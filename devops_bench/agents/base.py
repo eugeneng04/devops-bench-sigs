@@ -22,8 +22,11 @@ single agent crash never aborts the benchmark. Subclasses implement
 
 Each concrete harness lives in a sibling subpackage (``cli.gemini_cli`` /
 ``cli.openclaw``) and self-registers under its canonical key via
-``@AGENTS.register``. Heavy imports (``deepeval``, provider SDKs) stay
-function-local — ``import devops_bench.agents`` pulls only this module.
+``@AGENTS.register``. External packages register theirs through the
+``devops_bench.agents`` entry-point group instead, so a downstream harness
+resolves by key with no import of its module here. Heavy imports
+(``deepeval``, provider SDKs) stay function-local — ``import
+devops_bench.agents`` pulls only this module.
 """
 
 from __future__ import annotations
@@ -39,7 +42,10 @@ from devops_bench.core import Registry, get_logger
 
 __all__ = ["AgentHarness", "AGENTS"]
 
-AGENTS: Registry[type[AgentHarness]] = Registry("agents")
+#: Registry of concrete :class:`AgentHarness` subclasses, keyed by agent type.
+#: ``entry_point_group`` lets external packages register a harness without
+#: touching this tree.
+AGENTS: Registry[type[AgentHarness]] = Registry("agents", entry_point_group="devops_bench.agents")
 
 _log = get_logger("agents.base")
 

@@ -14,7 +14,11 @@
 
 """Unit tests for devops_bench.agents.base."""
 
+from collections.abc import Generator
+from pathlib import Path
+
 import pytest
+from pytest_mock import MockerFixture
 
 from devops_bench.agents import AGENTS, AgentConfig, AgentHarness, AgentResult
 from devops_bench.core import Registry
@@ -112,3 +116,58 @@ def test_third_party_can_register_with_no_central_edit() -> None:
 def test_registry_miss_raises_not_registered() -> None:
     with pytest.raises(NotRegisteredError):
         AGENTS.get("definitely-not-registered")
+
+
+class _FakeEntryPoint:
+    """Minimal stand-in for ``importlib.metadata.EntryPoint``."""
+
+    def __init__(self, name: str, value: type) -> None:
+        self.name = name
+        self._value = value
+
+    def load(self) -> type:
+        return self._value
+
+
+@pytest.fixture
+def _pristine_entry_point_scan() -> Generator[None, None, None]:
+    """Reset ``AGENTS``' one-time entry-point scan around a test.
+
+    Any registry miss elsewhere in the suite (e.g. the miss test above) latches
+    ``_entry_points_loaded`` for the whole session, which would keep a mocked
+    scan from ever firing. Reset the flag on entry so this test's scan runs;
+    on exit restore ``_items`` and the flag to their pre-test values, so
+    nothing loaded here leaks and a later unmocked miss cannot trigger a real
+    scan (which, on a host with a real ``devops_bench.agents`` package
+    installed, would leak a live registration into the suite).
+    """
+    saved_items = dict(AGENTS._items)  # noqa: SLF001 - test-only isolation
+    saved_loaded = AGENTS._entry_points_loaded  # noqa: SLF001
+    AGENTS._entry_points_loaded = False  # noqa: SLF001
+    try:
+        yield
+    finally:
+        AGENTS._items.clear()  # noqa: SLF001
+        AGENTS._items.update(saved_items)  # noqa: SLF001
+        AGENTS._entry_points_loaded = saved_loaded  # noqa: SLF001
+
+
+def test_registry_declares_the_agents_entry_point_group() -> None:
+    """The registry is wired to the ``devops_bench.agents`` discovery group."""
+    assert AGENTS._entry_point_group == "devops_bench.agents"  # noqa: SLF001
+
+
+def test_external_harness_loads_via_entry_point(
+    mocker: MockerFixture, _pristine_entry_point_scan: None
+) -> None:
+    """A harness shipped by another package resolves through the entry-point scan."""
+
+    class _External(AgentHarness):
+        def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+            return AgentResult(output="", trajectory=[])
+
+    ep = _FakeEntryPoint("dummy-external", _External)
+    mock_eps = mocker.patch("devops_bench.core.registry.metadata.entry_points", return_value=[ep])
+
+    assert AGENTS.get("dummy-external") is _External
+    mock_eps.assert_called_once_with(group="devops_bench.agents")
