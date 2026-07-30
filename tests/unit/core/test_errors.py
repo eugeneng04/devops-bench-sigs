@@ -50,7 +50,7 @@ def test_registry_errors_share_registry_base():
     assert issubclass(NotRegisteredError, RegistryError)
 
 
-def test_invalid_key_error_message_and_fields():
+def test_invalid_key_error_message_and_fields() -> None:
     err = InvalidKeyError("agents", "Gemini", "agent keys must be lowercase")
     assert err.registry_name == "agents"
     assert err.key == "Gemini"
