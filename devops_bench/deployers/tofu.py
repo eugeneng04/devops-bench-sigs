@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OpenTofu-backed deployer driving repo-local ``tf/`` stacks."""
+"""OpenTofu-backed deployer driving ``tf/`` stacks.
+
+Relative stack names resolve under the stack root: ``$BENCH_TF_ROOT`` when set,
+else the checkout's ``<repo_root>/tf``. The override is what lets a
+pip-installed devops-bench (no repo checkout, ``tf/`` is not packaged) drive
+stacks maintained in a downstream repository.
+"""
 
 from __future__ import annotations
 
@@ -23,7 +29,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from devops_bench.core import ClusterInfo, ConfigError, get_logger
+from devops_bench.core import ClusterInfo, ConfigError, get_env, get_logger
 from devops_bench.core.subprocess import run
 from devops_bench.deployers.base import Deployer
 
@@ -34,10 +40,27 @@ __all__ = ["TFDeployer"]
 
 # This module lives at ``<repo_root>/devops_bench/deployers/tofu.py``; the repo
 # root is therefore three levels up, and Tofu stacks live under ``<repo_root>/tf``.
+# Default only — ``_resolve_tf_root`` consults ``BENCH_TF_ROOT`` first.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _TF_ROOT = _REPO_ROOT / "tf"
 
 _log = get_logger("deployers.tofu")
+
+
+def _resolve_tf_root() -> Path:
+    """Return the stack root: ``$BENCH_TF_ROOT`` override, else ``<repo_root>/tf``.
+
+    Read per call (not at import) so setting the variable after import works.
+    Under a pip install the default points inside ``site-packages`` where no
+    ``tf/`` tree exists, so installed-library users set ``BENCH_TF_ROOT`` to the
+    directory holding their stacks. Two constraints on an override root: it is
+    copied *whole* per isolated run (stacks reference modules via relative
+    ``../../`` paths, so keep it lean), and it should not be an ancestor of the
+    run scratch dir (``BENCH_RUN_STATE_ROOT``) — :func:`_isolated_work_dir`
+    refuses to copy in that case and degrades to the shared stack dir.
+    """
+    override = get_env("BENCH_TF_ROOT")
+    return Path(override).expanduser().resolve() if override else _TF_ROOT
 
 
 def _format_var(value: Any) -> str:
@@ -97,12 +120,13 @@ def _isolated_work_dir(stack_dir: str, tf_root: Path) -> str:
     both still ran ``tofu`` in the *shared* ``tf/prebuilt/<stack>`` directory, so
     two concurrent runs of the SAME stack contend on its ``.terraform.lock.hcl``
     (no lock file is committed, so every ``init`` rewrites it). To give each run a
-    private working directory, copy the WHOLE ``tf/`` tree — stacks reference
+    private working directory, copy the WHOLE ``tf_root`` tree — stacks reference
     modules via relative ``../../`` paths, so a leaf-only copy would break — into
     the run's scratch dir (the parent of ``TF_DATA_DIR``, beside the per-run
     state file) and run tofu in the copied stack.
 
-    Only applies to in-repo stacks under an isolated (parallel) run; external or
+    Only applies to stacks under ``tf_root`` (the checkout's ``tf/`` or a
+    ``BENCH_TF_ROOT`` override) during an isolated (parallel) run; external or
     absolute stacks and single (non-isolated) runs keep the original directory.
     Any copy failure falls back to the original directory so provisioning still
     proceeds (degrading to the shared-dir behavior, never failing).
@@ -114,9 +138,21 @@ def _isolated_work_dir(stack_dir: str, tf_root: Path) -> str:
         rel = Path(stack_dir).resolve().relative_to(tf_root.resolve())
     except ValueError:
         return stack_dir  # external/absolute stack: cannot relocate safely
+    run_dir = Path(tf_data_dir).resolve().parent
+    dest_tf = run_dir / "tf"
+    if dest_tf.is_relative_to(tf_root.resolve()):
+        # Copying a tree into its own descendant recurses (each level's scandir
+        # sees the partial copy created one level up) until the OS path-length
+        # limit aborts it. Refuse and keep the shared dir instead.
+        _log.warning(
+            "cannot isolate tofu stack dir: stack root %s contains the run scratch dir %s; "
+            "using shared %s",
+            tf_root,
+            run_dir,
+            stack_dir,
+        )
+        return stack_dir
     try:
-        run_dir = Path(tf_data_dir).resolve().parent
-        dest_tf = run_dir / "tf"
         shutil.copytree(tf_root, dest_tf, dirs_exist_ok=True)
         return str(dest_tf / rel)
     except OSError as exc:
@@ -136,13 +172,15 @@ class TFDeployer(Deployer):
     its :class:`~devops_bench.providers.Provider`. Honors the ``TF_DATA_DIR``
     environment variable so OpenTofu state can be redirected for idempotent runs.
 
-    Path resolution: a relative ``tf_dir`` is resolved under ``<repo_root>/tf``;
-    an absolute path (``~`` is expanded) is used as-is, so stacks may live outside
-    the repository.
+    Path resolution: a relative ``tf_dir`` is resolved under the stack root
+    (``$BENCH_TF_ROOT`` when set, else the checkout's ``<repo_root>/tf`` — see
+    :func:`_resolve_tf_root`); an absolute path (``~`` is expanded) is used
+    as-is. Relative stacks keep per-run isolation under an override root;
+    absolute stacks do not, so concurrent runs should not share one.
 
     Args:
         tf_dir: Stack directory; an absolute/``~`` path used as-is, or a name
-            resolved under ``<repo_root>/tf``.
+            resolved under the stack root.
         provider: Cloud provider supplying credentials and cluster details.
         variables: OpenTofu input variables passed as ``-var`` flags.
         custom_keys: Subset of ``variables`` that came from task-level config;
@@ -161,19 +199,24 @@ class TFDeployer(Deployer):
         custom_keys: set[str] | None = None,
     ) -> None:
         tf_path = Path(tf_dir).expanduser()
+        tf_root = _resolve_tf_root()
         if tf_path.is_absolute():
             if not tf_path.exists():
                 raise ConfigError(f"Absolute TF directory not found: {tf_dir}")
             self.tf_dir = str(tf_path)
         else:
-            repo_tf_path = _TF_ROOT / tf_path
-            if not repo_tf_path.exists():
-                raise ConfigError(f"TF stack not found in repo: {tf_dir} (checked {repo_tf_path})")
-            self.tf_dir = str(repo_tf_path)
+            rooted_tf_path = tf_root / tf_path
+            if not rooted_tf_path.exists():
+                raise ConfigError(
+                    f"TF stack not found under {tf_root}: {tf_dir} "
+                    "(set BENCH_TF_ROOT to override the stack root)"
+                )
+            self.tf_dir = str(rooted_tf_path)
 
-        # Per-run private working directory (a copy of the tf/ tree under the
-        # run's scratch dir) when isolated; otherwise the shared stack dir.
-        self.work_dir = _isolated_work_dir(self.tf_dir, _TF_ROOT)
+        # Per-run private working directory (a copy of the stack-root tree
+        # under the run's scratch dir) when isolated; otherwise the shared
+        # stack dir.
+        self.work_dir = _isolated_work_dir(self.tf_dir, tf_root)
 
         self.provider = provider
         self.variables = variables or {}
