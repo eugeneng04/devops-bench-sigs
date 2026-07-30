@@ -12,16 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Concrete single-condition verifiers."""
+output "cluster_name" {
+  value       = module.cluster.cluster_name
+  description = "The finalized name of the created cluster"
+}
 
-from devops_bench.verification.verifiers.pod_healthy import PodHealthyVerifier
-from devops_bench.verification.verifiers.resource_property import (
-    ResourcePropertyVerifier,
-)
-from devops_bench.verification.verifiers.scaling_complete import ScalingCompleteVerifier
-
-__all__ = [
-    "PodHealthyVerifier",
-    "ResourcePropertyVerifier",
-    "ScalingCompleteVerifier",
-]
+output "cluster_location" {
+  value       = module.cluster.location
+  description = "The region/zone or 'local'"
+}
