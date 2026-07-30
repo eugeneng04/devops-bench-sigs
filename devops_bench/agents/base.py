@@ -22,8 +22,13 @@ single agent crash never aborts the benchmark. Subclasses implement
 
 Each concrete harness lives in a sibling subpackage (``cli.gemini_cli`` /
 ``cli.openclaw``) and self-registers under its canonical key via
-``@AGENTS.register``. Heavy imports (``deepeval``, provider SDKs) stay
-function-local — ``import devops_bench.agents`` pulls only this module.
+``@AGENTS.register``. External packages register theirs through the
+``devops_bench.agents`` entry-point group instead, so a downstream harness
+resolves by key with no import of its module here. Keys on both paths must be
+lowercase — the harness lowercases the configured agent type before lookup — so
+an uppercase one is rejected at registration rather than left unreachable.
+Heavy imports (``deepeval``, provider SDKs) stay function-local — ``import
+devops_bench.agents`` pulls only this module.
 """
 
 from __future__ import annotations
@@ -39,7 +44,37 @@ from devops_bench.core import Registry, get_logger
 
 __all__ = ["AgentHarness", "AGENTS"]
 
-AGENTS: Registry[type[AgentHarness]] = Registry("agents")
+
+def _reject_non_lowercase_key(key: str) -> str | None:
+    """Reject an agent key that a configured agent type could never match.
+
+    The harness lowercases the configured agent type before looking it up, so a
+    key carrying any uppercase character is unreachable — and the failure is
+    silent in the worst way: the configured name shows up verbatim in the
+    ``available:`` list of the resulting :class:`NotRegisteredError`. Rejecting
+    at registration turns that into an actionable message at the point the key
+    is introduced.
+
+    Args:
+        key: Candidate registry key.
+
+    Returns:
+        None when ``key`` is acceptable, else the reason it was rejected.
+    """
+    if key != key.lower():
+        return "agent keys must be lowercase; the configured agent type is lowercased before lookup"
+    return None
+
+
+#: Registry of concrete :class:`AgentHarness` subclasses, keyed by agent type.
+#: ``entry_point_group`` lets external packages register a harness without
+#: touching this tree; the key policy holds those external keys to the same
+#: lowercase contract the in-tree ones follow.
+AGENTS: Registry[type[AgentHarness]] = Registry(
+    "agents",
+    entry_point_group="devops_bench.agents",
+    key_validator=_reject_non_lowercase_key,
+)
 
 _log = get_logger("agents.base")
 

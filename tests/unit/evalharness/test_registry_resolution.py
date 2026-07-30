@@ -22,7 +22,10 @@ resolves with **no harness edit**.
 
 from __future__ import annotations
 
+from collections.abc import Generator
+
 import pytest
+from pytest_mock import MockerFixture
 
 from devops_bench.agents import AGENTS, AgentConfig, AgentHarness, AgentResult
 from devops_bench.core import NotRegisteredError
@@ -95,3 +98,55 @@ def test_unknown_agent_type_raises_not_registered() -> None:
 
     with pytest.raises(NotRegisteredError):
         harness.resolve_agent("not-a-real-agent-key")
+
+
+class _FakeEntryPoint:
+    """Minimal stand-in for ``importlib.metadata.EntryPoint``."""
+
+    def __init__(self, name: str, value: type) -> None:
+        self.name = name
+        self._value = value
+
+    def load(self) -> type:
+        return self._value
+
+
+@pytest.fixture
+def _pristine_entry_point_scan() -> Generator[None, None, None]:
+    """Reset ``AGENTS``' one-time entry-point scan around a test.
+
+    A registry miss anywhere in the suite (e.g. the unknown-agent test above)
+    latches ``_entry_points_loaded`` session-wide, which would keep a mocked
+    scan from firing. Reset on entry; on exit restore ``_items`` and the flag
+    to their pre-test values (so a later unmocked miss cannot run a real scan
+    on a host with a real ``devops_bench.agents`` package installed), and
+    clear the dummy's captured config even when an assertion failed mid-test.
+    """
+    saved_items = dict(AGENTS._items)  # noqa: SLF001 - test-only isolation
+    saved_loaded = AGENTS._entry_points_loaded  # noqa: SLF001
+    AGENTS._entry_points_loaded = False  # noqa: SLF001
+    try:
+        yield
+    finally:
+        AGENTS._items.clear()  # noqa: SLF001
+        AGENTS._items.update(saved_items)  # noqa: SLF001
+        AGENTS._entry_points_loaded = saved_loaded  # noqa: SLF001
+        _DummyAgent.last_config = None
+
+
+def test_entry_point_agent_resolves_with_no_harness_edit(
+    mocker: MockerFixture, _pristine_entry_point_scan: None
+) -> None:
+    """An agent shipped via the ``devops_bench.agents`` entry-point group flows
+    through the orchestrator with no import of its module anywhere in this tree —
+    the pip-installed-library integration path."""
+    ep = _FakeEntryPoint("dummy-external", _DummyAgent)
+    mock_eps = mocker.patch("devops_bench.core.registry.metadata.entry_points", return_value=[ep])
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c")
+
+    agent = harness.resolve_agent("dummy-external")
+
+    assert isinstance(agent, _DummyAgent)
+    mock_eps.assert_called_once_with(group="devops_bench.agents")
+    # The harness threaded its built config into the entry-point-loaded agent.
+    assert isinstance(_DummyAgent.last_config, AgentConfig)

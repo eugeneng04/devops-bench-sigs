@@ -14,11 +14,15 @@
 
 """Unit tests for devops_bench.agents.base."""
 
+from collections.abc import Generator
+from pathlib import Path
+
 import pytest
+from pytest_mock import MockerFixture
 
 from devops_bench.agents import AGENTS, AgentConfig, AgentHarness, AgentResult
 from devops_bench.core import Registry
-from devops_bench.core.errors import AlreadyRegisteredError, NotRegisteredError
+from devops_bench.core.errors import AlreadyRegisteredError, InvalidKeyError, NotRegisteredError
 
 
 def test_agents_registry_is_a_core_registry() -> None:
@@ -112,3 +116,96 @@ def test_third_party_can_register_with_no_central_edit() -> None:
 def test_registry_miss_raises_not_registered() -> None:
     with pytest.raises(NotRegisteredError):
         AGENTS.get("definitely-not-registered")
+
+
+class _FakeEntryPoint:
+    """Minimal stand-in for ``importlib.metadata.EntryPoint``."""
+
+    def __init__(self, name: str, value: type) -> None:
+        self.name = name
+        self._value = value
+
+    def load(self) -> type:
+        return self._value
+
+
+@pytest.fixture
+def _pristine_entry_point_scan() -> Generator[None, None, None]:
+    """Reset ``AGENTS``' one-time entry-point scan around a test.
+
+    Any registry miss elsewhere in the suite (e.g. the miss test above) latches
+    ``_entry_points_loaded`` for the whole session, which would keep a mocked
+    scan from ever firing. Reset the flag on entry so this test's scan runs;
+    on exit restore ``_items`` and the flag to their pre-test values, so
+    nothing loaded here leaks and a later unmocked miss cannot trigger a real
+    scan (which, on a host with a real ``devops_bench.agents`` package
+    installed, would leak a live registration into the suite).
+    """
+    saved_items = dict(AGENTS._items)  # noqa: SLF001 - test-only isolation
+    saved_loaded = AGENTS._entry_points_loaded  # noqa: SLF001
+    AGENTS._entry_points_loaded = False  # noqa: SLF001
+    try:
+        yield
+    finally:
+        AGENTS._items.clear()  # noqa: SLF001
+        AGENTS._items.update(saved_items)  # noqa: SLF001
+        AGENTS._entry_points_loaded = saved_loaded  # noqa: SLF001
+
+
+def test_registry_declares_the_agents_entry_point_group() -> None:
+    """The registry is wired to the ``devops_bench.agents`` discovery group."""
+    assert AGENTS._entry_point_group == "devops_bench.agents"  # noqa: SLF001
+
+
+def test_external_harness_loads_via_entry_point(
+    mocker: MockerFixture, _pristine_entry_point_scan: None
+) -> None:
+    """A harness shipped by another package resolves through the entry-point scan."""
+
+    class _External(AgentHarness):
+        def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+            return AgentResult(output="", trajectory=[])
+
+    ep = _FakeEntryPoint("dummy-external", _External)
+    mock_eps = mocker.patch("devops_bench.core.registry.metadata.entry_points", return_value=[ep])
+
+    assert AGENTS.get("dummy-external") is _External
+    mock_eps.assert_called_once_with(group="devops_bench.agents")
+
+
+def test_uppercase_entry_point_is_skipped(
+    mocker: MockerFixture, _pristine_entry_point_scan: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An uppercase external key is dropped, not admitted as an unreachable entry.
+
+    The harness lowercases the configured agent type, so ``Dummy-External``
+    could never be looked up. Skipping it keeps the registry free of dead keys
+    and surfaces the packaging mistake in the log instead.
+    """
+
+    class _External(AgentHarness):
+        def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+            return AgentResult(output="", trajectory=[])
+
+    bad = _FakeEntryPoint("Dummy-External", _External)
+    good = _FakeEntryPoint("dummy-external", _External)
+    mocker.patch("devops_bench.core.registry.metadata.entry_points", return_value=[bad, good])
+
+    with caplog.at_level("WARNING"):
+        # The valid sibling still loads — one bad key does not poison the scan.
+        assert AGENTS.get("dummy-external") is _External
+    assert "Dummy-External" not in AGENTS._items  # noqa: SLF001 - test-only assertion
+    assert "Dummy-External" in caplog.text
+
+
+def test_uppercase_explicit_registration_raises() -> None:
+    """An in-tree key that breaks the lowercase contract fails loudly."""
+
+    class _Dummy(AgentHarness):
+        def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+            return AgentResult(output="", trajectory=[])
+
+    with pytest.raises(InvalidKeyError) as exc_info:
+        AGENTS.register("Dummy-Uppercase")(_Dummy)
+    assert "lowercase" in str(exc_info.value)
+    assert "Dummy-Uppercase" not in AGENTS._items  # noqa: SLF001 - test-only assertion
