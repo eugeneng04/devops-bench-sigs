@@ -57,6 +57,5 @@ reviews:
     base_branches:
       - ".*"
     labels:
-      - "!needs-ok-to-test"
       - "!do-not-merge/work-in-progress"
       - "!cncf-cla: no"
