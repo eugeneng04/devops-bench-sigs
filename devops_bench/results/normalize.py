@@ -26,9 +26,11 @@ import re
 from collections.abc import Iterable, Mapping
 from typing import Any, NamedTuple
 
+from devops_bench.core import score_keys
 from devops_bench.results.row import Manifest, ResultRow
 
 __all__ = [
+    "CATASTROPHIC_SCORE_KEY",
     "OUTCOME_SCORE_KEY",
     "TOOL_SCORE_KEY",
     "NormalizedTokens",
@@ -40,11 +42,28 @@ __all__ = [
     "slugify",
 ]
 
-#: ``res["scores"]`` keys the flat ``outcomeScore`` / ``toolScore`` are read
-#: from. These match the ``MetricScore.name`` of the builtin outcome and tool
-#: metrics.
-OUTCOME_SCORE_KEY = "OutcomeValidity"
-TOOL_SCORE_KEY = "ToolInvocation"
+#: ``res["scores"]`` keys the flat row fields are read from, re-exported under
+#: this module's historical names. The values live in
+#: :mod:`devops_bench.core.score_keys` so the metrics and results layers share
+#: one definition without importing each other.
+OUTCOME_SCORE_KEY = score_keys.OUTCOME_SCORE_KEY
+TOOL_SCORE_KEY = score_keys.TOOL_INVOCATION_KEY
+
+#: Preference chains mirroring the composite assembly, so a row's components
+#: name the same signals the headline score was built from: a deterministic
+#: verification score wins over the judged equivalent. ``recoverableSafetyScore``
+#: carries the raw pass fraction, since this module maps and never scores; the
+#: ``[0.1, 1.0]`` rescale the formula applies belongs to the metrics layer.
+_CORRECTNESS_KEYS = (
+    score_keys.VERIFICATION_CORRECTNESS_KEY,
+    score_keys.CHECKLIST_SCORE_KEY,
+    score_keys.OUTCOME_VALIDITY_KEY,
+)
+_RECOVERABLE_KEYS = (
+    score_keys.VERIFICATION_RECOVERABLE_KEY,
+    score_keys.JUDGED_RECOVERABLE_KEY,
+)
+CATASTROPHIC_SCORE_KEY = score_keys.VERIFICATION_CATASTROPHIC_KEY
 
 # Token usage aliases per provider, in lookup priority. The canonical keys
 # (``input`` / ``cached`` / ``reasoning`` / ``output``; see
@@ -221,6 +240,39 @@ def extract_score(scores: Mapping[str, Any] | None, key: str) -> float | None:
     return None
 
 
+def _first_score(scores: Mapping[str, Any] | None, keys: tuple[str, ...]) -> float | None:
+    """Return the score under the first key in ``keys`` that carries one.
+
+    Args:
+        scores: The record's ``scores`` mapping, or ``None``.
+        keys: Candidate score keys in preference order.
+
+    Returns:
+        The first numeric score found, or ``None`` when no key carries one.
+    """
+    for key in keys:
+        value = extract_score(scores, key)
+        if value is not None:
+            return value
+    return None
+
+
+def _scoring_version(scores: Mapping[str, Any] | None) -> str:
+    """Read the scoring-framework version stamped on the composite entry.
+
+    Args:
+        scores: The record's ``scores`` mapping, or ``None``.
+
+    Returns:
+        The ``version`` string on the ``OutcomeScore`` entry, or ``""`` when
+        absent (unscored record, or a row predating the scoring framework).
+    """
+    entry = (scores or {}).get(OUTCOME_SCORE_KEY)
+    if isinstance(entry, Mapping) and isinstance(entry.get("version"), str):
+        return entry["version"]
+    return ""
+
+
 def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list[ResultRow]:
     """Flatten harness result records into :class:`ResultRow` rows for one run.
 
@@ -240,6 +292,8 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
     for record in records:
         scores = record.get("scores")
         tokens = normalize_tokens(record.get("tokens"))
+        correctness = _first_score(scores, _CORRECTNESS_KEYS)
+        catastrophic_score = extract_score(scores, CATASTROPHIC_SCORE_KEY)
         rows.append(
             ResultRow(
                 setup_id=manifest.setup_id,
@@ -252,6 +306,10 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 task_name=record.get("name", "") or "",
                 iteration=0,
                 outcome_score=extract_score(scores, OUTCOME_SCORE_KEY),
+                correctness_score=correctness,
+                recoverable_safety_score=_first_score(scores, _RECOVERABLE_KEYS),
+                catastrophic=catastrophic_score == 0.0,
+                scoring_version=_scoring_version(scores),
                 tool_score=extract_score(scores, TOOL_SCORE_KEY),
                 latency_sec=float(record.get("latency") or 0.0),
                 input_tokens=tokens.input,
