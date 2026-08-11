@@ -19,22 +19,16 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from urllib.parse import quote
 
 from devops_bench.agents.result import ToolCall, empty_tokens
 
 __all__: list[str] = ["extract_tokens_from_db", "extract_trajectory_from_db"]
 
 # Hermes ``sessions`` columns -> the canonical buckets in
-# :data:`~devops_bench.agents.result.TOKEN_BUCKETS`. Hermes populates these from
-# its per-turn cost calculation; ``cache_write_tokens`` exists because Hermes
-# drives Anthropic prompt caching with explicit cache_control breakpoints.
-#
-# The mapping assumes Hermes normalizes provider usage to the canonical split —
-# ``input_tokens`` *excludes* cache reads and ``output_tokens`` *excludes*
-# reasoning (the Anthropic convention its column names mirror). Hermes is
-# multi-provider: if it instead stores provider-native usage (OpenAI/Gemini
-# prompt counts include cache, completion counts include reasoning), ``total``
-# double-counts on those providers. Unverified against a live run.
+# :data:`~devops_bench.agents.result.TOKEN_BUCKETS`. Hermes normalizes every
+# provider's usage into its own ``CanonicalUsage`` before persisting, so
+# ``input_tokens`` already excludes cache reads and writes.
 _SESSION_TOKEN_COLUMNS: dict[str, str] = {
     "input_tokens": "input",
     "cache_read_tokens": "cached",
@@ -46,7 +40,9 @@ _SESSION_TOKEN_COLUMNS: dict[str, str] = {
 
 def _connect_ro(db_path: Path) -> sqlite3.Connection:
     """Open ``db_path`` read-only, so a live ``state.db`` is never locked."""
-    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    # quote() keeps a ``?`` or ``#`` in the path from being read as the URI's
+    # query or fragment delimiter.
+    return sqlite3.connect(f"file:{quote(str(db_path))}?mode=ro", uri=True)
 
 
 def extract_tokens_from_db(db_path: Path) -> dict[str, int | None]:
@@ -58,6 +54,11 @@ def extract_tokens_from_db(db_path: Path) -> dict[str, int | None]:
     and a run may write more than one session row. Never raises: an older
     Hermes schema (missing columns), a missing/corrupt DB, or any read failure
     yields all-``None`` buckets rather than a fabricated ``0``.
+
+    Hermes stores ``output_tokens`` as the provider's full completion count with
+    ``reasoning_tokens`` as a subset of it, whereas the canonical ``output``
+    bucket excludes reasoning; reasoning is subtracted out here so ``total``
+    counts it once and still matches Hermes's own prompt-plus-completion figure.
 
     Args:
         db_path: Path to the run's ``state.db``.
@@ -84,6 +85,8 @@ def extract_tokens_from_db(db_path: Path) -> dict[str, int | None]:
         # SUM yields int, float (REAL affinity), or NULL for an all-NULL column.
         if isinstance(value, int | float) and not isinstance(value, bool):
             tokens[bucket] = int(value)
+    if tokens["output"] is not None and tokens["reasoning"]:
+        tokens["output"] = max(0, tokens["output"] - tokens["reasoning"])
     reported = [
         value for bucket in _SESSION_TOKEN_COLUMNS.values() if (value := tokens[bucket]) is not None
     ]

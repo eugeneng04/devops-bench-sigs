@@ -18,9 +18,10 @@ Capability wiring is delivered through hermes's native channels, laid down in
 the run-scoped home directory ``$HERMES_HOME``:
 
 * **State isolation** — ``HERMES_HOME`` points at ``<workspace>/.hermes``, so
-  ``config.yaml`` and the ``state.db`` session store are per-run, never leak
-  into the user's ``~/.hermes``, and stay out of the workspace files the eval
-  harness collects as agent-generated artifacts.
+  ``config.yaml`` and the ``state.db`` session store are per-run and never
+  touch the user's ``~/.hermes``. The eval harness snapshots the workspace
+  before the run, so ``.hermes`` is copied into the run's ``generated_files/``
+  as a single directory rather than scattering hermes state across the diff.
 * **MCP servers** — command-bearing bindings become ``mcp_servers`` entries in
   ``$HERMES_HOME/config.yaml``.
 * **Skills** — ``config.capabilities.skills.paths`` are materialized under
@@ -143,9 +144,20 @@ class HermesAgent(AgentHarness):
         config_data: dict = {}
         if config_path.exists():
             try:
-                config_data = _yaml.load(config_path.read_text(encoding="utf-8")) or {}
+                loaded = _yaml.load(config_path.read_text(encoding="utf-8"))
             except (OSError, YAMLError) as exc:
                 _log.warning("Failed to load existing %s: %s", _CONFIG_FILE, exc)
+            else:
+                # A seeded config holding a list or scalar parses fine but would
+                # blow up the merge below; hermes would reject it anyway.
+                if isinstance(loaded, dict):
+                    config_data = loaded
+                elif loaded is not None:
+                    _log.warning(
+                        "Ignoring existing %s: expected a mapping, got %s",
+                        _CONFIG_FILE,
+                        type(loaded).__name__,
+                    )
 
         servers = build_mcp_servers(mcp_servers)
         if servers:
@@ -213,7 +225,7 @@ class HermesAgent(AgentHarness):
                     ),
                     trajectory=trajectory,
                     tokens=extract_tokens_from_db(db_path),
-                    errors=[f"hermes agent timed out after {self.config.timeout_sec}s", *errors],
+                    errors=[f"hermes agent timed out after {self.config.timeout_sec:g}s", *errors],
                     metadata={"timeout": True},
                 )
             except OSError as exc:

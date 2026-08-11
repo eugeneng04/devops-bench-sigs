@@ -21,7 +21,7 @@ import os
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from ruamel.yaml import YAML
@@ -71,7 +71,7 @@ def _init_schema(path: Path) -> None:
     conn.close()
 
 
-def _insert_session(path: Path, session_id: str, *counts) -> None:
+def _insert_session(path: Path, session_id: str, *counts: int | float | None) -> None:
     conn = sqlite3.connect(path)
     columns = ", ".join(_TOKEN_COLUMNS)
     placeholders = ", ".join("?" * len(_TOKEN_COLUMNS))
@@ -83,7 +83,7 @@ def _insert_session(path: Path, session_id: str, *counts) -> None:
     conn.close()
 
 
-def _insert_message(path: Path, session_id: str, role: str, **fields) -> None:
+def _insert_message(path: Path, session_id: str, role: str, **fields: str | None) -> None:
     conn = sqlite3.connect(path)
     keys = ["session_id", "role", *fields]
     placeholders = ", ".join("?" * len(keys))
@@ -139,7 +139,7 @@ def test_resolve_hermes_bin_prefers_the_configured_target() -> None:
 
 
 @patch("os.path.exists")
-def test_resolve_hermes_bin_falls_back_to_path_lookup(mock_exists) -> None:
+def test_resolve_hermes_bin_falls_back_to_path_lookup(mock_exists: MagicMock) -> None:
     agent = HermesAgent(AgentConfig(target=None))
 
     mock_exists.return_value = True
@@ -210,6 +210,17 @@ def test_prepare_config_keeps_unrelated_keys_from_a_seeded_config(tmp_path: Path
     assert "k8s" in data["mcp_servers"]
 
 
+def test_prepare_config_ignores_a_seeded_config_that_is_not_a_mapping(tmp_path: Path) -> None:
+    """Valid YAML of the wrong shape must not abort the run on the merge."""
+    (tmp_path / "config.yaml").write_text("- a\n- b\n", encoding="utf-8")
+    agent = HermesAgent(AgentConfig())
+
+    agent._prepare_config(tmp_path, (McpBinding(name="k8s", command=("k8s-mcp",)),))
+
+    data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert data == {"mcp_servers": {"k8s": {"command": "k8s-mcp"}}}
+
+
 def test_prepare_config_survives_an_unparseable_seeded_config(tmp_path: Path) -> None:
     (tmp_path / "config.yaml").write_text("::: not yaml :::\n", encoding="utf-8")
     agent = HermesAgent(AgentConfig())
@@ -253,7 +264,9 @@ def test_prepare_config_inherits_user_state_when_asked(tmp_path: Path) -> None:
 # --- _execute wiring ---------------------------------------------------------
 
 
-def _seed_state_db(home: Path, *, counts=(2748, 11267, 152, 334987, 12000)) -> None:
+def _seed_state_db(
+    home: Path, *, counts: tuple[int, ...] = (2748, 11267, 152, 334987, 12000)
+) -> None:
     _init_schema(home / "state.db")
     _insert_session(home / "state.db", "s1", *counts)
 
@@ -261,7 +274,9 @@ def _seed_state_db(home: Path, *, counts=(2748, 11267, 152, 334987, 12000)) -> N
 def test_execute_reports_trajectory_and_tokens_from_the_state_db() -> None:
     """End-to-end wiring: the run-scoped DB reaches ``AgentResult``."""
 
-    def fake_run(cmd, check, cwd, timeout, extra_env):
+    def fake_run(
+        cmd: list[str], check: bool, cwd: str, timeout: float | None, extra_env: dict[str, str]
+    ) -> SimpleNamespace:
         home = Path(extra_env["HERMES_HOME"])
         _seed_state_db(home)
         _insert_message(
@@ -291,8 +306,8 @@ def test_execute_reports_trajectory_and_tokens_from_the_state_db() -> None:
         "cached": 334987,
         "cache_write": 12000,
         "reasoning": 152,
-        "output": 11267,
-        "total": 2748 + 334987 + 12000 + 152 + 11267,
+        "output": 11267 - 152,
+        "total": 2748 + 334987 + 12000 + 11267,
     }
 
 
@@ -300,7 +315,9 @@ def test_execute_runs_in_the_harness_workspace_when_given_one(tmp_path: Path) ->
     """hermes runs *in* the workspace but keeps its own state out of it."""
     seen: dict = {}
 
-    def fake_run(cmd, check, cwd, timeout, extra_env):
+    def fake_run(
+        cmd: list[str], check: bool, cwd: str, timeout: float | None, extra_env: dict[str, str]
+    ) -> SimpleNamespace:
         seen["cwd"] = cwd
         seen["home"] = extra_env["HERMES_HOME"]
         _seed_state_db(Path(extra_env["HERMES_HOME"]))
@@ -324,7 +341,9 @@ def test_execute_materializes_granted_skills_under_the_state_home(tmp_path: Path
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
-    def fake_run(cmd, check, cwd, timeout, extra_env):
+    def fake_run(
+        cmd: list[str], check: bool, cwd: str, timeout: float | None, extra_env: dict[str, str]
+    ) -> SimpleNamespace:
         _seed_state_db(Path(extra_env["HERMES_HOME"]))
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
@@ -339,7 +358,9 @@ def test_execute_materializes_granted_skills_under_the_state_home(tmp_path: Path
 
 
 def test_execute_records_a_nonzero_exit_without_losing_the_trajectory() -> None:
-    def fake_run(cmd, check, cwd, timeout, extra_env):
+    def fake_run(
+        cmd: list[str], check: bool, cwd: str, timeout: float | None, extra_env: dict[str, str]
+    ) -> SimpleNamespace:
         _seed_state_db(Path(extra_env["HERMES_HOME"]))
         return SimpleNamespace(returncode=3, stdout="partial", stderr="boom")
 
@@ -352,7 +373,9 @@ def test_execute_records_a_nonzero_exit_without_losing_the_trajectory() -> None:
 
 
 def test_execute_on_timeout_reports_what_the_killed_run_flushed() -> None:
-    def fake_run(cmd, check, cwd, timeout, extra_env):
+    def fake_run(
+        cmd: list[str], check: bool, cwd: str, timeout: float | None, extra_env: dict[str, str]
+    ) -> SimpleNamespace:
         home = Path(extra_env["HERMES_HOME"])
         _seed_state_db(home)
         _insert_message(
@@ -624,6 +647,12 @@ def test_tokens_fill_every_canonical_bucket(db_path: Path) -> None:
 
 
 def test_tokens_read_the_session_counts(db_path: Path) -> None:
+    """``output`` drops the reasoning subset; ``total`` still counts it once.
+
+    Hermes stores ``output_tokens`` as the full provider completion count and
+    ``reasoning_tokens`` as a slice of it, so ``total`` here must equal Hermes's
+    own ``prompt_tokens + output_tokens``.
+    """
     _init_schema(db_path)
     _insert_session(db_path, "s1", 2748, 11267, 152, 334987, 12000)
 
@@ -632,8 +661,8 @@ def test_tokens_read_the_session_counts(db_path: Path) -> None:
         "cached": 334987,
         "cache_write": 12000,
         "reasoning": 152,
-        "output": 11267,
-        "total": 2748 + 334987 + 12000 + 152 + 11267,
+        "output": 11267 - 152,
+        "total": 2748 + 334987 + 12000 + 11267,
     }
 
 
@@ -649,11 +678,11 @@ def test_tokens_reach_the_result_row_unchanged(db_path: Path) -> None:
     normalized = normalize_tokens(extract_tokens_from_db(db_path))
 
     assert normalized.input == 2748
-    assert normalized.output == 11267
+    assert normalized.output == 11267 - 152
     assert normalized.cached == 334987
     assert normalized.cache_write == 12000
     assert normalized.reasoning == 152
-    assert normalized.total == 2748 + 334987 + 12000 + 152 + 11267
+    assert normalized.total == 2748 + 334987 + 12000 + 11267
 
 
 def test_tokens_sum_across_sessions(db_path: Path) -> None:
@@ -666,9 +695,9 @@ def test_tokens_sum_across_sessions(db_path: Path) -> None:
     tokens = extract_tokens_from_db(db_path)
 
     assert tokens["input"] == 501
-    assert tokens["output"] == 41
+    assert tokens["output"] == 41 - 5
     assert tokens["cached"] == 900
-    assert tokens["total"] == 501 + 41 + 5 + 900 + 30
+    assert tokens["total"] == 501 + 41 + 900 + 30
 
 
 def test_tokens_coerce_real_values(db_path: Path) -> None:
@@ -695,6 +724,28 @@ def test_tokens_null_columns_stay_none(db_path: Path) -> None:
     assert tokens["cached"] is None
     assert tokens["cache_write"] is None
     assert tokens["total"] == 107
+
+
+def test_tokens_reasoning_beyond_the_completion_total_clamps_at_zero(db_path: Path) -> None:
+    """Defensive: a bad provider report must not yield a negative bucket."""
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", 100, 7, 40, 0, 0)
+
+    tokens = extract_tokens_from_db(db_path)
+
+    assert tokens["output"] == 0
+    assert tokens["total"] == 140
+
+
+def test_tokens_survive_a_path_with_uri_delimiters(tmp_path: Path) -> None:
+    """A ``?`` in the run path must not truncate the read-only URI."""
+    odd_dir = tmp_path / "run?id=1"
+    odd_dir.mkdir()
+    db_path = odd_dir / "state.db"
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", 100, 7, 0, 0, 0)
+
+    assert extract_tokens_from_db(db_path)["input"] == 100
 
 
 def test_tokens_no_session_rows_stay_none(db_path: Path) -> None:
