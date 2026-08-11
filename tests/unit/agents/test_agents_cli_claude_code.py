@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -739,7 +741,9 @@ def test_build_env_threads_api_key_into_anthropic_var() -> None:
     assert env["DISABLE_AUTOUPDATER"] == "1"
 
 
-def test_build_env_keyless_vertex_sets_switch_and_maps_project_region(monkeypatch) -> None:
+def test_build_env_keyless_vertex_sets_switch_and_maps_project_region(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("GCP_PROJECT_ID", "proj-42")
     monkeypatch.setenv("GCP_VERTEX_LOCATION", "us-east5")
     env = _build_env(AgentConfig(provider="anthropic-vertex"), config_dir=None)
@@ -750,8 +754,11 @@ def test_build_env_keyless_vertex_sets_switch_and_maps_project_region(monkeypatc
     assert "ANTHROPIC_API_KEY" not in env
 
 
-def test_build_env_vertex_region_defaults_to_global(monkeypatch) -> None:
+def test_build_env_vertex_region_defaults_to_global(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Both inputs to the region chain must be cleared: an ambient CLOUD_ML_REGION
+    # on the developer's machine or the CI runner would shadow the fallback.
     monkeypatch.delenv("GCP_VERTEX_LOCATION", raising=False)
+    monkeypatch.delenv("CLOUD_ML_REGION", raising=False)
     monkeypatch.setenv("GCP_PROJECT_ID", "proj-42")
     env = _build_env(AgentConfig(provider="anthropic-vertex"), config_dir=None)
     assert env["CLOUD_ML_REGION"] == "global"
@@ -820,7 +827,7 @@ def test_claude_agent_mirrors_capability_bindings_onto_mixin_attributes() -> Non
 # ---------------------------------------------------------------------------
 
 
-def test_execute_returns_typed_result_with_trajectory(monkeypatch) -> None:
+def test_execute_returns_typed_result_with_trajectory(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
     def fake_run(argv, **kwargs):
@@ -839,7 +846,7 @@ def test_execute_returns_typed_result_with_trajectory(monkeypatch) -> None:
     assert captured["argv"][-2:] == ["--", "ping"]
 
 
-def test_execute_wires_extra_env_into_subprocess_call(monkeypatch) -> None:
+def test_execute_wires_extra_env_into_subprocess_call(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
     def fake_run(argv, **kwargs):
@@ -853,7 +860,7 @@ def test_execute_wires_extra_env_into_subprocess_call(monkeypatch) -> None:
     assert env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
 
 
-def test_execute_records_non_zero_exit(monkeypatch) -> None:
+def test_execute_records_non_zero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(argv, **kwargs):
         return SimpleNamespace(stdout="", stderr="boom", returncode=2)
 
@@ -864,7 +871,7 @@ def test_execute_records_non_zero_exit(monkeypatch) -> None:
     assert result.metadata.get("returncode") == 2
 
 
-def test_execute_parses_stream_on_non_zero_exit(monkeypatch) -> None:
+def test_execute_parses_stream_on_non_zero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     """An ``error_max_turns`` run exits non-zero *after* emitting a full stream;
     output and trajectory must still be parsed, with the exit + subtype recorded."""
     stream = _stream(
@@ -885,7 +892,7 @@ def test_execute_parses_stream_on_non_zero_exit(monkeypatch) -> None:
     assert any("exited 1" in e for e in result.errors)
 
 
-def test_execute_captures_stderr_on_clean_exit(monkeypatch) -> None:
+def test_execute_captures_stderr_on_clean_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     """stderr is kept for diagnosis even when the process exits 0."""
 
     def fake_run(argv, **kwargs):
@@ -898,7 +905,7 @@ def test_execute_captures_stderr_on_clean_exit(monkeypatch) -> None:
     assert not any("exited" in e for e in result.errors)
 
 
-def test_execute_handles_subprocess_error(monkeypatch) -> None:
+def test_execute_handles_subprocess_error(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(argv, **kwargs):
         raise SubprocessError(argv, returncode=-1, stdout="", stderr="timeout")
 
@@ -909,7 +916,7 @@ def test_execute_handles_subprocess_error(monkeypatch) -> None:
     assert result.trajectory == []
 
 
-def test_execute_recovers_partial_trajectory_on_timeout(monkeypatch) -> None:
+def test_execute_recovers_partial_trajectory_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """A timeout carries the partial stream-json captured before the kill; the
     harness recovers the trajectory instead of discarding the run's work, while
     still surfacing the error."""
@@ -931,7 +938,7 @@ def test_execute_recovers_partial_trajectory_on_timeout(monkeypatch) -> None:
     assert result.metadata["stderr"] == "killed after timeout"
 
 
-def test_execute_handles_missing_binary(monkeypatch) -> None:
+def test_execute_handles_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(argv, **kwargs):
         raise OSError("not found")
 
@@ -942,7 +949,7 @@ def test_execute_handles_missing_binary(monkeypatch) -> None:
     assert result.tokens == _tok()
 
 
-def test_execute_passes_timeout_to_subprocess(monkeypatch) -> None:
+def test_execute_passes_timeout_to_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
     def fake_run(argv, **kwargs):
@@ -961,7 +968,9 @@ def test_execute_passes_timeout_to_subprocess(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_execute_writes_claude_md_with_rules_text_before_subprocess(monkeypatch) -> None:
+def test_execute_writes_claude_md_with_rules_text_before_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured: dict = {}
 
     def fake_run(argv, **kwargs):
@@ -981,7 +990,7 @@ def test_execute_writes_claude_md_with_rules_text_before_subprocess(monkeypatch)
     assert captured["text"] == "you are a precise SRE"
 
 
-def test_execute_skips_writing_claude_md_when_rules_empty(monkeypatch) -> None:
+def test_execute_skips_writing_claude_md_when_rules_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
     def fake_run(argv, **kwargs):
@@ -994,7 +1003,7 @@ def test_execute_skips_writing_claude_md_when_rules_empty(monkeypatch) -> None:
     assert captured["exists"] is False
 
 
-def test_execute_writes_mcp_config_and_passes_flag(monkeypatch) -> None:
+def test_execute_writes_mcp_config_and_passes_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
     def fake_run(argv, **kwargs):
@@ -1002,6 +1011,7 @@ def test_execute_writes_mcp_config_and_passes_flag(monkeypatch) -> None:
         mcp_path = os.path.join(kwargs["cwd"], ".claude", "mcp-config.json")
         captured["exists"] = os.path.exists(mcp_path)
         if captured["exists"]:
+            captured["mode"] = stat.S_IMODE(os.stat(mcp_path).st_mode)
             with open(mcp_path) as f:
                 captured["payload"] = json.load(f)
         return SimpleNamespace(stdout="", stderr="", returncode=0)
@@ -1014,12 +1024,15 @@ def test_execute_writes_mcp_config_and_passes_flag(monkeypatch) -> None:
 
     assert captured["exists"], "mcp-config.json must exist in cwd before subprocess"
     assert captured["payload"] == {"mcpServers": {"gke": {"command": "gke-mcp"}}}
+    # A binding's argv can carry a server credential, so the file must not be
+    # left at the umask default in a workspace the harness later collects.
+    assert captured["mode"] == 0o600
     argv = captured["argv"]
     assert argv[argv.index("--mcp-config") + 1].endswith(os.path.join(".claude", "mcp-config.json"))
     assert "--strict-mcp-config" in argv
 
 
-def test_execute_writes_no_mcp_config_when_no_command(monkeypatch) -> None:
+def test_execute_writes_no_mcp_config_when_no_command(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
     def fake_run(argv, **kwargs):
@@ -1038,7 +1051,9 @@ def test_execute_writes_no_mcp_config_when_no_command(monkeypatch) -> None:
     assert "--mcp-config" not in captured["argv"]
 
 
-def test_execute_materializes_skills_into_workspace(monkeypatch, tmp_path) -> None:
+def test_execute_materializes_skills_into_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     src = tmp_path / "skills" / "my-skill"
     src.mkdir(parents=True)
     skill_text = "---\nname: my-skill\ndescription: do things\n---\nbody\n"
@@ -1068,7 +1083,9 @@ def test_execute_materializes_skills_into_workspace(monkeypatch, tmp_path) -> No
 # ---------------------------------------------------------------------------
 
 
-def test_execute_injects_per_run_config_dir_when_ambient_unset(monkeypatch) -> None:
+def test_execute_injects_per_run_config_dir_when_ambient_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     captured: dict = {}
 
@@ -1089,7 +1106,7 @@ def test_execute_injects_per_run_config_dir_when_ambient_unset(monkeypatch) -> N
     assert os.path.basename(captured["cwd"]).startswith("claude-run-")
 
 
-def test_execute_respects_operator_config_dir(monkeypatch) -> None:
+def test_execute_respects_operator_config_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/operator/claude")
     captured: dict = {}
 
@@ -1104,7 +1121,7 @@ def test_execute_respects_operator_config_dir(monkeypatch) -> None:
     assert captured["config_dir"] is None
 
 
-def test_execute_uses_distinct_cwd_and_config_dir_per_run(monkeypatch) -> None:
+def test_execute_uses_distinct_cwd_and_config_dir_per_run(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     cwds: list[str] = []
     cfg_dirs: list[str] = []

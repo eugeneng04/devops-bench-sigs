@@ -36,8 +36,7 @@ Auth is env-driven, matching the bench contract: ``config.api_key`` →
 ``ANTHROPIC_API_KEY`` for the direct API, or keyless Vertex / Bedrock via ADC /
 AWS credentials. ``CLAUDE_CONFIG_DIR`` is redirected to a fresh per-run temp dir
 so Claude Code's mutable global state never races across concurrent evals (see
-:func:`_claude_config_dir` for the OAuth-debug escape hatch, and
-``docs/appendix/known_issues.md`` for the keyless-Vertex ``--parallel`` gotcha).
+:func:`_claude_config_dir` for the OAuth-debug escape hatch).
 """
 
 from __future__ import annotations
@@ -276,6 +275,10 @@ class ClaudeCodeAgent(AgentHarness):
                 claude_dir.mkdir(parents=True, exist_ok=True)
                 mcp_path = claude_dir / _CLAUDE_MCP_FILE
                 mcp_path.write_text(json.dumps({"mcpServers": servers}, indent=2), encoding="utf-8")
+                # A binding's argv can carry a server credential, and this file
+                # lands in the run workspace the harness later collects, so do
+                # not leave it at the umask default (0o644 on most machines).
+                mcp_path.chmod(0o600)
                 mcp_config_path = str(mcp_path)
 
             argv = _build_argv(

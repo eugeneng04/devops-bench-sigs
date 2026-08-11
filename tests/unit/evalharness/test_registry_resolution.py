@@ -87,22 +87,25 @@ def test_alias_normalizes_to_canonical_key() -> None:
     # ``gemini-cli`` is the friendly alias for the gemini agent; resolution must
     # not require a path table — the alias map normalizes to ``gemini`` and the
     # registry returns the registered class.
-    agent_cls = AGENTS.get("gemini")
+    #
+    # Resolve first: builtin harnesses self-register on the lazy import that
+    # ``resolve_agent`` performs, so reading ``AGENTS`` ahead of it would pass
+    # only when some earlier test happened to import the module.
     agent = harness.resolve_agent("gemini-cli")
-    assert isinstance(agent, agent_cls)
+    assert isinstance(agent, AGENTS.get("gemini"))
 
 
 def test_claude_code_alias_normalizes_to_canonical_key() -> None:
     """``claude-code`` resolves to the canonical ``claude`` agent.
 
     The ``AGENTS`` registry has no alias mechanism; the alias lives in
-    ``_AGENT_TYPE_ALIASES`` and is applied only by ``resolve_agent``.
+    ``_AGENT_TYPE_ALIASES`` and is applied only by ``resolve_agent``, whose lazy
+    import is also what registers the builtin — hence resolving before reading.
     """
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
 
-    agent_cls = AGENTS.get("claude")
     agent = harness.resolve_agent("claude-code")
-    assert isinstance(agent, agent_cls)
+    assert isinstance(agent, AGENTS.get("claude"))
 
 
 def test_unknown_agent_type_raises_not_registered() -> None:
