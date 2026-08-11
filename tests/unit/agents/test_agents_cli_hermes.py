@@ -1,0 +1,719 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for the Hermes CLI agent harness and its ``state.db`` parsers."""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+from ruamel.yaml import YAML
+
+from devops_bench.agents.base import AGENTS
+from devops_bench.agents.capabilities import AllCapabilities, McpBinding, SkillBinding
+from devops_bench.agents.cli.hermes import agent as agent_mod
+from devops_bench.agents.cli.hermes.agent import HermesAgent, _build_env, _prepend_rules
+from devops_bench.agents.cli.hermes.parsing import (
+    extract_tokens_from_db,
+    extract_trajectory_from_db,
+)
+from devops_bench.agents.config import AgentConfig
+from devops_bench.agents.result import TOKEN_BUCKETS, empty_tokens
+from devops_bench.core.errors import SubprocessError
+from devops_bench.results.normalize import normalize_tokens
+
+_yaml = YAML(typ="safe")
+
+_TOKEN_COLUMNS = (
+    "input_tokens",
+    "output_tokens",
+    "reasoning_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+)
+
+
+@pytest.fixture
+def db_path(tmp_path: Path) -> Path:
+    """Path a test ``state.db`` is created at (the file itself is not made)."""
+    return tmp_path / "state.db"
+
+
+def _init_schema(path: Path) -> None:
+    """Create the ``sessions`` / ``messages`` tables hermes writes."""
+    token_columns = "".join(f", {column} INTEGER" for column in _TOKEN_COLUMNS)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        f"CREATE TABLE sessions (id TEXT PRIMARY KEY, started_at TIMESTAMP{token_columns})"
+    )
+    conn.execute(
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT,"
+        " role TEXT, content TEXT, tool_calls TEXT, tool_call_id TEXT, tool_name TEXT)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _insert_session(path: Path, session_id: str, *counts) -> None:
+    conn = sqlite3.connect(path)
+    columns = ", ".join(_TOKEN_COLUMNS)
+    placeholders = ", ".join("?" * len(_TOKEN_COLUMNS))
+    conn.execute(
+        f"INSERT INTO sessions (id, started_at, {columns}) VALUES (?, NULL, {placeholders})",
+        (session_id, *counts),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _insert_message(path: Path, session_id: str, role: str, **fields) -> None:
+    conn = sqlite3.connect(path)
+    keys = ["session_id", "role", *fields]
+    placeholders = ", ".join("?" * len(keys))
+    conn.execute(
+        f"INSERT INTO messages ({', '.join(keys)}) VALUES ({placeholders})",
+        (session_id, role, *fields.values()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _tool_calls_json(call_id: str | None, name: str | None, args: dict | str) -> str:
+    function: dict = {"arguments": args if isinstance(args, str) else json.dumps(args)}
+    if name is not None:
+        function["name"] = name
+    entry: dict = {"type": "function", "function": function}
+    if call_id is not None:
+        entry["id"] = call_id
+    return json.dumps([entry])
+
+
+# --- registration & configuration -------------------------------------------
+
+
+def test_registers_under_the_canonical_key() -> None:
+    """The eval harness resolves the agent by its lowercase registry key."""
+    assert AGENTS.get("hermes") is HermesAgent
+
+
+def test_build_env_routes_the_api_key_to_the_provider_vars() -> None:
+    env = _build_env(
+        AgentConfig(provider="google", api_key="test-key", extra_env={"FOO": "BAR"}),
+    )
+
+    assert env["GEMINI_API_KEY"] == "test-key"
+    assert env["GOOGLE_API_KEY"] == "test-key"
+    assert env["FOO"] == "BAR"
+
+
+def test_build_env_omits_key_vars_when_no_key_is_configured() -> None:
+    """A keyless (ADC / Vertex) run must not export an empty credential."""
+    assert _build_env(AgentConfig(provider="google-vertex")) == {}
+
+
+def test_prepend_rules_is_a_noop_for_blank_rules() -> None:
+    assert _prepend_rules("   \n", "do the thing") == "do the thing"
+    assert _prepend_rules("be careful\n", "do the thing") == "be careful\n\ndo the thing"
+
+
+def test_resolve_hermes_bin_prefers_the_configured_target() -> None:
+    agent = HermesAgent(AgentConfig(target="/custom/bin/hermes"))
+    assert agent._resolve_hermes_bin() == "/custom/bin/hermes"
+
+
+@patch("os.path.exists")
+def test_resolve_hermes_bin_falls_back_to_path_lookup(mock_exists) -> None:
+    agent = HermesAgent(AgentConfig(target=None))
+
+    mock_exists.return_value = True
+    assert agent._resolve_hermes_bin() == os.path.expanduser("~/.local/bin/hermes")
+
+    mock_exists.return_value = False
+    assert agent._resolve_hermes_bin() == "hermes"
+
+
+def test_build_command_maps_vertex_onto_the_vertex_backend() -> None:
+    cmd = HermesAgent(
+        AgentConfig(target="/bin/hermes", model="gemini-3-pro", provider="google-vertex")
+    )._build_command("hi")
+
+    assert cmd == [
+        "/bin/hermes",
+        "chat",
+        "--query=hi",
+        "-m",
+        "gemini-3-pro",
+        "--provider",
+        "vertex",
+    ]
+
+
+def test_build_command_uses_the_adapter_family_for_direct_providers() -> None:
+    cmd = HermesAgent(AgentConfig(target="/bin/hermes", provider="anthropic"))._build_command("hi")
+
+    assert cmd == ["/bin/hermes", "chat", "--query=hi", "--provider", "claude"]
+
+
+def test_build_command_binds_a_dash_leading_prompt_to_the_query_flag() -> None:
+    """A prompt starting with ``-`` must not be parsed as a hermes flag."""
+    cmd = HermesAgent(AgentConfig(target="/bin/hermes"))._build_command("--help me")
+
+    assert cmd == ["/bin/hermes", "chat", "--query=--help me"]
+
+
+def test_prepare_config_writes_the_granted_mcp_servers(tmp_path: Path) -> None:
+    agent = HermesAgent(AgentConfig())
+    binding = McpBinding(name="k8s", command=("k8s-mcp", "--stdio"))
+
+    agent._prepare_config(tmp_path, (binding,))
+
+    data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert data["mcp_servers"] == {"k8s": {"command": "k8s-mcp", "args": ["--stdio"]}}
+
+
+def test_prepare_config_merges_over_a_null_mcp_servers_key(tmp_path: Path) -> None:
+    """A seeded config with an explicit ``mcp_servers: null`` must not crash."""
+    (tmp_path / "config.yaml").write_text("mcp_servers: null\n", encoding="utf-8")
+    agent = HermesAgent(AgentConfig())
+
+    agent._prepare_config(tmp_path, (McpBinding(name="k8s", command=("k8s-mcp",)),))
+
+    data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert data["mcp_servers"]["k8s"]["command"] == "k8s-mcp"
+
+
+def test_prepare_config_keeps_unrelated_keys_from_a_seeded_config(tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text("model: local-model\n", encoding="utf-8")
+    agent = HermesAgent(AgentConfig())
+
+    agent._prepare_config(tmp_path, (McpBinding(name="k8s", command=("k8s-mcp",)),))
+
+    data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert data["model"] == "local-model"
+    assert "k8s" in data["mcp_servers"]
+
+
+def test_prepare_config_survives_an_unparseable_seeded_config(tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text("::: not yaml :::\n", encoding="utf-8")
+    agent = HermesAgent(AgentConfig())
+
+    agent._prepare_config(tmp_path, ())
+
+    assert (tmp_path / "config.yaml").exists()
+
+
+def test_prepare_config_does_not_read_user_state_by_default(tmp_path: Path) -> None:
+    """A benchmark run is reproducible: ``~/.hermes`` is not inherited."""
+    home = tmp_path / "home"
+    (home / ".hermes").mkdir(parents=True)
+    (home / ".hermes" / "SOUL.md").write_text("ambient", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    with patch.dict(os.environ, {"HOME": str(home)}):
+        HermesAgent(AgentConfig())._prepare_config(run_dir, ())
+
+    assert not (run_dir / "SOUL.md").exists()
+
+
+def test_prepare_config_inherits_user_state_when_asked(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / ".hermes").mkdir(parents=True)
+    (home / ".hermes" / "SOUL.md").write_text("ambient", encoding="utf-8")
+    (home / ".hermes" / ".env").write_text("ANTHROPIC_API_KEY=secret", encoding="utf-8")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    with patch.dict(os.environ, {"HOME": str(home)}):
+        HermesAgent(AgentConfig(), inherit_user_config=True)._prepare_config(run_dir, ())
+
+    assert (run_dir / "SOUL.md").read_text(encoding="utf-8") == "ambient"
+    # ``.env`` holds the user's credentials and the run home lands in the run
+    # artifacts, so it is never inherited.
+    assert not (run_dir / ".env").exists()
+
+
+# --- _execute wiring ---------------------------------------------------------
+
+
+def _seed_state_db(home: Path, *, counts=(2748, 11267, 152, 334987, 12000)) -> None:
+    _init_schema(home / "state.db")
+    _insert_session(home / "state.db", "s1", *counts)
+
+
+def test_execute_reports_trajectory_and_tokens_from_the_state_db() -> None:
+    """End-to-end wiring: the run-scoped DB reaches ``AgentResult``."""
+
+    def fake_run(cmd, check, cwd, timeout, extra_env):
+        home = Path(extra_env["HERMES_HOME"])
+        _seed_state_db(home)
+        _insert_message(
+            home / "state.db",
+            "s1",
+            "assistant",
+            tool_calls=_tool_calls_json("call_1", "kubectl_apply", {"manifest": "nginx.yaml"}),
+        )
+        _insert_message(home / "state.db", "s1", "tool", content="applied", tool_call_id="call_1")
+        return SimpleNamespace(returncode=0, stdout="done", stderr="")
+
+    with patch.object(agent_mod, "run", side_effect=fake_run):
+        result = HermesAgent(AgentConfig(target="/bin/hermes")).run("hello")
+
+    assert result.output == "done"
+    assert not result.has_errors()
+    assert result.trajectory == [
+        {
+            "name": "kubectl_apply",
+            "args": {"manifest": "nginx.yaml"},
+            "result": "applied",
+            "status": "completed",
+        }
+    ]
+    assert result.tokens == {
+        "input": 2748,
+        "cached": 334987,
+        "cache_write": 12000,
+        "reasoning": 152,
+        "output": 11267,
+        "total": 2748 + 334987 + 12000 + 152 + 11267,
+    }
+
+
+def test_execute_runs_in_the_harness_workspace_when_given_one(tmp_path: Path) -> None:
+    """hermes runs *in* the workspace but keeps its own state out of it."""
+    seen: dict = {}
+
+    def fake_run(cmd, check, cwd, timeout, extra_env):
+        seen["cwd"] = cwd
+        seen["home"] = extra_env["HERMES_HOME"]
+        _seed_state_db(Path(extra_env["HERMES_HOME"]))
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    with patch.object(agent_mod, "run", side_effect=fake_run):
+        HermesAgent(AgentConfig(target="/bin/hermes")).run("hello", tmp_path)
+
+    assert seen["cwd"] == str(tmp_path)
+    assert seen["home"] == str(tmp_path / ".hermes")
+    assert (tmp_path / ".hermes" / "config.yaml").exists()
+    # Only the state home is added to the workspace, so the harness's
+    # generated-file diff stays dominated by what the agent actually wrote.
+    assert [entry.name for entry in tmp_path.iterdir()] == [".hermes"]
+
+
+def test_execute_materializes_granted_skills_under_the_state_home(tmp_path: Path) -> None:
+    src = tmp_path / "src" / "deploy"
+    src.mkdir(parents=True)
+    (src / "SKILL.md").write_text("---\nname: deploy\n---\nsteps", encoding="utf-8")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def fake_run(cmd, check, cwd, timeout, extra_env):
+        _seed_state_db(Path(extra_env["HERMES_HOME"]))
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    config = AgentConfig(
+        target="/bin/hermes",
+        capabilities=AllCapabilities(skills=SkillBinding(paths=(str(tmp_path / "src"),))),
+    )
+    with patch.object(agent_mod, "run", side_effect=fake_run):
+        HermesAgent(config).run("hello", workspace)
+
+    assert (workspace / ".hermes" / "skills" / "deploy" / "SKILL.md").exists()
+
+
+def test_execute_records_a_nonzero_exit_without_losing_the_trajectory() -> None:
+    def fake_run(cmd, check, cwd, timeout, extra_env):
+        _seed_state_db(Path(extra_env["HERMES_HOME"]))
+        return SimpleNamespace(returncode=3, stdout="partial", stderr="boom")
+
+    with patch.object(agent_mod, "run", side_effect=fake_run):
+        result = HermesAgent(AgentConfig(target="/bin/hermes")).run("hello")
+
+    assert result.metadata["returncode"] == 3
+    assert any("hermes agent exited 3: boom" in err for err in result.errors)
+    assert result.tokens["input"] == 2748
+
+
+def test_execute_on_timeout_reports_what_the_killed_run_flushed() -> None:
+    def fake_run(cmd, check, cwd, timeout, extra_env):
+        home = Path(extra_env["HERMES_HOME"])
+        _seed_state_db(home)
+        _insert_message(
+            home / "state.db",
+            "s1",
+            "assistant",
+            tool_calls=_tool_calls_json("call_1", "kubectl_get", {}),
+        )
+        raise SubprocessError(cmd, returncode=-1, stdout="out", stderr="err")
+
+    with patch.object(agent_mod, "run", side_effect=fake_run):
+        result = HermesAgent(AgentConfig(target="/bin/hermes", timeout_sec=5)).run("hello")
+
+    assert result.metadata["timeout"] is True
+    assert result.errors[0] == "hermes agent timed out after 5s"
+    assert [call["name"] for call in result.trajectory] == ["kubectl_get"]
+    assert result.tokens["input"] == 2748
+    assert "out" in result.output and "err" in result.output
+
+
+def test_execute_reports_canonical_none_tokens_when_the_binary_is_missing() -> None:
+    with patch.object(agent_mod, "run", side_effect=OSError("no such file")):
+        result = HermesAgent(AgentConfig(target="/bin/hermes")).run("hello")
+
+    assert result.has_errors()
+    assert result.trajectory == []
+    assert result.tokens == empty_tokens()
+
+
+# --- extract_trajectory_from_db ----------------------------------------------
+
+
+def test_trajectory_missing_db_is_reported(db_path: Path) -> None:
+    trajectory, errors = extract_trajectory_from_db(db_path)
+
+    assert trajectory == []
+    assert "State database not found" in errors[0]
+
+
+def test_trajectory_non_database_file_is_reported(db_path: Path) -> None:
+    db_path.write_text("not a database", encoding="utf-8")
+
+    trajectory, errors = extract_trajectory_from_db(db_path)
+
+    assert trajectory == []
+    assert errors and errors[0].startswith("Database error:")
+
+
+def test_trajectory_empty_db_reports_the_missing_table(db_path: Path) -> None:
+    db_path.touch()
+
+    trajectory, errors = extract_trajectory_from_db(db_path)
+
+    assert trajectory == []
+    assert "Database error: no such table: sessions" in errors[0]
+
+
+def test_trajectory_no_sessions_is_reported(db_path: Path) -> None:
+    _init_schema(db_path)
+
+    trajectory, errors = extract_trajectory_from_db(db_path)
+
+    assert trajectory == []
+    assert "No session found in state database" in errors[0]
+
+
+def test_trajectory_reads_only_the_newest_session(db_path: Path) -> None:
+    """Session ids are UUIDs, so "newest" is insertion order, not id order."""
+    _init_schema(db_path)
+    _insert_session(db_path, "f3a9-uuid", *[0] * len(_TOKEN_COLUMNS))
+    _insert_session(db_path, "0b21-uuid", *[0] * len(_TOKEN_COLUMNS))
+    _insert_message(
+        db_path, "f3a9-uuid", "assistant", tool_calls=_tool_calls_json("a", "old_call", {})
+    )
+    _insert_message(
+        db_path, "0b21-uuid", "assistant", tool_calls=_tool_calls_json("b", "new_call", {})
+    )
+
+    trajectory, errors = extract_trajectory_from_db(db_path)
+
+    assert errors == []
+    assert [call["name"] for call in trajectory] == ["new_call"]
+
+
+def test_trajectory_pairs_calls_with_their_results(db_path: Path) -> None:
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", *[0] * len(_TOKEN_COLUMNS))
+    _insert_message(db_path, "s1", "user", content="Deploy app")
+    _insert_message(
+        db_path,
+        "s1",
+        "assistant",
+        tool_calls=_tool_calls_json("call_1", "kubectl_apply", {"manifest": "nginx.yaml"}),
+    )
+    _insert_message(
+        db_path,
+        "s1",
+        "tool",
+        content="Successfully applied",
+        tool_call_id="call_1",
+        tool_name="kubectl_apply",
+    )
+
+    trajectory, errors = extract_trajectory_from_db(db_path)
+
+    assert errors == []
+    assert trajectory == [
+        {
+            "name": "kubectl_apply",
+            "args": {"manifest": "nginx.yaml"},
+            "result": "Successfully applied",
+            "status": "completed",
+        }
+    ]
+
+
+def test_trajectory_keeps_an_unanswered_call_as_called(db_path: Path) -> None:
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", *[0] * len(_TOKEN_COLUMNS))
+    _insert_message(
+        db_path, "s1", "assistant", tool_calls=_tool_calls_json("call_1", "kubectl_get", {})
+    )
+
+    trajectory, errors = extract_trajectory_from_db(db_path)
+
+    assert errors == []
+    assert trajectory[0]["status"] == "called"
+    assert trajectory[0]["result"] is None
+
+
+def test_trajectory_malformed_tool_calls_json_is_reported(db_path: Path) -> None:
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", *[0] * len(_TOKEN_COLUMNS))
+    _insert_message(db_path, "s1", "assistant", tool_calls="[invalid json")
+
+    trajectory, errors = extract_trajectory_from_db(db_path)
+
+    assert trajectory == []
+    assert "Failed to parse tool calls JSON" in errors[0]
+
+
+def test_trajectory_malformed_json_does_not_drop_later_calls(db_path: Path) -> None:
+    """One bad row must not truncate the rest of the session."""
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", *[0] * len(_TOKEN_COLUMNS))
+    _insert_message(db_path, "s1", "assistant", tool_calls="[invalid json")
+    _insert_message(
+        db_path, "s1", "assistant", tool_calls=_tool_calls_json("call_2", "kubectl_get", {})
+    )
+
+    trajectory, errors = extract_trajectory_from_db(db_path)
+
+    assert len(errors) == 1
+    assert [call["name"] for call in trajectory] == ["kubectl_get"]
+
+
+def test_trajectory_non_json_arguments_are_preserved_raw(db_path: Path) -> None:
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", *[0] * len(_TOKEN_COLUMNS))
+    _insert_message(
+        db_path,
+        "s1",
+        "assistant",
+        tool_calls=_tool_calls_json("call_1", "bash", "kubectl get po"),
+    )
+
+    trajectory, errors = extract_trajectory_from_db(db_path)
+
+    assert errors == []
+    assert trajectory[0]["args"] == {"raw_args": "kubectl get po"}
+
+
+def test_trajectory_decoded_object_arguments_are_used_as_is(db_path: Path) -> None:
+    """Non-OpenAI adapters store ``arguments`` already decoded, not as a string."""
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", *[0] * len(_TOKEN_COLUMNS))
+    entry = {"id": "call_1", "function": {"name": "bash", "arguments": {"cmd": "kubectl get po"}}}
+    _insert_message(db_path, "s1", "assistant", tool_calls=json.dumps([entry]))
+
+    trajectory, errors = extract_trajectory_from_db(db_path)
+
+    assert errors == []
+    assert trajectory[0]["args"] == {"cmd": "kubectl get po"}
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_error"),
+    [
+        ('{"function": {}}', "Tool calls JSON is not a list"),
+        ("[42]", "Skipped non-object tool call entry"),
+    ],
+)
+def test_trajectory_malformed_tool_call_shapes_are_reported(
+    db_path: Path, payload: str, expected_error: str
+) -> None:
+    """Valid JSON of the wrong shape must not crash the whole extraction."""
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", *[0] * len(_TOKEN_COLUMNS))
+    _insert_message(db_path, "s1", "assistant", tool_calls=payload)
+    _insert_message(
+        db_path, "s1", "assistant", tool_calls=_tool_calls_json("call_2", "kubectl_get", {})
+    )
+
+    trajectory, errors = extract_trajectory_from_db(db_path)
+
+    assert expected_error in errors[0]
+    assert [call["name"] for call in trajectory] == ["kubectl_get"]
+
+
+def test_trajectory_non_object_function_falls_back_to_unknown(db_path: Path) -> None:
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", *[0] * len(_TOKEN_COLUMNS))
+    _insert_message(
+        db_path, "s1", "assistant", tool_calls=json.dumps([{"id": "c1", "function": "bash"}])
+    )
+
+    trajectory, errors = extract_trajectory_from_db(db_path)
+
+    assert errors == []
+    assert trajectory == [{"name": "unknown", "args": {}, "result": None, "status": "called"}]
+
+
+def test_trajectory_missing_tool_name_falls_back_to_unknown(db_path: Path) -> None:
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", *[0] * len(_TOKEN_COLUMNS))
+    _insert_message(
+        db_path, "s1", "assistant", tool_calls=_tool_calls_json("call_1", None, {"a": 1})
+    )
+
+    trajectory, errors = extract_trajectory_from_db(db_path)
+
+    assert errors == []
+    assert trajectory[0]["name"] == "unknown"
+
+
+def test_trajectory_orphan_tool_result_is_kept_and_reported(db_path: Path) -> None:
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", *[0] * len(_TOKEN_COLUMNS))
+    _insert_message(
+        db_path,
+        "s1",
+        "tool",
+        content="Some result",
+        tool_call_id="call_unknown",
+        tool_name="kubectl_delete",
+    )
+
+    trajectory, errors = extract_trajectory_from_db(db_path)
+
+    assert "Found tool response for unknown tool_call_id: call_unknown" in errors[0]
+    assert trajectory == [
+        {"name": "kubectl_delete", "args": {}, "result": "Some result", "status": "completed"}
+    ]
+
+
+# --- extract_tokens_from_db --------------------------------------------------
+
+
+def test_tokens_fill_every_canonical_bucket(db_path: Path) -> None:
+    """The harness maps onto the shared schema — no bucket left unpopulated.
+
+    Guards against ``TOKEN_BUCKETS`` gaining a bucket this parser silently skips.
+    """
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", 1, 2, 3, 4, 5)
+
+    assert set(extract_tokens_from_db(db_path)) == set(TOKEN_BUCKETS)
+    assert all(value is not None for value in extract_tokens_from_db(db_path).values())
+
+
+def test_tokens_read_the_session_counts(db_path: Path) -> None:
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", 2748, 11267, 152, 334987, 12000)
+
+    assert extract_tokens_from_db(db_path) == {
+        "input": 2748,
+        "cached": 334987,
+        "cache_write": 12000,
+        "reasoning": 152,
+        "output": 11267,
+        "total": 2748 + 334987 + 12000 + 152 + 11267,
+    }
+
+
+def test_tokens_reach_the_result_row_unchanged(db_path: Path) -> None:
+    """Cross-layer guard: the emitted keys are the ones ``normalize_tokens`` reads.
+
+    A bucket named differently here would silently normalize to ``None`` on the
+    dashboard row rather than failing loudly.
+    """
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", 2748, 11267, 152, 334987, 12000)
+
+    normalized = normalize_tokens(extract_tokens_from_db(db_path))
+
+    assert normalized.input == 2748
+    assert normalized.output == 11267
+    assert normalized.cached == 334987
+    assert normalized.cache_write == 12000
+    assert normalized.reasoning == 152
+    assert normalized.total == 2748 + 334987 + 12000 + 152 + 11267
+
+
+def test_tokens_sum_across_sessions(db_path: Path) -> None:
+    # The DB is run-scoped; a run may write several session rows (compaction,
+    # sub-sessions), and session ids need not sort chronologically.
+    _init_schema(db_path)
+    _insert_session(db_path, "f3a9-uuid", 1, 1, 0, 0, 0)
+    _insert_session(db_path, "0b21-uuid", 500, 40, 5, 900, 30)
+
+    tokens = extract_tokens_from_db(db_path)
+
+    assert tokens["input"] == 501
+    assert tokens["output"] == 41
+    assert tokens["cached"] == 900
+    assert tokens["total"] == 501 + 41 + 5 + 900 + 30
+
+
+def test_tokens_coerce_real_values(db_path: Path) -> None:
+    # SQLite columns are dynamically typed; a REAL count must not be dropped.
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", 100, 7, 0, 0, 12000.0)
+
+    tokens = extract_tokens_from_db(db_path)
+
+    assert tokens["cache_write"] == 12000
+    assert tokens["input"] == 100
+
+
+def test_tokens_null_columns_stay_none(db_path: Path) -> None:
+    # NULL counts (e.g. a crashed run) must surface as None, not a fake 0.
+    _init_schema(db_path)
+    _insert_session(db_path, "s1", 100, 7, None, None, None)
+
+    tokens = extract_tokens_from_db(db_path)
+
+    assert tokens["input"] == 100
+    assert tokens["output"] == 7
+    assert tokens["reasoning"] is None
+    assert tokens["cached"] is None
+    assert tokens["cache_write"] is None
+    assert tokens["total"] == 107
+
+
+def test_tokens_no_session_rows_stay_none(db_path: Path) -> None:
+    """SUM over an empty table yields NULL, which must not become 0."""
+    _init_schema(db_path)
+
+    assert extract_tokens_from_db(db_path) == empty_tokens()
+
+
+def test_tokens_old_schema_without_token_columns(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, started_at TIMESTAMP)")
+    conn.commit()
+    conn.close()
+
+    assert extract_tokens_from_db(db_path) == empty_tokens()
+
+
+def test_tokens_missing_or_invalid_db(db_path: Path) -> None:
+    assert extract_tokens_from_db(db_path) == empty_tokens()  # no file
+    db_path.write_text("not a database", encoding="utf-8")
+    assert extract_tokens_from_db(db_path) == empty_tokens()

@@ -73,6 +73,7 @@ _BUILTIN_AGENT_MODULES: tuple[str, ...] = (
     "devops_bench.agents.cli.gemini_cli",
     "devops_bench.agents.cli.openclaw",
     "devops_bench.agents.cli.antigravity",
+    "devops_bench.agents.cli.hermes",
     "devops_bench.agents.api.agent",
 )
 
