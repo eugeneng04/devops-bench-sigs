@@ -27,9 +27,10 @@ per-run working directory before invocation:
 * **Skills** — ``config.capabilities.skills.paths`` are materialized under
   ``<cwd>/.claude/skills/<name>/SKILL.md``, Claude Code's skill-discovery root.
 * **MCP servers** — command-bearing bindings become a ``{"mcpServers": ...}``
-  document at ``<cwd>/.claude/mcp-config.json``, passed via ``--mcp-config``
-  together with ``--strict-mcp-config`` so any stray project ``.mcp.json`` is
-  ignored and no trust prompt fires.
+  document at ``<cwd>/.claude/mcp-config.json``, passed via ``--mcp-config``.
+  ``--strict-mcp-config`` is always set — including on a baseline arm with no
+  bindings — so any stray project ``.mcp.json`` is ignored and no trust prompt
+  fires.
 
 Auth is env-driven, matching the bench contract: ``config.api_key`` →
 ``ANTHROPIC_API_KEY`` for the direct API, or keyless Vertex / Bedrock via ADC /
@@ -75,18 +76,27 @@ _CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
 
 _log = get_logger("agents.cli.claude_code")
 
+# Child stderr is unbounded and reaches the persisted result record (both
+# ``metadata`` and ``errors``), so every path clips it to the same tail.
+_STDERR_TAIL_CHARS = 2000
+
+
+def _stderr_tail(stderr: str | None) -> str:
+    """Stripped last :data:`_STDERR_TAIL_CHARS` characters of ``stderr``."""
+    return (stderr or "").strip()[-_STDERR_TAIL_CHARS:]
+
 
 def _errored_with_tokens(msg: str, *, stderr: str | None = None) -> AgentResult:
     """An errored result carrying the canonical all-``None`` token shape.
 
-    ``stderr`` (last 2000 chars) is attached to ``metadata`` when present, so the
+    ``stderr`` (clipped tail) is attached to ``metadata`` when present, so the
     no-stdout failure path keeps the same diagnostic signal as the other paths.
     """
     result = AgentResult.errored(msg)
     result.tokens = empty_tokens()
-    tail = (stderr or "").strip()
+    tail = _stderr_tail(stderr)
     if tail:
-        result.metadata["stderr"] = tail[-2000:]
+        result.metadata["stderr"] = tail
     return result
 
 
@@ -101,9 +111,18 @@ def _build_argv(
     """Build the ``claude`` headless invocation for ``prompt``.
 
     ``--verbose`` is mandatory (the CLI rejects ``stream-json`` under ``-p``
-    without it); ``--dangerously-skip-permissions`` keeps headless runs from
-    blocking on confirmation prompts; ``--strict-mcp-config`` pins the CLI to
-    exactly the bound servers, ignoring any stray ``.mcp.json``.
+    without it) and ``--dangerously-skip-permissions`` keeps headless runs from
+    blocking on confirmation prompts.
+
+    ``--strict-mcp-config`` is passed unconditionally, not just alongside
+    ``--mcp-config``: it pins the run to exactly the bound servers, and for a
+    baseline arm that set is empty. Without it, a stray ``.mcp.json`` in the task
+    workspace (the CLI's cwd) is loaded and silently grants MCP tools to the
+    un-augmented arm, contaminating the very comparison the bench measures.
+
+    The prompt is the trailing positional after ``--``. The CLI's option parser
+    would otherwise read a prompt whose first token begins with ``-`` as a flag
+    and abort the run.
 
     Args:
         target: Path to the ``claude`` binary (already user-expanded).
@@ -119,18 +138,19 @@ def _build_argv(
     argv = [
         target,
         "-p",
-        prompt,
         "--output-format",
         "stream-json",
         "--verbose",
         "--dangerously-skip-permissions",
+        "--strict-mcp-config",
     ]
     if model:
         argv.extend(["--model", model])
     if max_turns is not None and max_turns > 0:
         argv.extend(["--max-turns", str(max_turns)])
     if mcp_config_path:
-        argv.extend(["--mcp-config", mcp_config_path, "--strict-mcp-config"])
+        argv.extend(["--mcp-config", mcp_config_path])
+    argv.extend(["--", prompt])
     return argv
 
 
@@ -276,24 +296,27 @@ class ClaudeCodeAgent(AgentHarness):
                         timeout=self.config.timeout_sec,
                     )
                 except SubprocessError as exc:
+                    # str(exc) embeds the child's full stderr, so rebuild the
+                    # message from the clipped tail rather than interpolating it.
+                    stderr = _stderr_tail(exc.stderr)
+                    reason = (
+                        f"claude subprocess error: exit {exc.returncode}: {stderr or '<no stderr>'}"
+                    )
                     # A timeout raises with the partial stream-json captured
                     # before the kill; recover the trajectory instead of dropping it.
                     if exc.stdout:
                         output, trajectory, tokens, parse_errors = parse_stream_json(exc.stdout)
-                        metadata = {}
-                        stderr = (exc.stderr or "").strip()
+                        metadata: dict = {"returncode": exc.returncode}
                         if stderr:
-                            metadata["stderr"] = stderr[-2000:]
+                            metadata["stderr"] = stderr
                         return AgentResult(
-                            output=output or f"claude subprocess error: {exc}",
+                            output=output or reason,
                             trajectory=trajectory,
                             tokens=tokens,
-                            errors=[*parse_errors, f"claude subprocess error: {exc}"],
+                            errors=[*parse_errors, reason],
                             metadata=metadata,
                         )
-                    return _errored_with_tokens(
-                        f"claude subprocess error: {exc}", stderr=exc.stderr
-                    )
+                    return _errored_with_tokens(reason, stderr=exc.stderr)
                 except OSError as exc:
                     # Spawn failure core.subprocess.run does not wrap: usually a
                     # missing / non-executable binary, but also a vanished cwd.
@@ -301,12 +324,12 @@ class ClaudeCodeAgent(AgentHarness):
 
         output, trajectory, tokens, parse_errors = parse_stream_json(completed.stdout or "")
         errors: list[str] = list(parse_errors)
-        metadata: dict = {}
-        stderr = (completed.stderr or "").strip()
+        metadata = {}
+        stderr = _stderr_tail(completed.stderr)
         if stderr:
             # Keep stderr for diagnosis even on a clean exit — e.g. MCP startup
             # warnings that leave the process returncode at 0.
-            metadata["stderr"] = stderr[-2000:]
+            metadata["stderr"] = stderr
         if completed.returncode != 0:
             errors.append(f"claude exited {completed.returncode}: {stderr or '<no stderr>'}")
             if not output:

@@ -40,17 +40,39 @@ def _int_or_none(val: object) -> int | None:
     return val if isinstance(val, int) and not isinstance(val, bool) else None
 
 
+# Claude Code echoes the full body of every tool result into the stream, so an
+# uncapped trajectory grows with the agent's file reads and command output. The
+# whole trace is re-serialized into the LLM judge prompts downstream, where a
+# multi-megabyte trace overruns the judge's context, so keep a head and tail
+# slice — metric matching only needs the edges, not the middle.
+_RESULT_HEAD_CHARS = 12000
+_RESULT_TAIL_CHARS = 4000
+_RESULT_MAX_CHARS = _RESULT_HEAD_CHARS + _RESULT_TAIL_CHARS
+
+
+def _clip_result(text: str) -> str:
+    """Head+tail slice ``text`` to :data:`_RESULT_MAX_CHARS`, marking the elision."""
+    if len(text) <= _RESULT_MAX_CHARS:
+        return text
+    elided = len(text) - _RESULT_MAX_CHARS
+    return (
+        f"{text[:_RESULT_HEAD_CHARS]}\n... [{elided} chars elided] ...\n"
+        f"{text[-_RESULT_TAIL_CHARS:]}"
+    )
+
+
 def _block_text(content: object) -> str | None:
     """Render a tool_result ``content`` payload to a string, or ``None``.
 
     Claude Code emits tool results either as a bare string or as a list of
     content blocks. Text blocks contribute their text; any other block (e.g. an
-    ``image``) is JSON-encoded in place so nothing is dropped silently.
+    ``image``) is JSON-encoded in place so nothing is dropped silently. The
+    rendered text is clipped (see :func:`_clip_result`).
     """
     if content is None:
         return None
     if isinstance(content, str):
-        return content
+        return _clip_result(content)
     if isinstance(content, list):
         if not content:
             return None
@@ -60,8 +82,8 @@ def _block_text(content: object) -> str | None:
             else json.dumps(block, default=str)
             for block in content
         ]
-        return "".join(parts)
-    return json.dumps(content, default=str)
+        return _clip_result("".join(parts))
+    return _clip_result(json.dumps(content, default=str))
 
 
 # Claude Code namespaces MCP tools as ``mcp__<server>__<tool>``. The rest of the
@@ -94,9 +116,14 @@ def _iter_events(stdout: str) -> Iterator[tuple[object, str | None]]:
     decoded with ``raw_decode`` in a loop so every object is recovered rather
     than lost to a single ``Extra data`` error. A malformed remainder yields one
     error and the rest of that line is abandoned.
+
+    Splitting on ``"\\n"`` rather than :meth:`str.splitlines` is deliberate: the
+    CLI leaves U+0085 (NEL) unescaped inside JSON strings, and ``splitlines``
+    would treat it as a line break, shredding that event into two undecodable
+    fragments.
     """
     decoder = json.JSONDecoder()
-    for lineno, raw in enumerate(stdout.splitlines(), start=1):
+    for lineno, raw in enumerate(stdout.split("\n"), start=1):
         line = raw.strip()
         if not line:
             continue
@@ -137,7 +164,8 @@ def parse_stream_json(stdout: str) -> tuple[str, list[dict], dict, list[str]]:
     empty answer (error subtypes emit ``""``). Likewise token usage falls back to
     the per-turn accumulator only when the terminal event reports no usage;
     per-turn usage is deduped by message id, since Claude Code repeats the same
-    ``usage`` on every content-block envelope of one API message.
+    ``usage`` on every content-block envelope of one API message. That fallback
+    recovers the prompt-side buckets only (see :data:`_ACC_USAGE_KEYS`).
 
     Args:
         stdout: Raw process stdout, possibly empty.
@@ -278,16 +306,26 @@ def _has_usage(usage: dict) -> bool:
     return any(_int_or_none(usage.get(key)) is not None for key in _USAGE_KEYS)
 
 
+# ``output_tokens`` is deliberately absent from the accumulator. The per-turn
+# ``usage`` on an assistant envelope is the streaming ``message_start`` snapshot,
+# whose ``output_tokens`` is a placeholder of a few tokens rather than the final
+# count (observed: a summed 3 against a terminal 3069). The prompt-side fields do
+# accumulate faithfully, so they are kept and ``output`` is left unreported —
+# per the bucket contract, an absent number beats an invented one.
+_ACC_USAGE_KEYS = tuple(key for key in _USAGE_KEYS if key != "output_tokens")
+
+
 def _add_usage(acc: dict, usage: object) -> None:
     """Fold an Anthropic per-turn ``usage`` block into a running accumulator.
 
     Callers dedupe by message id first, so each API message is added once. The
     terminal ``result`` usage is cumulative and authoritative; this accumulator
-    is only a best-effort stand-in for a truncated stream that never emits it.
+    is only a best-effort stand-in for a truncated stream that never emits it,
+    and covers :data:`_ACC_USAGE_KEYS` only.
     """
     if not isinstance(usage, dict):
         return
-    for key in _USAGE_KEYS:
+    for key in _ACC_USAGE_KEYS:
         val = _int_or_none(usage.get(key))
         if val is not None:
             acc[key] = acc.get(key, 0) + val
@@ -297,17 +335,25 @@ def _usage_tokens(usage: dict) -> dict[str, int | None]:
     """Normalize an Anthropic ``usage`` block onto :data:`TOKEN_BUCKETS`.
 
     ``input_tokens`` is already the uncached prompt; cache reads and writes stay
-    separate buckets (writes bill at a premium). ``reasoning`` stays ``None``:
-    Anthropic bills extended thinking inside ``output_tokens`` and reports no
-    separate count, so there is nothing to split out. Leaving it unreported —
-    rather than a fabricated ``0`` — keeps ``total`` free of double counting.
+    separate buckets (writes bill at a premium). Extended thinking is billed
+    *inside* ``output_tokens`` and counted again under
+    ``output_tokens_details.thinking_tokens``, so it is subtracted back out to
+    honour the contract that ``output`` excludes ``reasoning`` while ``total``
+    stays exact. Without that details block ``reasoning`` stays ``None`` rather
+    than a fabricated ``0``.
     """
     tokens = empty_tokens()
+    output = _int_or_none(usage.get("output_tokens"))
+    details = usage.get("output_tokens_details")
+    reasoning = _int_or_none(details.get("thinking_tokens")) if isinstance(details, dict) else None
+    if output is not None and reasoning is not None:
+        output = max(0, output - reasoning)
     tokens.update(
         input=_int_or_none(usage.get("input_tokens")),
         cached=_int_or_none(usage.get("cache_read_input_tokens")),
         cache_write=_int_or_none(usage.get("cache_creation_input_tokens")),
-        output=_int_or_none(usage.get("output_tokens")),
+        reasoning=reasoning,
+        output=output,
     )
     reported = [v for k, v in tokens.items() if k != "total" and v is not None]
     if reported:

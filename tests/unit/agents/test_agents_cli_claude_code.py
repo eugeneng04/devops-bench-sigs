@@ -140,6 +140,61 @@ def test_tokens_reach_the_result_row_unchanged() -> None:
     assert normalized.total == 2748 + 11267 + 334987 + 12000
 
 
+def test_thinking_tokens_split_out_of_output() -> None:
+    """Extended thinking is billed inside ``output_tokens`` and reported again
+    under ``output_tokens_details``. The canonical contract says ``output``
+    excludes ``reasoning``, so it is subtracted back out — leaving ``total``
+    (which sums every bucket) equal to the provider's own accounting."""
+    blob = _stream(
+        {
+            "type": "result",
+            "result": "ok",
+            "usage": {
+                "input_tokens": 4,
+                "output_tokens": 3069,
+                "cache_read_input_tokens": 13445,
+                "cache_creation_input_tokens": 31257,
+                "output_tokens_details": {"thinking_tokens": 2778},
+            },
+        }
+    )
+
+    _output, _trajectory, tokens, _errors = parse_stream_json(blob)
+
+    assert tokens == _tok(
+        input=4,
+        cached=13445,
+        cache_write=31257,
+        reasoning=2778,
+        output=3069 - 2778,
+        total=4 + 13445 + 31257 + 3069,
+    )
+
+
+def test_thinking_tokens_absent_leaves_reasoning_unreported() -> None:
+    """No ``output_tokens_details`` means nothing to split: ``reasoning`` stays
+    ``None`` rather than a fabricated ``0``, and ``output`` is untouched."""
+    blob = _stream(
+        {"type": "result", "result": "ok", "usage": {"input_tokens": 4, "output_tokens": 78}}
+    )
+    _output, _trajectory, tokens, _errors = parse_stream_json(blob)
+    assert tokens == _tok(input=4, reasoning=None, output=78, total=82)
+
+
+def test_thinking_tokens_exceeding_output_clamp_at_zero() -> None:
+    """A provider quirk must not produce a negative bucket."""
+    blob = _stream(
+        {
+            "type": "result",
+            "result": "ok",
+            "usage": {"output_tokens": 5, "output_tokens_details": {"thinking_tokens": 9}},
+        }
+    )
+    _output, _trajectory, tokens, _errors = parse_stream_json(blob)
+    assert tokens["output"] == 0
+    assert tokens["reasoning"] == 9
+
+
 def test_parse_stream_json_emits_canonical_trajectory() -> None:
     output, trajectory, tokens, errors = parse_stream_json(SAMPLE_STREAM)
     assert output == "Done."
@@ -297,8 +352,9 @@ def test_parse_stream_json_falls_back_to_assistant_text_without_result_event() -
 
 
 def test_parse_stream_json_falls_back_to_accumulated_usage_without_result_event() -> None:
-    """A truncated stream (no terminal ``result``) still yields token counts,
-    summed from the per-turn assistant ``usage``."""
+    """A truncated stream (no terminal ``result``) still yields prompt-side token
+    counts, summed from the per-turn assistant ``usage``. ``output`` stays
+    unreported — see the next test."""
     blob = _stream(
         {
             "type": "assistant",
@@ -321,8 +377,27 @@ def test_parse_stream_json_falls_back_to_accumulated_usage_without_result_event(
     )
     output, _trajectory, tokens, errors = parse_stream_json(blob)
     assert output == "ab"
-    assert tokens == _tok(input=30, cached=2, cache_write=3, output=12, total=47)
+    assert tokens == _tok(input=30, cached=2, cache_write=3, total=35)
     assert errors == []
+
+
+def test_parse_stream_json_accumulator_leaves_output_unreported() -> None:
+    """Per-turn ``usage.output_tokens`` is the ``message_start`` placeholder — a
+    handful of tokens against a real terminal count in the thousands. Summing it
+    would persist an invented number, so the bucket is left ``None``."""
+    blob = _stream(
+        {
+            "type": "assistant",
+            "message": {
+                "id": "msg_1",
+                "content": [{"type": "text", "text": "..."}],
+                "usage": {"input_tokens": 4, "output_tokens": 3},
+            },
+        },
+    )
+    _output, _trajectory, tokens, _errors = parse_stream_json(blob)
+    assert tokens["output"] is None
+    assert tokens == _tok(input=4, total=4)
 
 
 def test_parse_stream_json_result_usage_wins_over_accumulated() -> None:
@@ -362,7 +437,7 @@ def test_parse_stream_json_falls_back_when_result_usage_degenerate() -> None:
         {"type": "result", "subtype": "success", "result": "x", "usage": {}},
     )
     _output, _trajectory, tokens, _errors = parse_stream_json(blob)
-    assert tokens == _tok(input=15, output=4, total=19)
+    assert tokens == _tok(input=15, total=15)
 
 
 def test_parse_stream_json_result_string_is_authoritative_over_text() -> None:
@@ -400,7 +475,7 @@ def test_parse_stream_json_dedupes_accumulated_usage_by_message_id() -> None:
         },
     )
     _output, _trajectory, tokens, _errors = parse_stream_json(blob)
-    assert tokens == _tok(input=100, cached=8, output=40, total=148)
+    assert tokens == _tok(input=100, cached=8, total=108)
 
 
 def test_parse_stream_json_empty_result_falls_back_to_text() -> None:
@@ -468,6 +543,73 @@ def test_parse_stream_json_recovers_concatenated_objects_on_one_line() -> None:
     assert output == "hi"
     assert tokens == _tok(input=3, output=1, total=4)
     assert errors == []
+
+
+def test_parse_stream_json_survives_unescaped_unicode_line_breaks() -> None:
+    """The CLI leaves U+0085 (NEL) unescaped inside JSON strings — real command
+    output carries it when a log is mis-decoded as latin-1. Framing must key on
+    ``\\n`` alone; ``str.splitlines`` would shred that event into undecodable
+    fragments, losing the tool call and injecting bogus errors that flip the run
+    to unvalidated.
+    """
+    body = "line\u0085next"
+    events = (
+        _assistant({"type": "tool_use", "id": "t1", "name": "Bash", "input": {"cmd": "cat log"}}),
+        {
+            "type": "user",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": body}]},
+        },
+        {"type": "result", "subtype": "success", "result": "done"},
+    )
+    # ensure_ascii=False mirrors Node's JSON.stringify, which leaves U+0085 raw.
+    blob = "\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n"
+    assert "\u0085" in blob  # guard: the fixture must carry the raw character
+
+    output, trajectory, _tokens, errors = parse_stream_json(blob)
+    assert errors == []
+    assert output == "done"
+    assert len(trajectory) == 1
+    assert trajectory[0]["status"] == "completed"
+    assert trajectory[0]["result"] == body
+
+
+def test_parse_stream_json_clips_oversized_tool_results() -> None:
+    """Claude Code echoes the full body of every tool result. The trajectory is
+    re-serialized into the LLM judge prompts, so an uncapped result overruns the
+    judge's context — keep the head and tail with the middle marked elided."""
+    payload = "A" * 20_000 + "TAIL"
+    blob = _stream(
+        _assistant({"type": "tool_use", "id": "t1", "name": "Read", "input": {}}),
+        {
+            "type": "user",
+            "message": {
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": payload}]
+            },
+        },
+    )
+    _output, trajectory, _tokens, errors = parse_stream_json(blob)
+    result = trajectory[0]["result"]
+    assert errors == []
+    assert len(result) < len(payload)
+    assert result.startswith("A" * 100)
+    assert result.endswith("TAIL")
+    assert "chars elided" in result
+
+
+def test_parse_stream_json_keeps_tool_results_under_the_cap_verbatim() -> None:
+    """The clip must not touch an ordinary result."""
+    payload = "B" * 500
+    blob = _stream(
+        _assistant({"type": "tool_use", "id": "t1", "name": "Read", "input": {}}),
+        {
+            "type": "user",
+            "message": {
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": payload}]
+            },
+        },
+    )
+    _output, trajectory, _tokens, _errors = parse_stream_json(blob)
+    assert trajectory[0]["result"] == payload
 
 
 def test_parse_stream_json_non_dict_message_does_not_crash() -> None:
@@ -541,8 +683,9 @@ def test_block_text_preserves_non_text_blocks() -> None:
 def test_build_argv_base_flags_and_prompt_via_argv() -> None:
     argv = _build_argv("/bin/claude", "hi", model=None, max_turns=None, mcp_config_path=None)
     assert argv[0] == "/bin/claude"
-    # Prompt is an argv value (never a shell string), right after ``-p``.
-    assert argv[1:3] == ["-p", "hi"]
+    # Prompt is the trailing argv value (never a shell string), behind ``--``.
+    assert argv[-2:] == ["--", "hi"]
+    assert "-p" in argv
     assert "--output-format" in argv and "stream-json" in argv
     assert "--verbose" in argv  # required for stream-json under -p
     assert "--dangerously-skip-permissions" in argv
@@ -550,9 +693,17 @@ def test_build_argv_base_flags_and_prompt_via_argv() -> None:
     assert "--model" not in argv
     assert "--max-turns" not in argv
     assert "--mcp-config" not in argv
-    assert "--strict-mcp-config" not in argv
     # This harness never emits an allowlist (bare names can't match mcp__ tools).
     assert "--allowedTools" not in argv and "--allowed-tools" not in argv
+
+
+def test_build_argv_shields_a_flag_like_prompt_behind_a_separator() -> None:
+    """A prompt whose first token looks like a flag must reach the CLI as the
+    prompt. Without ``--`` the option parser consumes it and aborts the run."""
+    argv = _build_argv(
+        "/bin/claude", "--settings=/tmp/x.json", model=None, max_turns=None, mcp_config_path=None
+    )
+    assert argv[-2:] == ["--", "--settings=/tmp/x.json"]
 
 
 def test_build_argv_threads_model_and_max_turns_when_set() -> None:
@@ -563,12 +714,17 @@ def test_build_argv_threads_model_and_max_turns_when_set() -> None:
     assert argv[argv.index("--max-turns") + 1] == "7"
 
 
-def test_build_argv_adds_strict_mcp_config_only_when_config_bound() -> None:
-    argv = _build_argv(
+def test_build_argv_always_sets_strict_mcp_config() -> None:
+    """Strict mode is unconditional: on a baseline arm it pins the run to zero
+    servers, so a stray ``.mcp.json`` in the workspace cannot grant MCP tools."""
+    bare = _build_argv("/bin/claude", "hi", model=None, max_turns=None, mcp_config_path=None)
+    assert "--strict-mcp-config" in bare
+
+    bound = _build_argv(
         "/bin/claude", "hi", model=None, max_turns=None, mcp_config_path="/w/.claude/mcp.json"
     )
-    assert argv[argv.index("--mcp-config") + 1] == "/w/.claude/mcp.json"
-    assert "--strict-mcp-config" in argv
+    assert bound[bound.index("--mcp-config") + 1] == "/w/.claude/mcp.json"
+    assert "--strict-mcp-config" in bound
 
 
 # ---------------------------------------------------------------------------
@@ -680,7 +836,7 @@ def test_execute_returns_typed_result_with_trajectory(monkeypatch) -> None:
     assert result.tokens == _tok(input=10, cached=5, output=20, total=35)
     assert captured["timeout"] == 30.0
     assert captured["argv"][0].endswith("claude-x")
-    assert captured["argv"][1:3] == ["-p", "ping"]
+    assert captured["argv"][-2:] == ["--", "ping"]
 
 
 def test_execute_wires_extra_env_into_subprocess_call(monkeypatch) -> None:
