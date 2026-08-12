@@ -30,7 +30,8 @@ per-run working directory before invocation:
   document at ``<cwd>/.claude/mcp-config.json``, passed via ``--mcp-config``.
   ``--strict-mcp-config`` is always set — including on a baseline arm with no
   bindings — so any stray project ``.mcp.json`` is ignored and no trust prompt
-  fires.
+  fires. A bound run first checks the binary against
+  :data:`_MCP_WAIT_MIN_VERSION`.
 
 Auth is env-driven, matching the bench contract: ``config.api_key`` →
 ``ANTHROPIC_API_KEY`` for the direct API, or keyless Vertex / Bedrock via ADC /
@@ -44,6 +45,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -83,6 +85,32 @@ _STDERR_TAIL_CHARS = 2000
 def _stderr_tail(stderr: str | None) -> str:
     """Stripped last :data:`_STDERR_TAIL_CHARS` characters of ``stderr``."""
     return (stderr or "").strip()[-_STDERR_TAIL_CHARS:]
+
+
+# ``--mcp-config`` under ``-p`` only waits for still-pending servers to connect
+# before the first turn from this version on. An older binary accepts the flag
+# and starts the turn anyway, so an MCP-augmented arm can run with none of its
+# tools attached and still be scored as augmented — the same silent
+# contamination ``--strict-mcp-config`` prevents from the other direction.
+_MCP_WAIT_MIN_VERSION = (2, 1, 221)
+_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def _claude_version(target: str) -> tuple[int, int, int] | None:
+    """Parse ``claude --version``, or ``None`` when it cannot be determined.
+
+    An unreadable version is not an error: ``config.target`` may be a wrapper
+    script with its own ``--version`` surface, and refusing to run on a probe
+    that merely failed to parse would be worse than the risk it guards.
+    """
+    try:
+        completed = run([target, "--version"], check=False, timeout=30)
+    except (OSError, SubprocessError):
+        return None
+    match = _VERSION_RE.search(completed.stdout or "")
+    if completed.returncode != 0 or not match:
+        return None
+    return (int(match[1]), int(match[2]), int(match[3]))
 
 
 def _errored_with_tokens(msg: str, *, stderr: str | None = None) -> AgentResult:
@@ -280,6 +308,16 @@ class ClaudeCodeAgent(AgentHarness):
                 # not leave it at the umask default (0o644 on most machines).
                 mcp_path.chmod(0o600)
                 mcp_config_path = str(mcp_path)
+                version = _claude_version(target)
+                if version is not None and version < _MCP_WAIT_MIN_VERSION:
+                    return _errored_with_tokens(
+                        "claude "
+                        + ".".join(str(part) for part in version)
+                        + " predates the --mcp-config startup wait (needs "
+                        + ".".join(str(part) for part in _MCP_WAIT_MIN_VERSION)
+                        + "); an MCP-bound arm would run without its servers. "
+                        "Upgrade the binary or drop the mcp_servers binding."
+                    )
 
             argv = _build_argv(
                 target,

@@ -1007,6 +1007,8 @@ def test_execute_writes_mcp_config_and_passes_flag(monkeypatch: pytest.MonkeyPat
     captured: dict = {}
 
     def fake_run(argv, **kwargs):
+        if "--version" in argv:
+            return SimpleNamespace(stdout="2.1.228 (Claude Code)\n", stderr="", returncode=0)
         captured["argv"] = argv
         mcp_path = os.path.join(kwargs["cwd"], ".claude", "mcp-config.json")
         captured["exists"] = os.path.exists(mcp_path)
@@ -1030,6 +1032,83 @@ def test_execute_writes_mcp_config_and_passes_flag(monkeypatch: pytest.MonkeyPat
     argv = captured["argv"]
     assert argv[argv.index("--mcp-config") + 1].endswith(os.path.join(".claude", "mcp-config.json"))
     assert "--strict-mcp-config" in argv
+
+
+def _mcp_caps() -> AllCapabilities:
+    return AllCapabilities(
+        mcp_servers=(McpBinding(name="gke", command=("gke-mcp",), tools=("mcp__gke__x",)),),
+    )
+
+
+def test_execute_refuses_mcp_run_on_a_binary_predating_the_startup_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older binary accepts ``--mcp-config`` but starts the first turn without
+    waiting for the servers, so the arm runs un-augmented yet is scored as
+    augmented. Fail loud instead of recording a contaminated result."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "--version" in argv:
+            return SimpleNamespace(stdout="2.1.220 (Claude Code)\n", stderr="", returncode=0)
+        raise AssertionError("the agent turn must not run on an under-version binary")
+
+    monkeypatch.setattr(claude_mod, "run", fake_run)
+    result = ClaudeCodeAgent(AgentConfig(target="claude", capabilities=_mcp_caps())).run("p")
+
+    assert calls == [["claude", "--version"]]
+    assert result.tokens == empty_tokens()
+    assert "2.1.220" in result.errors[0]
+    assert "2.1.221" in result.errors[0]
+
+
+def test_execute_skips_the_version_probe_without_mcp_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The floor only bites on ``--mcp-config``; a baseline arm must not pay for
+    an extra subprocess on every run."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(claude_mod, "run", fake_run)
+    ClaudeCodeAgent(AgentConfig(target="claude")).run("p")
+
+    assert all("--version" not in argv for argv in calls)
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        SimpleNamespace(stdout="", stderr="not a claude binary", returncode=1),
+        SimpleNamespace(stdout="wrapper build abc\n", stderr="", returncode=0),
+        OSError("no such binary"),
+    ],
+    ids=["nonzero-exit", "unparseable", "spawn-failure"],
+)
+def test_execute_proceeds_when_the_version_probe_is_inconclusive(
+    monkeypatch: pytest.MonkeyPatch, probe: object
+) -> None:
+    """``config.target`` may be a wrapper with its own ``--version`` surface, so a
+    probe that fails to yield a number must not block the run."""
+    ran = []
+
+    def fake_run(argv, **kwargs):
+        if "--version" in argv:
+            if isinstance(probe, OSError):
+                raise probe
+            return probe
+        ran.append(list(argv))
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(claude_mod, "run", fake_run)
+    ClaudeCodeAgent(AgentConfig(target="claude", capabilities=_mcp_caps())).run("p")
+
+    assert len(ran) == 1
+    assert "--mcp-config" in ran[0]
 
 
 def test_execute_writes_no_mcp_config_when_no_command(monkeypatch: pytest.MonkeyPatch) -> None:
