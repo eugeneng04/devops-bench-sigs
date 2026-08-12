@@ -830,7 +830,7 @@ def test_claude_agent_mirrors_capability_bindings_onto_mixin_attributes() -> Non
 def test_execute_returns_typed_result_with_trajectory(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         captured["argv"] = argv
         captured["timeout"] = kwargs.get("timeout")
         return SimpleNamespace(stdout=SAMPLE_STREAM, stderr="", returncode=0)
@@ -849,7 +849,7 @@ def test_execute_returns_typed_result_with_trajectory(monkeypatch: pytest.Monkey
 def test_execute_wires_extra_env_into_subprocess_call(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         captured["extra_env"] = kwargs.get("extra_env")
         return SimpleNamespace(stdout="", stderr="", returncode=0)
 
@@ -861,7 +861,7 @@ def test_execute_wires_extra_env_into_subprocess_call(monkeypatch: pytest.Monkey
 
 
 def test_execute_records_non_zero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(stdout="", stderr="boom", returncode=2)
 
     monkeypatch.setattr(claude_mod, "run", fake_run)
@@ -879,7 +879,7 @@ def test_execute_parses_stream_on_non_zero_exit(monkeypatch: pytest.MonkeyPatch)
         {"type": "result", "subtype": "error_max_turns", "result": "hit the cap"},
     )
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(stdout=stream, stderr="turn limit reached", returncode=1)
 
     monkeypatch.setattr(claude_mod, "run", fake_run)
@@ -895,7 +895,7 @@ def test_execute_parses_stream_on_non_zero_exit(monkeypatch: pytest.MonkeyPatch)
 def test_execute_captures_stderr_on_clean_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     """stderr is kept for diagnosis even when the process exits 0."""
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         return SimpleNamespace(stdout=SAMPLE_STREAM, stderr="a warning", returncode=0)
 
     monkeypatch.setattr(claude_mod, "run", fake_run)
@@ -906,7 +906,7 @@ def test_execute_captures_stderr_on_clean_exit(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_execute_handles_subprocess_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         raise SubprocessError(argv, returncode=-1, stdout="", stderr="timeout")
 
     monkeypatch.setattr(claude_mod, "run", fake_run)
@@ -927,7 +927,7 @@ def test_execute_recovers_partial_trajectory_on_timeout(monkeypatch: pytest.Monk
         _user({"type": "tool_result", "tool_use_id": "c1", "content": "ok"}),
     )
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         raise SubprocessError(argv, returncode=-1, stdout=partial, stderr="killed after timeout")
 
     monkeypatch.setattr(claude_mod, "run", fake_run)
@@ -939,7 +939,7 @@ def test_execute_recovers_partial_trajectory_on_timeout(monkeypatch: pytest.Monk
 
 
 def test_execute_handles_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         raise OSError("not found")
 
     monkeypatch.setattr(claude_mod, "run", fake_run)
@@ -952,7 +952,7 @@ def test_execute_handles_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None
 def test_execute_passes_timeout_to_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         captured.update(kwargs)
         return SimpleNamespace(stdout="", stderr="", returncode=0)
 
@@ -973,7 +973,7 @@ def test_execute_writes_claude_md_with_rules_text_before_subprocess(
 ) -> None:
     captured: dict = {}
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         from pathlib import Path
 
         cwd = kwargs.get("cwd")
@@ -993,7 +993,7 @@ def test_execute_writes_claude_md_with_rules_text_before_subprocess(
 def test_execute_skips_writing_claude_md_when_rules_empty(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         cwd = kwargs.get("cwd")
         captured["exists"] = bool(cwd and os.path.exists(os.path.join(cwd, "CLAUDE.md")))
         return SimpleNamespace(stdout="", stderr="", returncode=0)
@@ -1006,7 +1006,7 @@ def test_execute_skips_writing_claude_md_when_rules_empty(monkeypatch: pytest.Mo
 def test_execute_writes_mcp_config_and_passes_flag(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         if "--version" in argv:
             return SimpleNamespace(stdout="2.1.228 (Claude Code)\n", stderr="", returncode=0)
         captured["argv"] = argv
@@ -1048,7 +1048,7 @@ def test_execute_refuses_mcp_run_on_a_binary_predating_the_startup_wait(
     augmented. Fail loud instead of recording a contaminated result."""
     calls: list[list[str]] = []
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         calls.append(list(argv))
         if "--version" in argv:
             return SimpleNamespace(stdout="2.1.220 (Claude Code)\n", stderr="", returncode=0)
@@ -1070,7 +1070,7 @@ def test_execute_skips_the_version_probe_without_mcp_bindings(
     an extra subprocess on every run."""
     calls: list[list[str]] = []
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         calls.append(list(argv))
         return SimpleNamespace(stdout="", stderr="", returncode=0)
 
@@ -1090,13 +1090,13 @@ def test_execute_skips_the_version_probe_without_mcp_bindings(
     ids=["nonzero-exit", "unparseable", "spawn-failure"],
 )
 def test_execute_proceeds_when_the_version_probe_is_inconclusive(
-    monkeypatch: pytest.MonkeyPatch, probe: object
+    monkeypatch: pytest.MonkeyPatch, probe: SimpleNamespace | OSError
 ) -> None:
     """``config.target`` may be a wrapper with its own ``--version`` surface, so a
     probe that fails to yield a number must not block the run."""
-    ran = []
+    ran: list[list[str]] = []
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         if "--version" in argv:
             if isinstance(probe, OSError):
                 raise probe
@@ -1114,7 +1114,7 @@ def test_execute_proceeds_when_the_version_probe_is_inconclusive(
 def test_execute_writes_no_mcp_config_when_no_command(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict = {}
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         captured["argv"] = argv
         mcp_path = os.path.join(kwargs["cwd"], ".claude", "mcp-config.json")
         captured["exists"] = os.path.exists(mcp_path)
@@ -1140,7 +1140,7 @@ def test_execute_materializes_skills_into_workspace(
 
     captured: dict = {}
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         skill_path = os.path.join(kwargs["cwd"], ".claude", "skills", "my-skill", "SKILL.md")
         captured["exists"] = os.path.exists(skill_path)
         if captured["exists"]:
@@ -1168,7 +1168,7 @@ def test_execute_injects_per_run_config_dir_when_ambient_unset(
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     captured: dict = {}
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         captured["cwd"] = kwargs.get("cwd")
         captured["config_dir"] = kwargs.get("extra_env", {}).get("CLAUDE_CONFIG_DIR")
         return SimpleNamespace(stdout="", stderr="", returncode=0)
@@ -1187,9 +1187,10 @@ def test_execute_injects_per_run_config_dir_when_ambient_unset(
 
 def test_execute_respects_operator_config_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/operator/claude")
+    monkeypatch.delenv("BENCH_PARALLEL", raising=False)
     captured: dict = {}
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         captured["config_dir"] = kwargs.get("extra_env", {}).get("CLAUDE_CONFIG_DIR")
         return SimpleNamespace(stdout="", stderr="", returncode=0)
 
@@ -1200,12 +1201,35 @@ def test_execute_respects_operator_config_dir(monkeypatch: pytest.MonkeyPatch) -
     assert captured["config_dir"] is None
 
 
+def test_execute_overrides_operator_config_dir_under_parallel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--parallel`` means several benchmark processes share this host. Honouring
+    the operator's dir would hand them one mutable Claude config to race on, so
+    isolation outranks the login cache the hatch exists to preserve."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/operator/claude")
+    monkeypatch.setenv("BENCH_PARALLEL", "true")
+    cfg_dirs: list[str | None] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        cfg_dirs.append(kwargs.get("extra_env", {}).get("CLAUDE_CONFIG_DIR"))
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(claude_mod, "run", fake_run)
+    agent = ClaudeCodeAgent(AgentConfig(target="claude"))
+    agent.run("p")
+    agent.run("p")
+
+    assert all(d and d != "/operator/claude" for d in cfg_dirs), cfg_dirs
+    assert len(set(cfg_dirs)) == 2, f"config dirs must be unique per run, got {cfg_dirs}"
+
+
 def test_execute_uses_distinct_cwd_and_config_dir_per_run(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     cwds: list[str] = []
     cfg_dirs: list[str] = []
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
         cwds.append(kwargs.get("cwd"))
         cfg_dirs.append(kwargs.get("extra_env", {}).get("CLAUDE_CONFIG_DIR"))
         return SimpleNamespace(stdout="", stderr="", returncode=0)

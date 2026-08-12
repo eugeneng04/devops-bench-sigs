@@ -37,7 +37,8 @@ Auth is env-driven, matching the bench contract: ``config.api_key`` →
 ``ANTHROPIC_API_KEY`` for the direct API, or keyless Vertex / Bedrock via ADC /
 AWS credentials. ``CLAUDE_CONFIG_DIR`` is redirected to a fresh per-run temp dir
 so Claude Code's mutable global state never races across concurrent evals (see
-:func:`_claude_config_dir` for the OAuth-debug escape hatch).
+:func:`_claude_config_dir` for the OAuth-debug escape hatch, which ``--parallel``
+overrides).
 """
 
 from __future__ import annotations
@@ -60,6 +61,7 @@ from devops_bench.agents.shared.cli_capabilities import (
     materialize_skills,
 )
 from devops_bench.core import SubprocessError, get_logger
+from devops_bench.core.config import get_bool
 from devops_bench.core.model_providers import resolve_provider
 from devops_bench.core.subprocess import run
 
@@ -243,10 +245,21 @@ def _claude_config_dir() -> Iterator[str | None]:
     untouched and ``None`` is yielded so no per-run temp dir is created or
     injected. An empty ambient value is ignored so per-run isolation still
     applies (the CLI treats an empty var as unset and would race on ~/.claude).
+
+    The hatch is refused under ``BENCH_PARALLEL``. Several benchmark processes
+    on one host would then share a single mutable config dir — the collision
+    class :mod:`devops_bench.core.run_env` exists to prevent — and the operator
+    has already declared concurrency, so isolation outranks the login cache.
     """
     if os.environ.get(_CONFIG_DIR_ENV):
-        yield None
-        return
+        if not get_bool("BENCH_PARALLEL", False):
+            yield None
+            return
+        _log.warning(
+            "ignoring ambient %s under BENCH_PARALLEL: concurrent runs would share "
+            "one mutable Claude config dir; using a per-run dir instead",
+            _CONFIG_DIR_ENV,
+        )
     # ignore_cleanup_errors: Claude Code may leave straggler state/lock files or
     # MCP-server children; a cleanup OSError must not turn a completed run into
     # an errored one via the base safety net.
