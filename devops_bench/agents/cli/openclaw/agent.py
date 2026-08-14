@@ -74,6 +74,7 @@ from devops_bench.agents.shared.cli_capabilities import (
     build_mcp_servers,
     materialize_skills,
 )
+from devops_bench.agents.shared.mcp_probe import McpUnreachableError, preflight_mcp
 from devops_bench.core import SubprocessError, get_logger
 from devops_bench.core.errors import ConfigError
 from devops_bench.core.model_providers import resolve_provider
@@ -442,6 +443,21 @@ class OpenClawAgent(AgentHarness):
         with agent_workdir(workspace_path, prefix="oc-run-") as workdir:
             state_dir = workdir / _OPENCLAW_STATE_DIRNAME
             state_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                # Inside the workdir so the probe launches each server exactly as
+                # oc will: a relative path in a binding's args resolves the same
+                # way in both, instead of probing green and failing under the CLI.
+                # openclaw has no `mcp list` equivalent, so this is the only gate.
+                preflight_mcp(
+                    caps.mcp_servers,
+                    base_env={**os.environ, **_build_env(self.config)},
+                    cwd=workdir,
+                )
+            except McpUnreachableError as exc:
+                # Fatal: a granted-but-dead server leaves oc running tool-less and
+                # exiting 0, which would score as a clean MCP arm.
+                return AgentResult.errored(f"MCP preflight failed: {exc}")
 
             materialize_skills(state_dir / _OPENCLAW_SKILLS_DIRNAME, caps.skills.paths)
 

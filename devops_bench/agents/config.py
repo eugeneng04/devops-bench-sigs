@@ -16,9 +16,12 @@
 
 from __future__ import annotations
 
+import json
+import os
 import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from devops_bench.agents.capabilities import (
     AgentRules,
@@ -26,7 +29,7 @@ from devops_bench.agents.capabilities import (
     McpBinding,
     SkillBinding,
 )
-from devops_bench.core import get_env, get_int
+from devops_bench.core import ConfigError, get_env, get_int
 
 __all__ = ["AgentConfig"]
 
@@ -38,31 +41,147 @@ def _parse_csv(raw: str | None) -> tuple[str, ...]:
     return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
+def _load_mcp_config(raw: str) -> dict:
+    """Load ``AGENT_MCP_CONFIG`` from inline JSON or from a file path.
+
+    A value starting with ``{`` is inline JSON; anything else is a path. Both
+    forms exist because the two call sites differ: a one-off local run passes
+    the document inline, while the matrix joins its env with ``;`` and evaluates
+    it over ssh, where a quoted JSON blob does not survive.
+
+    Args:
+        raw: The variable's value, already known to be non-empty.
+
+    Returns:
+        The parsed document.
+
+    Raises:
+        ConfigError: If the path is missing or the JSON is malformed.
+    """
+    text = raw.strip()
+    if not text.startswith("{"):
+        path = Path(os.path.expanduser(text))
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError(f"AGENT_MCP_CONFIG path is unreadable: {exc}") from exc
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"AGENT_MCP_CONFIG is not valid JSON: {exc}") from exc
+    if not isinstance(document, dict):
+        raise ConfigError("AGENT_MCP_CONFIG must be a JSON object")
+    return document
+
+
+def _parse_mcp_config(raw: str, default_tools: tuple[str, ...]) -> tuple[McpBinding, ...]:
+    """Build MCP bindings from the standard ``mcpServers`` document.
+
+    The schema is the one Claude Code (``--mcp-config``), Cursor, and the wider
+    ecosystem already read, so a server config can be copied between them
+    unchanged::
+
+        {"mcpServers": {"github": {"command": "npx",
+                                   "args": ["-y", "@modelcontextprotocol/server-github"],
+                                   "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}}}}
+
+    ``tools`` is an optional per-server extension (ignored by other readers)
+    naming the tools to pre-approve; servers omitting it inherit
+    ``default_tools`` from ``AGENT_ALLOWED_TOOLS``.
+
+    Args:
+        raw: The raw ``AGENT_MCP_CONFIG`` value (inline JSON or a path).
+        default_tools: Tool names applied to servers that declare none.
+
+    Returns:
+        One binding per entry, in document order.
+
+    Raises:
+        ConfigError: If the document is malformed or an entry has no ``command``.
+    """
+    servers = _load_mcp_config(raw).get("mcpServers")
+    if servers is None:
+        raise ConfigError("AGENT_MCP_CONFIG has no 'mcpServers' key")
+    if not isinstance(servers, dict):
+        raise ConfigError("AGENT_MCP_CONFIG 'mcpServers' must be a JSON object")
+    if not servers:
+        # An arm that grants nothing leaves AGENT_MCP_CONFIG unset. Setting it to
+        # an empty document instead yields a no-MCP run that still reports as an
+        # MCP arm — the silent-pass this whole path exists to prevent.
+        raise ConfigError("AGENT_MCP_CONFIG 'mcpServers' is empty; unset the variable instead")
+
+    bindings: list[McpBinding] = []
+    for name, entry in servers.items():
+        if not isinstance(entry, dict):
+            raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} must be a JSON object")
+        command = entry.get("command")
+        if not isinstance(command, str) or not command:
+            raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} needs a non-empty 'command'")
+        args = entry.get("args") or []
+        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+            raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} 'args' must be a list of strings")
+        env = entry.get("env") or {}
+        if not isinstance(env, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in env.items()
+        ):
+            raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} 'env' must be a string mapping")
+        tools = entry.get("tools")
+        if tools is not None and (
+            not isinstance(tools, list) or not all(isinstance(t, str) for t in tools)
+        ):
+            raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} 'tools' must be a list of strings")
+        cwd = entry.get("cwd") or ""
+        if not isinstance(cwd, str):
+            raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} 'cwd' must be a string")
+        bindings.append(
+            McpBinding(
+                name=name,
+                command=(command, *args),
+                env=tuple(env.items()),
+                cwd=cwd,
+                tools=tuple(tools) if tools is not None else default_tools,
+            )
+        )
+    return tuple(bindings)
+
+
 def _build_capabilities_from_env(env: Mapping[str, str] | None) -> AllCapabilities:
     """Build an :class:`AllCapabilities` aggregate from ``AGENT_*`` env vars.
 
-    Reads ``AGENT_MCP_SERVER`` (shell-quoted argv) and ``AGENT_ALLOWED_TOOLS``
-    (CSV) into a single :class:`McpBinding` when either is set;
-    ``AGENT_SKILLS_PATHS`` (CSV) into a :class:`SkillBinding`; and
-    ``AGENT_RULES_TEXT`` into :class:`AgentRules`. A missing variable yields
-    the default (empty) shape, so the function never raises on unset values
-    and a fully unset env produces a default :class:`AllCapabilities`.
+    MCP servers come from ``AGENT_MCP_CONFIG`` (a standard ``mcpServers``
+    document, inline or a path — see :func:`_parse_mcp_config`) which supports
+    any number of servers with their own env and cwd. ``AGENT_MCP_SERVER``
+    (shell-quoted argv) remains the single-server shorthand and is read only
+    when ``AGENT_MCP_CONFIG`` is unset. ``AGENT_ALLOWED_TOOLS`` (CSV) supplies
+    the tool list for servers that declare none. ``AGENT_SKILLS_PATHS`` (CSV)
+    becomes a :class:`SkillBinding` and ``AGENT_RULES_TEXT`` becomes
+    :class:`AgentRules`. A missing variable yields the default (empty) shape,
+    so a fully unset env produces a default :class:`AllCapabilities`.
 
     Args:
         env: Optional mapping read from (defaults to ``os.environ``).
 
     Returns:
         A populated :class:`AllCapabilities`.
+
+    Raises:
+        ConfigError: If ``AGENT_MCP_CONFIG`` is set but malformed. A broken
+            capability grant fails loud rather than running an MCP arm with no
+            MCP server.
     """
-    mcp_command_raw = get_env("AGENT_MCP_SERVER", env=env) or ""
-    mcp_command = tuple(shlex.split(mcp_command_raw)) if mcp_command_raw else ()
     allowed_tools = _parse_csv(get_env("AGENT_ALLOWED_TOOLS", env=env))
+    mcp_config_raw = (get_env("AGENT_MCP_CONFIG", env=env) or "").strip()
 
     mcp_servers: tuple[McpBinding, ...] = ()
-    if mcp_command or allowed_tools:
-        # ``name="default"`` is generic: env-driven from_env has no catalog to
-        # pull a real name from, and the agent never inspects it.
-        mcp_servers = (McpBinding(name="default", command=mcp_command, tools=allowed_tools),)
+    if mcp_config_raw:
+        mcp_servers = _parse_mcp_config(mcp_config_raw, allowed_tools)
+    else:
+        mcp_command_raw = get_env("AGENT_MCP_SERVER", env=env) or ""
+        mcp_command = tuple(shlex.split(mcp_command_raw)) if mcp_command_raw else ()
+        if mcp_command or allowed_tools:
+            # ``name="default"`` is generic: the shorthand carries no name and
+            # the agent never inspects it.
+            mcp_servers = (McpBinding(name="default", command=mcp_command, tools=allowed_tools),)
 
     skills_paths = _parse_csv(get_env("AGENT_SKILLS_PATHS", env=env))
     skills = SkillBinding(paths=skills_paths)
@@ -124,10 +243,10 @@ class AgentConfig:
         Reads ``AGENT_MODEL`` / ``AGENT_PROVIDER`` / ``AGENT_API_KEY`` /
         ``AGENT_TARGET`` / ``AGENT_TIMEOUT_SEC`` / ``AGENT_MAX_TURNS`` /
         ``AGENT_EXTRA_FLAGS`` and delegates capability construction
-        (``AGENT_MCP_SERVER`` / ``AGENT_ALLOWED_TOOLS`` / ``AGENT_SKILLS_PATHS`` /
-        ``AGENT_RULES_TEXT``) to :func:`_build_capabilities_from_env`. A missing
-        variable yields the dataclass default — this method never raises on unset
-        variables.
+        (``AGENT_MCP_CONFIG`` / ``AGENT_MCP_SERVER`` / ``AGENT_ALLOWED_TOOLS`` /
+        ``AGENT_SKILLS_PATHS`` / ``AGENT_RULES_TEXT``) to
+        :func:`_build_capabilities_from_env`. A missing variable yields the
+        dataclass default — this method never raises on unset variables.
 
         Args:
             env: Optional mapping to read from (defaults to ``os.environ``).
@@ -135,6 +254,9 @@ class AgentConfig:
 
         Returns:
             A populated :class:`AgentConfig`.
+
+        Raises:
+            ConfigError: If ``AGENT_MCP_CONFIG`` is set but malformed.
         """
         timeout = get_int("AGENT_TIMEOUT_SEC", env=env)
         max_turns = get_int("AGENT_MAX_TURNS", env=env)

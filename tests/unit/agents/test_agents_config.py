@@ -14,6 +14,11 @@
 
 """Unit tests for devops_bench.agents.config."""
 
+import json
+from pathlib import Path
+
+import pytest
+
 from devops_bench.agents.capabilities import (
     AgentRules,
     AllCapabilities,
@@ -21,6 +26,7 @@ from devops_bench.agents.capabilities import (
     SkillBinding,
 )
 from devops_bench.agents.config import AgentConfig
+from devops_bench.core import ConfigError
 
 
 def test_default_construction_uses_safe_defaults() -> None:
@@ -149,3 +155,110 @@ def test_from_env_extra_flags_unset_or_empty() -> None:
     assert AgentConfig.from_env({}).extra_flags == ()
     assert AgentConfig.from_env({"AGENT_EXTRA_FLAGS": ""}).extra_flags == ()
     assert AgentConfig.from_env({"AGENT_EXTRA_FLAGS": "   "}).extra_flags == ()
+
+
+def test_from_env_parses_inline_mcp_config_document() -> None:
+    """``AGENT_MCP_CONFIG`` accepts the standard ``mcpServers`` document inline,
+    so a one-off run needs no config file."""
+    env = {
+        "AGENT_MCP_CONFIG": json.dumps(
+            {
+                "mcpServers": {
+                    "time": {"command": "uvx", "args": ["mcp-server-time"]},
+                    "github": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-github"],
+                        "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"},
+                        "cwd": "/work",
+                        "tools": ["create_issue"],
+                    },
+                }
+            }
+        )
+    }
+    cfg = AgentConfig.from_env(env)
+
+    assert cfg.capabilities.mcp_servers == (
+        McpBinding(name="time", command=("uvx", "mcp-server-time")),
+        McpBinding(
+            name="github",
+            command=("npx", "-y", "@modelcontextprotocol/server-github"),
+            env=(("GITHUB_TOKEN", "${GITHUB_TOKEN}"),),
+            cwd="/work",
+            tools=("create_issue",),
+        ),
+    )
+
+
+def test_from_env_reads_mcp_config_from_a_path(tmp_path: Path) -> None:
+    """A value that is not inline JSON is a path — the form the matrix uses,
+    where a quoted JSON blob would not survive its ';'-joined, eval'd env."""
+    config = tmp_path / "bench-mcp.json"
+    config.write_text(json.dumps({"mcpServers": {"time": {"command": "uvx"}}}))
+
+    cfg = AgentConfig.from_env({"AGENT_MCP_CONFIG": str(config)})
+
+    assert cfg.capabilities.mcp_servers == (McpBinding(name="time", command=("uvx",)),)
+
+
+def test_from_env_mcp_config_servers_inherit_allowed_tools() -> None:
+    """A server declaring no ``tools`` inherits ``AGENT_ALLOWED_TOOLS``."""
+    env = {
+        "AGENT_MCP_CONFIG": '{"mcpServers": {"time": {"command": "uvx"}}}',
+        "AGENT_ALLOWED_TOOLS": "a,b",
+    }
+    cfg = AgentConfig.from_env(env)
+
+    assert cfg.capabilities.mcp_servers[0].tools == ("a", "b")
+
+
+def test_from_env_mcp_config_takes_precedence_over_the_shorthand() -> None:
+    """``AGENT_MCP_SERVER`` is the single-server shorthand; the document wins."""
+    env = {
+        "AGENT_MCP_CONFIG": '{"mcpServers": {"time": {"command": "uvx"}}}',
+        "AGENT_MCP_SERVER": "/bin/gke-mcp",
+    }
+    cfg = AgentConfig.from_env(env)
+
+    assert [b.name for b in cfg.capabilities.mcp_servers] == ["time"]
+
+
+def test_from_env_blank_mcp_config_falls_back_to_the_shorthand() -> None:
+    """An empty value is treated as unset, not as a malformed document."""
+    env = {"AGENT_MCP_CONFIG": "  ", "AGENT_MCP_SERVER": "/bin/gke-mcp"}
+    cfg = AgentConfig.from_env(env)
+
+    assert cfg.capabilities.mcp_servers == (McpBinding(name="default", command=("/bin/gke-mcp",)),)
+
+
+@pytest.mark.parametrize(
+    ("raw", "match"),
+    [
+        ("{not json", "not valid JSON"),
+        ('{"servers": {}}', "no 'mcpServers' key"),
+        ('{"mcpServers": []}', "must be a JSON object"),
+        ('{"mcpServers": {"a": "uvx"}}', "must be a JSON object"),
+        ('{"mcpServers": {"a": {}}}', "non-empty 'command'"),
+        ('{"mcpServers": {"a": {"command": "uvx", "args": "x"}}}', "list of strings"),
+        ('{"mcpServers": {"a": {"command": "uvx", "env": {"K": 1}}}}', "string mapping"),
+        ('{"mcpServers": {"a": {"command": "uvx", "tools": "x"}}}', "list of strings"),
+        ('{"mcpServers": {"a": {"command": "uvx", "cwd": ["/tmp"]}}}', "'cwd' must be a string"),
+        ('{"mcpServers": {}}', "is empty"),
+        ("/nonexistent/bench-mcp.json", "unreadable"),
+    ],
+)
+def test_from_env_malformed_mcp_config_fails_loud(raw: str, match: str) -> None:
+    """A broken capability grant raises rather than running an MCP arm with no
+    MCP server — the same validity concern the reachability probe addresses."""
+    with pytest.raises(ConfigError, match=match):
+        AgentConfig.from_env({"AGENT_MCP_CONFIG": raw})
+
+
+def test_from_env_mcp_config_file_must_hold_a_json_object(tmp_path: Path) -> None:
+    """Only the inline form is recognized by its leading ``{``; a file is read
+    first and then validated, so a non-object document fails there."""
+    config = tmp_path / "bench-mcp.json"
+    config.write_text("[]")
+
+    with pytest.raises(ConfigError, match="must be a JSON object"):
+        AgentConfig.from_env({"AGENT_MCP_CONFIG": str(config)})
