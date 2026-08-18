@@ -39,8 +39,9 @@ class McpBinding:
             :class:`~devops_bench.agents.api.mcp.MCPClient`.
         env: Environment pairs the server is launched with, as a tuple of
             ``(name, value)`` so the binding stays hashable. A value may carry
-            ``${VAR}`` / ``$VAR`` references resolved from the runner's
-            environment; references are written through to the CLI's config
+            ``${VAR}`` references (braces required — a bare ``$VAR`` stays
+            literal) resolved from the runner's environment; references are
+            written through to the CLI's config
             file **unexpanded** so a credential never lands in the agent's
             workspace, which is collected wholesale into the run's artifacts.
         cwd: Working directory the server is launched in. Empty inherits the

@@ -25,7 +25,7 @@ import contextlib
 import os
 import shutil
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -116,7 +116,9 @@ def build_mcp_servers(mcp_servers: tuple[McpBinding, ...]) -> dict[str, dict]:
     return servers
 
 
-def _ignore_escaping_links(bundle: Path):
+def _ignore_escaping_links(
+    bundle: Path,
+) -> Callable[[str | os.PathLike[str], list[str]], set[str]]:
     """Return a :func:`shutil.copytree` ``ignore`` callback dropping escaping links.
 
     A skill bundle is data the harness copies into the agent's workspace, and
@@ -126,7 +128,7 @@ def _ignore_escaping_links(bundle: Path):
     """
     root = bundle.resolve()
 
-    def _ignore(dirpath: str, names: list[str]) -> set[str]:
+    def _ignore(dirpath: str | os.PathLike[str], names: list[str]) -> set[str]:
         skipped: set[str] = set()
         for name in names:
             entry = Path(dirpath) / name

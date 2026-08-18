@@ -40,7 +40,7 @@ import threading
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING
 
 from devops_bench.core import DevOpsBenchError, get_logger
 
@@ -166,7 +166,7 @@ def _redact(text: str, secrets: tuple[str, ...]) -> str:
     return text
 
 
-def _pump(stream, sink: queue.Queue) -> None:
+def _pump(stream: IO[str], sink: queue.Queue[str | None]) -> None:
     """Forward each line of ``stream`` onto ``sink``, then a ``None`` sentinel.
 
     Drops the oldest line when the queue is full: a server that chatters for its
@@ -184,7 +184,7 @@ def _pump(stream, sink: queue.Queue) -> None:
         sink.put(None)
 
 
-def _drain_stderr(stream, sink: collections.deque) -> None:
+def _drain_stderr(stream: IO[str], sink: collections.deque[str]) -> None:
     """Collect ``stream``'s tail into ``sink`` line by line.
 
     Line-at-a-time rather than one blocking ``read()`` so the tail is available
@@ -198,7 +198,7 @@ def _drain_stderr(stream, sink: collections.deque) -> None:
         pass
 
 
-def _read_result(lines: queue.Queue, request_id: int, deadline: float) -> dict:
+def _read_result(lines: queue.Queue[str | None], request_id: int, deadline: float) -> dict:
     """Read newline-delimited JSON-RPC until the reply to ``request_id`` arrives.
 
     Non-JSON lines and unrelated messages (notifications, other ids) are skipped:
@@ -287,8 +287,8 @@ def probe_stdio_server(
     except OSError as exc:
         raise McpUnreachableError(f"could not launch server: {exc}") from exc
 
-    lines: queue.Queue = queue.Queue(maxsize=_MAX_STDOUT_LINES)
-    stderr_tail: collections.deque = collections.deque(maxlen=_MAX_STDERR_CHUNKS)
+    lines: queue.Queue[str | None] = queue.Queue(maxsize=_MAX_STDOUT_LINES)
+    stderr_tail: collections.deque[str] = collections.deque(maxlen=_MAX_STDERR_CHUNKS)
     readers = (
         threading.Thread(target=_pump, args=(proc.stdout, lines), daemon=True),
         threading.Thread(target=_drain_stderr, args=(proc.stderr, stderr_tail), daemon=True),

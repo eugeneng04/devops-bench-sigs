@@ -117,10 +117,12 @@ def _parse_mcp_config(raw: str, default_tools: tuple[str, ...]) -> tuple[McpBind
         command = entry.get("command")
         if not isinstance(command, str) or not command:
             raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} needs a non-empty 'command'")
-        args = entry.get("args") or []
+        args = entry.get("args")
+        args = [] if args is None else args
         if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
             raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} 'args' must be a list of strings")
-        env = entry.get("env") or {}
+        env = entry.get("env")
+        env = {} if env is None else env
         if not isinstance(env, dict) or not all(
             isinstance(k, str) and isinstance(v, str) for k, v in env.items()
         ):
@@ -130,7 +132,8 @@ def _parse_mcp_config(raw: str, default_tools: tuple[str, ...]) -> tuple[McpBind
             not isinstance(tools, list) or not all(isinstance(t, str) for t in tools)
         ):
             raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} 'tools' must be a list of strings")
-        cwd = entry.get("cwd") or ""
+        cwd = entry.get("cwd")
+        cwd = "" if cwd is None else cwd
         if not isinstance(cwd, str):
             raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} 'cwd' must be a string")
         bindings.append(

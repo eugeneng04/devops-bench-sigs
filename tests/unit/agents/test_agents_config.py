@@ -243,6 +243,12 @@ def test_from_env_blank_mcp_config_falls_back_to_the_shorthand() -> None:
         ('{"mcpServers": {"a": {"command": "uvx", "env": {"K": 1}}}}', "string mapping"),
         ('{"mcpServers": {"a": {"command": "uvx", "tools": "x"}}}', "list of strings"),
         ('{"mcpServers": {"a": {"command": "uvx", "cwd": ["/tmp"]}}}', "'cwd' must be a string"),
+        # A falsy wrong type must raise rather than fall back to the default:
+        # dropping a declared env or argv leaves the server launching without
+        # its credential, and the probe then reports the wrong cause.
+        ('{"mcpServers": {"a": {"command": "uvx", "args": 0}}}', "list of strings"),
+        ('{"mcpServers": {"a": {"command": "uvx", "env": 0}}}', "string mapping"),
+        ('{"mcpServers": {"a": {"command": "uvx", "cwd": 0}}}', "'cwd' must be a string"),
         ('{"mcpServers": {}}', "is empty"),
         ("/nonexistent/bench-mcp.json", "unreadable"),
     ],

@@ -286,13 +286,6 @@ for line in sys.stdin:
 """
 
 
-def _server(tmp_path: Path, source: str) -> tuple[str, ...]:
-    """Write ``source`` as a script and return the argv that runs it."""
-    script = tmp_path / "srv.py"
-    script.write_text(source, encoding="utf-8")
-    return (sys.executable, str(script))
-
-
 def test_probe_returns_promptly_when_the_server_forks_a_surviving_grandchild(
     tmp_path: Path,
 ) -> None:
