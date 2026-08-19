@@ -268,3 +268,13 @@ def test_from_env_mcp_config_file_must_hold_a_json_object(tmp_path: Path) -> Non
 
     with pytest.raises(ConfigError, match="must be a JSON object"):
         AgentConfig.from_env({"AGENT_MCP_CONFIG": str(config)})
+
+
+def test_from_env_undecodable_mcp_config_file_raises_config_error(tmp_path: Path) -> None:
+    """``from_env`` documents ``ConfigError`` as its only failure, so a file that
+    is not UTF-8 must not surface the raw ``UnicodeDecodeError``."""
+    config = tmp_path / "bench-mcp.json"
+    config.write_bytes(b'{"mcpServers": {"a": {"command": "\xff\xfe"}}}')
+
+    with pytest.raises(ConfigError, match="not valid UTF-8"):
+        AgentConfig.from_env({"AGENT_MCP_CONFIG": str(config)})

@@ -56,7 +56,8 @@ def _load_mcp_config(raw: str) -> dict:
         The parsed document.
 
     Raises:
-        ConfigError: If the path is missing or the JSON is malformed.
+        ConfigError: If the path is missing, undecodable, or the JSON is
+            malformed.
     """
     text = raw.strip()
     if not text.startswith("{"):
@@ -65,6 +66,8 @@ def _load_mcp_config(raw: str) -> dict:
             text = path.read_text(encoding="utf-8")
         except OSError as exc:
             raise ConfigError(f"AGENT_MCP_CONFIG path is unreadable: {exc}") from exc
+        except UnicodeError as exc:
+            raise ConfigError(f"AGENT_MCP_CONFIG file is not valid UTF-8: {exc}") from exc
     try:
         document = json.loads(text)
     except json.JSONDecodeError as exc:
