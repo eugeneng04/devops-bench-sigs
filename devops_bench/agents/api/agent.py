@@ -25,6 +25,7 @@ import asyncio
 import shlex
 import time
 from collections import deque
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +41,7 @@ from devops_bench.core import get_logger
 from devops_bench.models import LLMClient, get_model
 from devops_bench.models.utils.loop import LoopResult, ToolDispatcher, run_tool_loop
 
-__all__ = ["ApiAgent", "fold_trajectory", "extract_tokens"]
+__all__ = ["ApiAgent", "fold_trajectory", "extract_tokens", "sum_tokens"]
 
 _log = get_logger("agents.api.agent")
 
@@ -158,7 +159,10 @@ def _fold_with_extraction_errors(
 
 
 def extract_tokens(response: Any) -> dict:
-    """Pull provider token usage off the final raw response.
+    """Pull one turn's provider token usage off a raw response.
+
+    A tool-use loop bills every turn, so this is a per-turn reading — use
+    :func:`sum_tokens` for a whole run.
 
     Detects which provider's usage shape is present and maps each onto a stable
     key scheme (``prompt_tokens`` / ``candidates_tokens`` / ``total_tokens``) so
@@ -179,8 +183,8 @@ def extract_tokens(response: Any) -> dict:
     other two so metrics never see ``0`` for a non-empty run.
 
     Args:
-        response: The last raw provider response from
-            :attr:`LoopResult.response`, or ``None``.
+        response: One raw provider response from :attr:`LoopResult.responses`,
+            or ``None``.
 
     Returns:
         A ``{"prompt_tokens", "candidates_tokens", "total_tokens"}`` dict, or
@@ -209,6 +213,33 @@ def extract_tokens(response: Any) -> dict:
         "candidates_tokens": candidates,
         "total_tokens": total,
     }
+
+
+def sum_tokens(responses: Sequence[Any]) -> dict:
+    """Sum per-turn provider token usage across a whole tool-use loop.
+
+    Every turn is billed on its own, and an agentic loop re-sends the entire
+    conversation each time, so a run's usage is the sum over turns rather than
+    the last turn's counts. Reading only the final response undercounts a
+    multi-turn run by close to the whole run, and the shortfall grows with turn
+    count — which is the opposite of what a cost comparison needs.
+
+    Keys are whatever :func:`extract_tokens` reports, so a provider bucket
+    added there is summed here without further change.
+
+    Args:
+        responses: Every raw provider response the loop produced, oldest first
+            (:attr:`LoopResult.responses`).
+
+    Returns:
+        The summed counts under :func:`extract_tokens`'s key scheme, or ``{}``
+        when no turn reported usage.
+    """
+    totals: dict[str, int] = {}
+    for response in responses:
+        for key, value in extract_tokens(response).items():
+            totals[key] = totals.get(key, 0) + value
+    return totals
 
 
 def _first_int_attr(obj: Any, *names: str) -> int:
@@ -427,8 +458,7 @@ class ApiAgent(AgentHarness):
             An :class:`AgentResult` whose ``trajectory`` is a list of canonical
             :class:`ToolCall` entries, ``output`` is :attr:`LoopResult.final_text`,
             and ``latency`` carries the loop's accumulated wall-clock.
-            ``tokens`` reflects the final provider turn only — per-turn
-            accumulation is a pending ``run_tool_loop`` follow-up.
+            ``tokens`` is summed over every provider turn.
         """
         llm_client = get_model(self.config.provider, self.config.model)
         max_turns = (
@@ -480,7 +510,7 @@ class ApiAgent(AgentHarness):
             return AgentResult.errored(f"API agent timed out after {timeout}s", latency=elapsed)
 
         trajectory, orphan_errors = _fold_with_extraction_errors(loop_result.contents)
-        tokens = extract_tokens(loop_result.response)
+        tokens = sum_tokens(loop_result.responses)
         metadata: dict[str, Any] = {
             "tools_used": sorted(loop_result.tools_used),
         }

@@ -337,9 +337,63 @@ async def test_loop_with_zero_max_turns_yields_empty_result(caplog):
     assert result.final_text == ""
     assert result.latency == 0.0
     assert result.response is None
+    assert result.responses == []
     assert result.contents == [{"role": "user", "content": "g"}]
     # `for ... else` runs `else` when the range is empty too.
     assert any("turn limit (0)" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_responses_collects_every_turn_in_order():
+    """Every provider response is retained, not just the last one.
+
+    Token usage is billed per turn, so a caller that reads only
+    ``response`` sees one turn's counts and undercounts the run.
+    """
+    turns = [
+        _Turn(text="t1", calls=[{"name": "t", "args": {}, "id": "a"}]),
+        _Turn(text="t2", calls=[{"name": "t", "args": {}, "id": "b"}]),
+        _Turn(text="t3-final", calls=[]),
+    ]
+    client = FakeLLMClient(turns)
+    dispatch, _ = _dispatcher_recording({"t": "ok"})
+
+    result = await run_tool_loop(
+        client=client,
+        goal="g",
+        tools=None,
+        system_instruction=None,
+        dispatch=dispatch,
+        max_turns=10,
+    )
+
+    assert [r.text for r in result.responses] == ["t1", "t2", "t3-final"]
+    assert result.responses[-1] is result.response
+
+
+@pytest.mark.asyncio
+async def test_responses_retains_turns_discarded_by_the_cap():
+    """A capped run keeps every turn it paid for.
+
+    Hitting ``max_turns`` is the case where reading only the final response
+    loses the most usage, so the cap must not truncate ``responses``.
+    """
+    turns = [
+        _Turn(text=f"turn{i}", calls=[{"name": "t", "args": {}, "id": str(i)}]) for i in range(5)
+    ]
+    client = FakeLLMClient(turns)
+    dispatch, _ = _dispatcher_recording({"t": "ok"})
+
+    result = await run_tool_loop(
+        client=client,
+        goal="g",
+        tools=None,
+        system_instruction=None,
+        dispatch=dispatch,
+        max_turns=3,
+    )
+
+    assert [r.text for r in result.responses] == ["turn0", "turn1", "turn2"]
 
 
 def test_loop_import_pulls_no_provider_sdk():

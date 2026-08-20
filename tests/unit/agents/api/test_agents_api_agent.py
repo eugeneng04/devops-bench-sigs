@@ -30,6 +30,7 @@ from devops_bench.agents.api.agent import (
     ApiAgent,
     extract_tokens,
     fold_trajectory,
+    sum_tokens,
 )
 from devops_bench.agents.capabilities import (
     AgentRules,
@@ -445,6 +446,67 @@ def test_extract_tokens_preserves_legacy_on_disk_key_scheme() -> None:
     usage = SimpleNamespace(input_tokens=1, output_tokens=2)
     keys = set(extract_tokens(SimpleNamespace(usage=usage)).keys())
     assert keys == {"prompt_tokens", "candidates_tokens", "total_tokens"}
+
+
+# ---------------------------------------------------------------------------
+# sum_tokens
+# ---------------------------------------------------------------------------
+
+
+def _usage_response(prompt: int, candidates: int, total: int) -> SimpleNamespace:
+    """Build a Google-shaped response carrying the given counts."""
+    return SimpleNamespace(
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=prompt,
+            candidates_token_count=candidates,
+            total_token_count=total,
+        )
+    )
+
+
+def test_sum_tokens_adds_every_turn() -> None:
+    """A run's usage is the sum over turns, not the last turn's counts.
+
+    Regression test: the agent read ``LoopResult.response`` — the final turn —
+    so a multi-turn run reported a fraction of what it was billed, and the
+    shortfall grew with turn count.
+    """
+    responses = [
+        _usage_response(100, 10, 110),
+        _usage_response(300, 20, 320),
+        _usage_response(700, 5, 705),
+    ]
+    assert sum_tokens(responses) == {
+        "prompt_tokens": 1100,
+        "candidates_tokens": 35,
+        "total_tokens": 1135,
+    }
+    # The old behaviour, for contrast: the last turn alone.
+    assert extract_tokens(responses[-1])["total_tokens"] == 705
+
+
+def test_sum_tokens_skips_turns_that_report_no_usage() -> None:
+    """A turn with no usage block contributes nothing rather than zeroing the sum."""
+    responses = [_usage_response(5, 1, 6), SimpleNamespace(), None, _usage_response(7, 2, 9)]
+    assert sum_tokens(responses) == {
+        "prompt_tokens": 12,
+        "candidates_tokens": 3,
+        "total_tokens": 15,
+    }
+
+
+def test_sum_tokens_returns_empty_dict_when_nothing_reported() -> None:
+    """No turns, or no turn with usage, yields ``{}`` — the same signal
+    :func:`extract_tokens` gives, so ``results.json`` omits the block rather
+    than recording a run that used zero tokens."""
+    assert sum_tokens([]) == {}
+    assert sum_tokens([SimpleNamespace(), None]) == {}
+
+
+def test_sum_tokens_single_turn_matches_extract_tokens() -> None:
+    """A one-turn run must report exactly what the single turn reported."""
+    response = _usage_response(11, 22, 33)
+    assert sum_tokens([response]) == extract_tokens(response)
 
 
 # ---------------------------------------------------------------------------

@@ -60,6 +60,11 @@ class LoopResult:
             final turn also requests tools.
         latency: Total seconds spent inside ``generate_content`` across turns.
         tools_used: Names of every tool the model requested.
+        responses: Every raw provider response, oldest first, so callers can
+            read per-turn usage. Each turn is billed separately, so a caller
+            reading only :attr:`response` sees one turn's counts rather than
+            the run's. Empty when the loop never ran a turn; otherwise its last
+            element is :attr:`response`.
     """
 
     response: Any
@@ -67,6 +72,7 @@ class LoopResult:
     final_text: str
     latency: float
     tools_used: set[str] = field(default_factory=set)
+    responses: list[Any] = field(default_factory=list)
 
 
 async def run_tool_loop(
@@ -92,12 +98,13 @@ async def run_tool_loop(
             warning rather than looping forever.
 
     Returns:
-        A :class:`LoopResult` with the last response, full ``contents``,
-        retained ``final_text``, accumulated ``latency``, and the set of
-        ``tools_used``.
+        A :class:`LoopResult` with the last response, every per-turn
+        ``responses`` entry, full ``contents``, retained ``final_text``,
+        accumulated ``latency``, and the set of ``tools_used``.
     """
     contents: list[dict] = [{"role": "user", "content": goal}]
     tools_used: set[str] = set()
+    responses: list[Any] = []
     response: Any = None
     final_text = ""
     total_latency = 0.0
@@ -108,6 +115,7 @@ async def run_tool_loop(
         start = time.monotonic()
         response = await client.generate_content(contents, tools, system_instruction)
         total_latency += time.monotonic() - start
+        responses.append(response)
 
         # Guard against ``get_text_content`` returning ``None``.
         text = client.get_text_content(response) or ""
@@ -148,4 +156,5 @@ async def run_tool_loop(
         final_text=final_text,
         latency=total_latency,
         tools_used=tools_used,
+        responses=responses,
     )
