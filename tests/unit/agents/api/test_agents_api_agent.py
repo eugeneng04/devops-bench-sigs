@@ -570,6 +570,32 @@ def test_extract_tokens_provider_total_wins_over_the_bucket_sum() -> None:
     assert extract_tokens(SimpleNamespace(usage_metadata=usage))["total"] == 99
 
 
+def test_extract_tokens_a_reported_zero_total_falls_back_to_the_bucket_sum() -> None:
+    """An unset protobuf int reads as 0; billed buckets must not sum to it."""
+    usage = SimpleNamespace(
+        prompt_token_count=4000, candidates_token_count=120, total_token_count=0
+    )
+    assert extract_tokens(SimpleNamespace(usage_metadata=usage))["total"] == 4120
+
+
+def test_extract_tokens_google_over_reported_cached_cannot_go_negative() -> None:
+    """``cached`` above the prompt count clamps ``input`` at 0, never below."""
+    usage = SimpleNamespace(prompt_token_count=100, cached_content_token_count=150)
+    assert extract_tokens(SimpleNamespace(usage_metadata=usage))["input"] == 0
+
+
+def test_extract_tokens_openai_reasoning_above_completion_cannot_go_negative() -> None:
+    """A shim billing reasoning *outside* ``completion_tokens`` must not yield
+    a negative ``output`` that then subtracts from the run's total."""
+    usage = SimpleNamespace(
+        prompt_tokens=6,
+        completion_tokens=1,
+        total_tokens=61,
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=54),
+    )
+    assert extract_tokens(SimpleNamespace(usage=usage))["output"] == 0
+
+
 def test_extract_tokens_computes_the_total_from_every_bucket() -> None:
     """With no provider total, the sum spans all five buckets, not just two."""
     usage = SimpleNamespace(
