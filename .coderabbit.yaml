@@ -9,6 +9,11 @@ knowledge_base:
 
 reviews:
   request_changes_workflow: true
+  instructions: |
+    Strictly enforce Vendor Neutrality and Public Standards across this repository:
+    1. User-facing surfaces (docs, CLI help, docstrings, error messages, public APIs) and generic framework layers (core, evalharness, run/cli, tasks/common, metrics, verification, chaos, agents, models, results, k8s) must remain vendor-neutral. Use generic terms (e.g. "cloud project ID", "target Kubernetes cluster", "k8s-mcp") instead of vendor-specific names (GCP, AWS, Azure, GKE, EKS, AKS, gke-mcp).
+    2. Cloud provider-specific terms and environment variables belong only in provider implementations (devops_bench/providers/), deployers, tf/ modules, per-vendor agent/model subtrees (devops_bench/agents/cli/<vendor>/, devops_bench/models/<vendor>.py), provider-shaped tasks (tasks/<provider>/), or where they name a real provider artifact. Do not flag the model-provider axis (gemini, claude, ollama, Vertex AI): a model adapter naming its own backend or reading SDK-required credentials/project ID is correct.
+    3. Strictly prevent internal corporate and intranet leakage across all PRs: Flag any proprietary internal hostnames, corporate domain suffixes/intranets (*.internal, *.corp, private DNS zones), enterprise SSO/corporate-suffixed usernames, internal issue tracking numbers, or internal VCS/code-review metadata tags. All code, scripts, and documentation must rely solely on public, reproducible conventions.
 
   path_filters:
     - "!uv.lock"
@@ -21,7 +26,7 @@ reviews:
 
     - path: "{devops_bench,docs}/**"
       instructions: |
-        Flag vendor-specific terminology (GKE, GCP, gcloud, Google Cloud) in user-facing surfaces: docstrings, CLI help text, error messages, public API names, and docs. The benchmark is vendor-neutral. Also flag generic framework layers (core, evalharness, run/cli, devops_bench/tasks, metrics, verification, chaos, agents, models, results, k8s) reading cloud-provider environment variables such as GCP_PROJECT_ID — cloud-provider resolution belongs in devops_bench/providers/ and deployer implementations. Provider-specific terms are acceptable in those provider modules, in tf/, in the per-vendor subtrees devops_bench/agents/cli/<vendor>/ and devops_bench/models/<vendor>.py, in provider-shaped tasks under tasks/<provider>/, or when naming a real provider artifact. Do not flag the model-provider axis (gemini, claude, ollama, Vertex AI): a model adapter naming its own backend, or reading GCP_PROJECT_ID because Vertex requires a project id, is correct. Suggest neutral phrasing such as "cloud project id" or "target Kubernetes cluster" elsewhere.
+        Flag vendor-specific terminology (GKE, GCP, gcloud, Google Cloud) in user-facing surfaces: docstrings, CLI help text, error messages, public API names, and docs unless naming a real provider artifact. In generic architecture diagrams and generic agent harness examples, ensure neutral tool names (e.g. k8s-mcp) are used rather than provider-specific variants (e.g. gke-mcp). Also flag generic framework layers (core, evalharness, run/cli, tasks/common, metrics, verification, chaos, agents, models, results, k8s) reading cloud-provider environment variables such as GCP_PROJECT_ID — cloud-provider resolution belongs in devops_bench/providers/ and deployer implementations. Suggest neutral phrasing such as "cloud project id" or "target Kubernetes cluster" elsewhere.
 
     - path: "tests/**/*.py"
       instructions: |
@@ -31,7 +36,7 @@ reviews:
       instructions: |
         Focus on utility logic correctness, argument handling, file/process management, and compliance with project license header checks.
 
-    - path: "devops_bench/tasks/**"
+    - path: "tasks/**"
       instructions: |
         Focus on benchmarking task definition schema validity, clarity of task descriptions, reproducible setup/teardown steps, and evaluation completeness.
 
@@ -48,6 +53,14 @@ reviews:
     - path: "deployers/**"
       instructions: |
         Focus on container deployment workflows, infrastructure automation scripts, error recovery, and security parameters.
+
+    - path: "scripts/**"
+      instructions: |
+        Verify shell script safety (set -euo pipefail, quoting, error handling). Ensure runner scripts maintain generic parameter fallbacks and do not hardcode internal infrastructure hostnames or corporate user conventions.
+
+    - path: "tf/**"
+      instructions: |
+        Review OpenTofu/Terraform modules for clean variable abstraction, clear documentation, and proper provider separation between generic cluster modules and provider-specific stacks.
 
     - path: "**/*.md"
       instructions: |
