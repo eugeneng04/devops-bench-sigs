@@ -216,24 +216,14 @@ def extract_tokens(response: Any) -> dict:
 
 
 def sum_tokens(responses: Sequence[Any]) -> dict:
-    """Sum per-turn provider token usage across a whole tool-use loop.
+    """Sum :func:`extract_tokens` across every provider turn.
 
-    Every turn is billed on its own, and an agentic loop re-sends the entire
-    conversation each time, so a run's usage is the sum over turns rather than
-    the last turn's counts. Reading only the final response undercounts a
-    multi-turn run by close to the whole run, and the shortfall grows with turn
-    count — which is the opposite of what a cost comparison needs.
+    An agentic loop re-sends the whole conversation each turn and is billed for
+    each, so reading only the final response undercounts by close to the whole
+    run — and the shortfall grows with turn count, the opposite of what a cost
+    comparison needs.
 
-    Keys are whatever :func:`extract_tokens` reports, so a provider bucket
-    added there is summed here without further change.
-
-    Args:
-        responses: Every raw provider response the loop produced, oldest first
-            (:attr:`LoopResult.responses`).
-
-    Returns:
-        The summed counts under :func:`extract_tokens`'s key scheme, or ``{}``
-        when no turn reported usage.
+    Returns ``{}`` when no turn reported usage.
     """
     totals: dict[str, int] = {}
     for response in responses:

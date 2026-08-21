@@ -60,11 +60,9 @@ class LoopResult:
             final turn also requests tools.
         latency: Total seconds spent inside ``generate_content`` across turns.
         tools_used: Names of every tool the model requested.
-        responses: Every raw provider response, oldest first, so callers can
-            read per-turn usage. Each turn is billed separately, so a caller
-            reading only :attr:`response` sees one turn's counts rather than
-            the run's. Empty when the loop never ran a turn; otherwise its last
-            element is :attr:`response`.
+        responses: Every raw provider response, oldest first. Each turn is
+            billed separately, so a caller reading only :attr:`response` sees
+            one turn's counts rather than the run's.
     """
 
     response: Any
