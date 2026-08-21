@@ -53,8 +53,8 @@ class TurnRecord:
     """One provider turn inside :func:`run_tool_loop`.
 
     A run's totals hide their own shape: 40k tokens over 4 turns and 40k over
-    30 is the same row today, and only the second is a loop that is failing to
-    converge. Per-turn records make the growth curve readable.
+    30 are the same row today, and only the second is a loop failing to
+    converge.
 
     Attributes:
         response: The raw provider response for this turn, carrying its usage.
@@ -95,8 +95,7 @@ class LoopResult:
         """Every raw provider response, oldest first.
 
         Each turn is billed separately, so a caller reading only
-        :attr:`response` sees one turn's counts rather than the run's. The last
-        element is :attr:`response` whenever the loop ran at all.
+        :attr:`response` sees one turn's counts rather than the run's.
         """
         return [turn.response for turn in self.turns]
 

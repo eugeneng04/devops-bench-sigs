@@ -309,10 +309,8 @@ def sum_tokens(responses: Sequence[Any]) -> dict:
 def _int_attr(obj: Any, name: str) -> int | None:
     """Return ``obj.name`` as an int, or ``None`` when absent or unset.
 
-    Provider usage objects are typed namespaces / pydantic models with the
-    counts as plain ints; an unset field is either missing or ``None``. Both
-    cases yield ``None`` so callers can tell an unreported bucket from a
-    reported zero.
+    An unset provider field is either missing or ``None``; both yield ``None``
+    so callers can tell an unreported bucket from a reported zero.
     """
     value = getattr(obj, name, None)
     return None if value is None else int(value)

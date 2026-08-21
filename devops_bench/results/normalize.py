@@ -219,14 +219,10 @@ def normalize_tokens(tokens: Mapping[str, Any] | None) -> NormalizedTokens:
 
 
 def count_turns(turns: Any) -> int | None:
-    """Return how many provider turns a record's ``turns`` list holds.
+    """Return a record's provider-turn count, or ``None`` when unreported.
 
-    Args:
-        turns: The record's ``turns`` value, of any shape.
-
-    Returns:
-        The turn count, or ``None`` when the record carries no usable turn list
-        — a harness that cannot report turns must not read as zero turns.
+    A harness that cannot see inside its own loop must not read as zero turns
+    and sink a dashboard average.
     """
     if not isinstance(turns, list) or not turns:
         return None

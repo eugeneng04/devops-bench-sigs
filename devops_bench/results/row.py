@@ -121,10 +121,9 @@ class ResultRow(BaseModel):
         tool_score: Tool-invocation judge score in ``[0, 1]``, or ``None``.
         model_turns: Provider turns the run took, or ``None`` when the harness
             cannot see inside its own loop (every CLI agent, which runs that
-            loop in another process). ``None`` rather than ``0`` so unreported
-            stays distinguishable from a run that never took a turn. Read with
-            ``total_tokens`` this separates a run that spent its budget on a few
-            large turns from one stuck in a loop.
+            loop in another process). Read with ``total_tokens`` this separates
+            a run that spent its budget on a few large turns from one stuck in
+            a loop.
         latency_sec: Agent wall-clock seconds for the iteration.
         input_tokens: Non-cached prompt token count, or ``None`` when
             unreported. (Historical records that predate the canonical token
