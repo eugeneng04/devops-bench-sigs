@@ -274,31 +274,26 @@ def _scoring_version(scores: Mapping[str, Any] | None) -> str:
     return ""
 
 
-#: Trajectory ``status`` values that mean the tool call did not deliver a
-#: result. ``called`` is deliberately excluded: it means the parser never saw
-#: the call resolve, which is a gap in our capture rather than a tool failure.
-_FAILED_TOOL_STATUSES = frozenset({"error", "interrupted"})
-
-
-def count_tool_calls(trajectory: Any) -> tuple[int, int]:
+def count_tool_calls(trajectory: Any) -> tuple[int | None, int | None]:
     """Return ``(tool_calls, tool_errors)`` for a record's trajectory.
 
     Every trajectory entry is a ``ToolCall.to_dict()`` mapping, so the entry
     count is the call count. Entries that are not mappings are skipped rather
     than raising — a malformed record should lose a count, not a whole run.
 
-    Args:
-        trajectory: The record's ``trajectory`` value, of any shape.
+    Only ``status == "error"`` counts as an error. ``called`` and
+    ``interrupted`` are the same condition — a call the parser never saw
+    resolve — labelled differently by different parsers, so counting either
+    would make the column incomparable across harnesses.
 
-    Returns:
-        The total number of tool calls and how many of them failed or were
-        interrupted.
+    An empty or non-list trajectory yields ``(None, None)``. A trajectory
+    export can fail (see the early returns in the openclaw harness), and a
+    zero that means "not captured" would sink a dashboard average.
     """
-    if not isinstance(trajectory, list):
-        return 0, 0
+    if not isinstance(trajectory, list) or not trajectory:
+        return None, None
     entries = [entry for entry in trajectory if isinstance(entry, Mapping)]
-    errors = sum(1 for entry in entries if entry.get("status") in _FAILED_TOOL_STATUSES)
-    return len(entries), errors
+    return len(entries), sum(1 for entry in entries if entry.get("status") == "error")
 
 
 def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list[ResultRow]:

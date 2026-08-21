@@ -59,7 +59,10 @@ class ToolCall:
         result: Tool output text once the tool returns; ``None`` until then.
         status: Lifecycle marker — ``"called"`` when first emitted,
             ``"completed"`` once the result is folded in, ``"error"`` when the
-            tool failed.
+            tool failed. The antigravity parser also emits ``"interrupted"``
+            for a call left pending at the end of a run; that is the same
+            condition other parsers leave as ``"called"``, so neither counts
+            as a tool error.
     """
 
     name: str
