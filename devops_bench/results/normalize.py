@@ -70,6 +70,13 @@ CATASTROPHIC_SCORE_KEY = score_keys.VERIFICATION_CATASTROPHIC_KEY
 # (``input`` / ``cached`` / ``reasoning`` / ``output``; see
 # ``devops_bench.agents.result.TOKEN_BUCKETS``) come first; the rest keep
 # historical ``results.json`` records readable.
+#
+# The CLI harnesses pass their tool's own usage keys through verbatim, so the
+# tool's spelling is part of this contract. OpenClaw emits camelCase
+# ``cacheRead`` / ``cacheWrite`` / ``totalTokens`` from every one of its
+# provider adapters, with ``input`` already net of both cache buckets — see
+# ``@openclaw/ai``'s ``parseChunkUsage``, whose own total is
+# ``input + output + cacheRead + cacheWrite``.
 _INPUT_TOKEN_KEYS = ("input", "prompt_tokens", "prompt_token_count", "input_tokens")
 _OUTPUT_TOKEN_KEYS = (
     "output",
@@ -78,10 +85,15 @@ _OUTPUT_TOKEN_KEYS = (
     "completion_tokens",
     "output_tokens",
 )
-_CACHED_TOKEN_KEYS = ("cached", "cache_read_input_tokens", "cached_content_token_count")
-_CACHE_WRITE_TOKEN_KEYS = ("cache_write", "cache_creation_input_tokens")
+_CACHED_TOKEN_KEYS = (
+    "cached",
+    "cacheRead",
+    "cache_read_input_tokens",
+    "cached_content_token_count",
+)
+_CACHE_WRITE_TOKEN_KEYS = ("cache_write", "cacheWrite", "cache_creation_input_tokens")
 _REASONING_TOKEN_KEYS = ("reasoning", "thoughts_token_count", "reasoning_tokens")
-_TOTAL_TOKEN_KEYS = ("total", "total_tokens", "total_token_count")
+_TOTAL_TOKEN_KEYS = ("total", "totalTokens", "total_tokens", "total_token_count")
 
 # Runs of characters outside ``[a-z0-9]`` collapse to a single ``-``. Mirrors the
 # dashboard's ``catalog.mjs`` / seeder ``slugify`` so the model component of a
