@@ -158,37 +158,45 @@ def _fold_with_extraction_errors(
     return [entry.to_dict() for entry in trajectory], orphan_errors
 
 
-def extract_tokens(response: Any) -> dict:
-    """Pull one turn's provider token usage off a raw response.
+def extract_tokens(response: Any) -> dict[str, int | None]:
+    """Map one turn's provider usage onto the canonical token buckets.
 
     A tool-use loop bills every turn, so this is a per-turn reading — use
     :func:`sum_tokens` for a whole run.
 
-    Detects which provider's usage shape is present and maps each onto a stable
-    key scheme (``prompt_tokens`` / ``candidates_tokens`` / ``total_tokens``) so
-    ``results.json`` stays consistent across providers.
+    Emits :data:`~devops_bench.agents.result.TOKEN_BUCKETS`, matching what the
+    gemini_cli and antigravity harnesses already write. ``input`` is the
+    **non-cached** prompt, ``cached`` is cache-read only, ``cache_write`` is
+    cache creation, ``output`` excludes ``reasoning`` where the provider splits
+    them, and ``total`` is the sum of all five.
 
-    Supported shapes:
+    Whether a provider's prompt count already includes its cached tokens
+    differs per provider, so each shape is mapped explicitly rather than by
+    first-matching alias:
 
-    * **Google** — ``response.usage_metadata`` with ``prompt_token_count`` /
-      ``candidates_token_count`` / ``total_token_count``.
-    * **Anthropic** — ``response.usage`` with ``input_tokens`` /
-      ``output_tokens`` (no aggregated total; the sum is used).
-    * **OpenAI / Ollama** — ``response.usage`` with ``prompt_tokens`` /
-      ``completion_tokens`` / ``total_tokens``.
+    ============ ============================== ==================================
+    Provider     Prompt count                   Buckets it cannot report
+    ============ ============================== ==================================
+    Google       includes cached — subtracted   ``cache_write``
+    OpenAI       includes cached — subtracted   ``cache_write``
+    Anthropic    excludes cache reads/writes    ``reasoning`` (billed in output)
+    ============ ============================== ==================================
 
-    The "output" field (``candidates_tokens``) absorbs whichever provider name
-    is present (``candidates_token_count`` / ``output_tokens`` /
-    ``completion_tokens``). When ``total`` is absent it is computed from the
-    other two so metrics never see ``0`` for a non-empty run.
+    A bucket the provider does not report is ``None``, never ``0``, so the
+    dashboard can tell "no cache telemetry" from "nothing was cached".
+
+    ``total`` uses the provider's own figure when present and the bucket sum
+    otherwise. Anthropic reports no total, and the previous ``input + output``
+    fallback dropped every cache-read and cache-creation token from a cached
+    run — the tokens that dominate a long agentic conversation.
 
     Args:
         response: One raw provider response from :attr:`LoopResult.responses`,
             or ``None``.
 
     Returns:
-        A ``{"prompt_tokens", "candidates_tokens", "total_tokens"}`` dict, or
-        ``{}`` when no usage is reported.
+        A dict keyed by :data:`TOKEN_BUCKETS`, or ``{}`` when the response
+        carries no usage or an unrecognized usage shape.
     """
     if response is None:
         return {}
@@ -196,22 +204,85 @@ def extract_tokens(response: Any) -> dict:
     if usage is None:
         return {}
 
-    # Try the Google attr first, then the OpenAI-style attr, then the Anthropic
-    # alias.
-    prompt = _first_int_attr(usage, "prompt_token_count", "prompt_tokens", "input_tokens")
-    candidates = _first_int_attr(
-        usage, "candidates_token_count", "completion_tokens", "output_tokens"
-    )
-    total = _first_int_attr(usage, "total_token_count", "total_tokens")
-    # Anthropic emits no aggregated total; compute it so non-zero usage never
-    # surfaces as ``total_tokens: 0`` in results.json.
-    if total == 0 and (prompt or candidates):
-        total = prompt + candidates
+    # The three prompt-count names are mutually exclusive across providers, so
+    # the one that is present identifies the shape.
+    if _int_attr(usage, "prompt_token_count") is not None:
+        buckets = _google_buckets(usage)
+    elif _int_attr(usage, "prompt_tokens") is not None:
+        buckets = _openai_buckets(usage)
+    elif _int_attr(usage, "input_tokens") is not None:
+        buckets = _anthropic_buckets(usage)
+    else:
+        # A usage object in a shape we do not know. Reporting zeros would claim
+        # a free run; ``{}`` reads downstream as "unavailable".
+        return {}
 
+    if buckets["total"] is None:
+        buckets["total"] = sum(
+            count for key, count in buckets.items() if key != "total" and count is not None
+        )
+    return buckets
+
+
+def _google_buckets(usage: Any) -> dict[str, int | None]:
+    """Map a Google ``usage_metadata`` object onto the canonical buckets.
+
+    ``prompt_token_count`` includes cached tokens, so ``cached`` is subtracted
+    back out. ``candidates_token_count`` excludes thinking, which Google
+    reports separately as ``thoughts_token_count``. Implicit caching carries no
+    creation charge, so ``cache_write`` is unreported rather than zero.
+    """
+    prompt = _int_attr(usage, "prompt_token_count") or 0
+    cached = _int_attr(usage, "cached_content_token_count")
     return {
-        "prompt_tokens": prompt,
-        "candidates_tokens": candidates,
-        "total_tokens": total,
+        "input": prompt - (cached or 0),
+        "cached": cached,
+        "cache_write": None,
+        "reasoning": _int_attr(usage, "thoughts_token_count"),
+        "output": _int_attr(usage, "candidates_token_count") or 0,
+        "total": _int_attr(usage, "total_token_count"),
+    }
+
+
+def _openai_buckets(usage: Any) -> dict[str, int | None]:
+    """Map an OpenAI / Ollama ``usage`` object onto the canonical buckets.
+
+    Both split counts live in nested detail objects and are *included* in their
+    parent, so each is subtracted back out: ``prompt_tokens_details.cached_tokens``
+    sits inside ``prompt_tokens`` and ``completion_tokens_details.reasoning_tokens``
+    inside ``completion_tokens``. Ollama omits both detail objects entirely,
+    which leaves those buckets ``None``.
+    """
+    prompt = _int_attr(usage, "prompt_tokens") or 0
+    completion = _int_attr(usage, "completion_tokens") or 0
+    cached = _nested_int_attr(usage, "prompt_tokens_details", "cached_tokens")
+    reasoning = _nested_int_attr(usage, "completion_tokens_details", "reasoning_tokens")
+    return {
+        "input": prompt - (cached or 0),
+        "cached": cached,
+        "cache_write": None,
+        "reasoning": reasoning,
+        "output": completion - (reasoning or 0),
+        "total": _int_attr(usage, "total_tokens"),
+    }
+
+
+def _anthropic_buckets(usage: Any) -> dict[str, int | None]:
+    """Map an Anthropic ``usage`` object onto the canonical buckets.
+
+    ``input_tokens`` already excludes both cache reads and cache creation, so
+    it maps to ``input`` untouched — the one provider here that needs no
+    subtraction. Thinking tokens are billed inside ``output_tokens`` and are
+    not reported separately, so ``reasoning`` stays ``None`` and ``output``
+    keeps them.
+    """
+    return {
+        "input": _int_attr(usage, "input_tokens") or 0,
+        "cached": _int_attr(usage, "cache_read_input_tokens"),
+        "cache_write": _int_attr(usage, "cache_creation_input_tokens"),
+        "reasoning": None,
+        "output": _int_attr(usage, "output_tokens") or 0,
+        "total": None,
     }
 
 
@@ -223,28 +294,41 @@ def sum_tokens(responses: Sequence[Any]) -> dict:
     run — and the shortfall grows with turn count, the opposite of what a cost
     comparison needs.
 
-    Returns ``{}`` when no turn reported usage.
+    A bucket stays ``None`` unless some turn reported it; treating it as ``0``
+    would turn "this provider sends no cache telemetry" into "nothing was
+    cached". Returns ``{}`` when no turn reported usage.
     """
-    totals: dict[str, int] = {}
+    totals: dict[str, int | None] = {}
     for response in responses:
         for key, value in extract_tokens(response).items():
-            totals[key] = totals.get(key, 0) + value
+            if value is None:
+                totals.setdefault(key, None)
+                continue
+            running = totals.get(key)
+            totals[key] = value if running is None else running + value
     return totals
 
 
-def _first_int_attr(obj: Any, *names: str) -> int:
-    """Return the first ``names`` attribute on ``obj`` that holds a non-``None`` int.
+def _int_attr(obj: Any, name: str) -> int | None:
+    """Return ``obj.name`` as an int, or ``None`` when absent or unset.
 
     Provider usage objects are typed namespaces / pydantic models with the
-    counts as plain ints; an unset field is either absent or ``None``. The
-    helper falls through both cases and returns ``0`` when no name matches so
-    the caller never has to ``None``-guard the arithmetic.
+    counts as plain ints; an unset field is either missing or ``None``. Both
+    cases yield ``None`` so callers can tell an unreported bucket from a
+    reported zero.
     """
-    for name in names:
-        value = getattr(obj, name, None)
-        if value is not None:
-            return int(value)
-    return 0
+    value = getattr(obj, name, None)
+    return None if value is None else int(value)
+
+
+def _nested_int_attr(obj: Any, parent: str, name: str) -> int | None:
+    """Return ``obj.parent.name`` as an int, or ``None`` when either is absent.
+
+    OpenAI nests its cached-prompt and reasoning counts one level down, and
+    omits the whole detail object for models that report neither.
+    """
+    child = getattr(obj, parent, None)
+    return None if child is None else _int_attr(child, name)
 
 
 def _build_dispatch(
