@@ -49,6 +49,7 @@ def test_agent_result_to_dict_is_serializable_copies() -> None:
         trajectory=trajectory,
         tokens={"prompt": 1},
         latency=2.5,
+        turns=[{"tokens": {"total": 3}, "latency_sec": 2.5, "tool_calls": 1}],
         errors=["x"],
         metadata={"k": 1},
     )
@@ -58,6 +59,7 @@ def test_agent_result_to_dict_is_serializable_copies() -> None:
         "trajectory": trajectory,
         "tokens": {"prompt": 1},
         "latency": 2.5,
+        "turns": [{"tokens": {"total": 3}, "latency_sec": 2.5, "tool_calls": 1}],
         "errors": ["x"],
         "metadata": {"k": 1},
     }
@@ -65,6 +67,7 @@ def test_agent_result_to_dict_is_serializable_copies() -> None:
     # never bleeds back into the result it came from.
     out["trajectory"].append({"name": "extra", "args": {}, "result": None, "status": "called"})
     out["tokens"]["mutated"] = True
+    out["turns"][0]["mutated"] = True
     out["errors"].append("mutated")
     out["metadata"]["mutated"] = True
     assert result.trajectory == trajectory

@@ -35,6 +35,7 @@ __all__ = [
     "TOOL_SCORE_KEY",
     "NormalizedTokens",
     "build_rows",
+    "count_turns",
     "derive_augmentation",
     "extract_score",
     "normalize_tokens",
@@ -217,6 +218,21 @@ def normalize_tokens(tokens: Mapping[str, Any] | None) -> NormalizedTokens:
     )
 
 
+def count_turns(turns: Any) -> int | None:
+    """Return how many provider turns a record's ``turns`` list holds.
+
+    Args:
+        turns: The record's ``turns`` value, of any shape.
+
+    Returns:
+        The turn count, or ``None`` when the record carries no usable turn list
+        — a harness that cannot report turns must not read as zero turns.
+    """
+    if not isinstance(turns, list) or not turns:
+        return None
+    return len(turns)
+
+
 def extract_score(scores: Mapping[str, Any] | None, key: str) -> float | None:
     """Pull a single continuous metric score out of a record's ``scores`` map.
 
@@ -311,6 +327,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 catastrophic=catastrophic_score == 0.0,
                 scoring_version=_scoring_version(scores),
                 tool_score=extract_score(scores, TOOL_SCORE_KEY),
+                model_turns=count_turns(record.get("turns")),
                 latency_sec=float(record.get("latency") or 0.0),
                 input_tokens=tokens.input,
                 output_tokens=tokens.output,

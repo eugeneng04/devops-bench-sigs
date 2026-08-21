@@ -582,6 +582,14 @@ class ApiAgent(AgentHarness):
 
         trajectory, orphan_errors = _fold_with_extraction_errors(loop_result.contents)
         tokens = sum_tokens(loop_result.responses)
+        turns = [
+            {
+                "tokens": extract_tokens(turn.response),
+                "latency_sec": turn.latency,
+                "tool_calls": turn.tool_calls,
+            }
+            for turn in loop_result.turns
+        ]
         metadata: dict[str, Any] = {
             "tools_used": sorted(loop_result.tools_used),
         }
@@ -593,6 +601,7 @@ class ApiAgent(AgentHarness):
             trajectory=trajectory,
             tokens=tokens,
             latency=loop_result.latency,
+            turns=turns,
             errors=list(dispatch_errors) + orphan_errors,
             metadata=metadata,
         )

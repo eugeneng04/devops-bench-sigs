@@ -786,6 +786,48 @@ def test_execute_records_anthropic_tokens_through_to_agentresult(
     }
 
 
+def test_execute_records_one_turn_entry_per_provider_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run's totals hide their own shape.
+
+    40k tokens over 3 turns and 40k over 30 produce the same ``tokens`` dict,
+    and only the second is a loop failing to converge, so the per-turn split
+    has to reach ``AgentResult``.
+    """
+    fake = _FakeLLMClient(
+        [
+            _Turn(
+                text="working",
+                calls=[{"name": "t", "args": {}, "id": "a"}],
+                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+                usage_attr="usage",
+            ),
+            _Turn(
+                text="done",
+                usage=SimpleNamespace(prompt_tokens=30, completion_tokens=7, total_tokens=37),
+                usage_attr="usage",
+            ),
+        ]
+    )
+    monkeypatch.setattr(agent_mod, "get_model", lambda *a, **kw: fake)
+    result = ApiAgent(AgentConfig()).run("p")
+
+    assert [turn["tool_calls"] for turn in result.turns] == [1, 0]
+    assert [turn["tokens"]["total"] for turn in result.turns] == [15, 37]
+    assert result.tokens["total"] == 52
+    assert sum(turn["latency_sec"] for turn in result.turns) == pytest.approx(result.latency)
+
+
+def test_execute_leaves_turns_empty_when_the_loop_never_ran(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No turn taken means no turn measured — not a turn of zeros."""
+    fake = _FakeLLMClient([])
+    monkeypatch.setattr(agent_mod, "get_model", lambda *a, **kw: fake)
+    assert ApiAgent(AgentConfig(max_turns=0)).run("p").turns == []
+
+
 def test_execute_records_openai_tokens_through_to_agentresult(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -396,6 +396,65 @@ async def test_responses_retains_turns_discarded_by_the_cap():
     assert [r.text for r in result.responses] == ["turn0", "turn1", "turn2"]
 
 
+@pytest.mark.asyncio
+async def test_turns_record_the_tool_calls_each_turn_issued():
+    """Per-turn tool counts show where a run's work actually went.
+
+    A run's total tool count cannot say whether the model made four calls on
+    one turn or one call across four turns; only the second is a loop failing
+    to converge.
+    """
+    turns = [
+        _Turn(
+            text="t1",
+            calls=[
+                {"name": "t", "args": {}, "id": "a"},
+                {"name": "t", "args": {}, "id": "b"},
+            ],
+        ),
+        _Turn(text="t2", calls=[{"name": "t", "args": {}, "id": "c"}]),
+        _Turn(text="done", calls=[]),
+    ]
+    client = FakeLLMClient(turns)
+    dispatch, _ = _dispatcher_recording({"t": "ok"})
+
+    result = await run_tool_loop(
+        client=client,
+        goal="g",
+        tools=None,
+        system_instruction=None,
+        dispatch=dispatch,
+        max_turns=10,
+    )
+
+    assert [turn.tool_calls for turn in result.turns] == [2, 1, 0]
+    assert [turn.response.text for turn in result.turns] == ["t1", "t2", "done"]
+
+
+@pytest.mark.asyncio
+async def test_per_turn_latency_sums_to_the_run_total():
+    """Splitting latency per turn must not change what the run reports."""
+    turns = [
+        _Turn(text="t1", calls=[{"name": "t", "args": {}, "id": "a"}]),
+        _Turn(text="t2", calls=[]),
+    ]
+    client = FakeLLMClient(turns)
+    dispatch, _ = _dispatcher_recording({"t": "ok"})
+
+    result = await run_tool_loop(
+        client=client,
+        goal="g",
+        tools=None,
+        system_instruction=None,
+        dispatch=dispatch,
+        max_turns=10,
+    )
+
+    assert len(result.turns) == 2
+    assert all(turn.latency >= 0.0 for turn in result.turns)
+    assert result.latency == pytest.approx(sum(turn.latency for turn in result.turns))
+
+
 def test_loop_import_pulls_no_provider_sdk():
     """Importing the loop primitive must not drag in provider SDKs.
 

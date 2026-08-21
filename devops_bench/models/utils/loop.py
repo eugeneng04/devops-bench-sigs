@@ -36,7 +36,7 @@ from typing import Any
 from devops_bench.core import get_logger
 from devops_bench.models.base import LLMClient
 
-__all__ = ["LoopResult", "ToolDispatcher", "run_tool_loop"]
+__all__ = ["LoopResult", "ToolDispatcher", "TurnRecord", "run_tool_loop"]
 
 _log = get_logger("models.utils.loop")
 
@@ -46,6 +46,25 @@ _log = get_logger("models.utils.loop")
 #: and must return the tool's textual result. Raising propagates out of
 #: :func:`run_tool_loop` so the caller controls error handling.
 ToolDispatcher = Callable[[str, Any, str | None], Awaitable[str]]
+
+
+@dataclass
+class TurnRecord:
+    """One provider turn inside :func:`run_tool_loop`.
+
+    A run's totals hide their own shape: 40k tokens over 4 turns and 40k over
+    30 is the same row today, and only the second is a loop that is failing to
+    converge. Per-turn records make the growth curve readable.
+
+    Attributes:
+        response: The raw provider response for this turn, carrying its usage.
+        latency: Seconds spent inside this turn's ``generate_content``.
+        tool_calls: How many tool calls the model issued on this turn.
+    """
+
+    response: Any
+    latency: float
+    tool_calls: int
 
 
 @dataclass
@@ -60,9 +79,8 @@ class LoopResult:
             final turn also requests tools.
         latency: Total seconds spent inside ``generate_content`` across turns.
         tools_used: Names of every tool the model requested.
-        responses: Every raw provider response, oldest first. Each turn is
-            billed separately, so a caller reading only :attr:`response` sees
-            one turn's counts rather than the run's.
+        turns: One :class:`TurnRecord` per provider turn, oldest first. Empty
+            when the loop never ran a turn.
     """
 
     response: Any
@@ -70,7 +88,17 @@ class LoopResult:
     final_text: str
     latency: float
     tools_used: set[str] = field(default_factory=set)
-    responses: list[Any] = field(default_factory=list)
+    turns: list[TurnRecord] = field(default_factory=list)
+
+    @property
+    def responses(self) -> list[Any]:
+        """Every raw provider response, oldest first.
+
+        Each turn is billed separately, so a caller reading only
+        :attr:`response` sees one turn's counts rather than the run's. The last
+        element is :attr:`response` whenever the loop ran at all.
+        """
+        return [turn.response for turn in self.turns]
 
 
 async def run_tool_loop(
@@ -96,13 +124,13 @@ async def run_tool_loop(
             warning rather than looping forever.
 
     Returns:
-        A :class:`LoopResult` with the last response, every per-turn
-        ``responses`` entry, full ``contents``, retained ``final_text``,
-        accumulated ``latency``, and the set of ``tools_used``.
+        A :class:`LoopResult` with the last response, a :class:`TurnRecord` per
+        provider turn, full ``contents``, retained ``final_text``, accumulated
+        ``latency``, and the set of ``tools_used``.
     """
     contents: list[dict] = [{"role": "user", "content": goal}]
     tools_used: set[str] = set()
-    responses: list[Any] = []
+    turns: list[TurnRecord] = []
     response: Any = None
     final_text = ""
     total_latency = 0.0
@@ -112,12 +140,20 @@ async def run_tool_loop(
 
         start = time.monotonic()
         response = await client.generate_content(contents, tools, system_instruction)
-        total_latency += time.monotonic() - start
-        responses.append(response)
+        turn_latency = time.monotonic() - start
+        total_latency += turn_latency
 
         # Guard against ``get_text_content`` returning ``None``.
         text = client.get_text_content(response) or ""
         function_calls = client.extract_function_calls(response)
+
+        turns.append(
+            TurnRecord(
+                response=response,
+                latency=turn_latency,
+                tool_calls=len(function_calls),
+            )
+        )
 
         final_text = text
 
@@ -154,5 +190,5 @@ async def run_tool_loop(
         final_text=final_text,
         latency=total_latency,
         tools_used=tools_used,
-        responses=responses,
+        turns=turns,
     )

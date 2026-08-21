@@ -680,6 +680,7 @@ _RESULTS_JSON_REQUIRED_KEYS: frozenset[str] = frozenset(
         "tokens",
         "tools",
         "trajectory",
+        "turns",
         "skills",
         "name",
         "folder",

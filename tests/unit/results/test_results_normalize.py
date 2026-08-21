@@ -23,7 +23,7 @@ from devops_bench.results import (
     normalize_tokens,
     setup_id,
 )
-from devops_bench.results.normalize import OUTCOME_SCORE_KEY, TOOL_SCORE_KEY
+from devops_bench.results.normalize import OUTCOME_SCORE_KEY, TOOL_SCORE_KEY, count_turns
 
 
 def _manifest(**overrides):
@@ -193,6 +193,7 @@ def test_build_rows_success_record():
         "catastrophic": False,
         "scoringVersion": "",
         "toolScore": 0.7,
+        "modelTurns": None,
         "latencySec": 42.5,
         "inputTokens": 100,
         "outputTokens": 20,
@@ -331,6 +332,7 @@ def test_result_row_keys_match_typescript_interface():
         "catastrophic",
         "scoringVersion",
         "toolScore",
+        "modelTurns",
         "latencySec",
         "inputTokens",
         "outputTokens",
@@ -410,3 +412,37 @@ def test_build_rows_carries_cache_write() -> None:
     row = build_rows([record], _manifest())[0]
     assert row.cache_write_tokens == 200
     assert row.total_tokens == 1245
+
+
+def test_count_turns_reads_the_length_of_the_turn_list() -> None:
+    assert count_turns([{"tool_calls": 1}, {"tool_calls": 0}]) == 2
+
+
+def test_count_turns_returns_none_when_turns_are_absent_or_malformed() -> None:
+    """A harness that cannot report turns must not read as a zero-turn run.
+
+    Every CLI agent runs its turn loop in another process, so its records carry
+    no ``turns``; folding that into ``0`` would make them look like runs that
+    never called the model.
+    """
+    assert count_turns(None) is None
+    assert count_turns([]) is None
+    assert count_turns("3") is None
+
+
+def test_build_rows_counts_model_turns_from_the_record() -> None:
+    record = {
+        "name": "t",
+        "folder": "f",
+        "status": "success",
+        "turns": [
+            {"tokens": {"total": 15}, "latency_sec": 1.0, "tool_calls": 1},
+            {"tokens": {"total": 37}, "latency_sec": 2.0, "tool_calls": 0},
+        ],
+    }
+    assert build_rows([record], _manifest())[0].model_turns == 2
+
+
+def test_build_rows_leaves_model_turns_none_for_a_cli_record() -> None:
+    record = {"name": "t", "folder": "f", "status": "success"}
+    assert build_rows([record], _manifest())[0].model_turns is None

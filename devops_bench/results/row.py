@@ -119,6 +119,12 @@ class ResultRow(BaseModel):
         scoring_version: Scoring-framework version that produced ``outcome_score``
             (e.g. ``"v1"``); ``""`` for rows written before the framework landed.
         tool_score: Tool-invocation judge score in ``[0, 1]``, or ``None``.
+        model_turns: Provider turns the run took, or ``None`` when the harness
+            cannot see inside its own loop (every CLI agent, which runs that
+            loop in another process). ``None`` rather than ``0`` so unreported
+            stays distinguishable from a run that never took a turn. Read with
+            ``total_tokens`` this separates a run that spent its budget on a few
+            large turns from one stuck in a loop.
         latency_sec: Agent wall-clock seconds for the iteration.
         input_tokens: Non-cached prompt token count, or ``None`` when
             unreported. (Historical records that predate the canonical token
@@ -155,6 +161,7 @@ class ResultRow(BaseModel):
     catastrophic: bool = False
     scoring_version: str = ""
     tool_score: float | None
+    model_turns: int | None = None
     latency_sec: float
     input_tokens: int | None
     output_tokens: int | None

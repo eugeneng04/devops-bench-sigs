@@ -73,6 +73,11 @@ class AgentResult:
             through verbatim).
         latency: Total wall-clock seconds spent inside the agent run, stamped
             by :meth:`AgentHarness.run`.
+        turns: Per-turn measurements, oldest first, one entry per provider turn
+            (``{"tokens": {...}, "latency_sec": float, "tool_calls": int}``).
+            Empty for harnesses that cannot see inside their own turn loop —
+            every CLI agent runs its loop in another process, so only the API
+            harness fills this.
         errors: Human-readable error or extraction-failure messages. **Empty**
             on a clean run; populated when a known-error path (subprocess
             failure, parse miss, timeout) is reached — never silently dropped.
@@ -84,6 +89,7 @@ class AgentResult:
     trajectory: list[dict[str, Any]]
     tokens: dict[str, Any] = field(default_factory=dict)
     latency: float = 0.0
+    turns: list[dict[str, Any]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -104,6 +110,7 @@ class AgentResult:
             "trajectory": list(self.trajectory),
             "tokens": dict(self.tokens),
             "latency": self.latency,
+            "turns": [dict(turn) for turn in self.turns],
             "errors": list(self.errors),
             "metadata": dict(self.metadata),
         }

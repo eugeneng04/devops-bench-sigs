@@ -930,6 +930,7 @@ class DefaultEvalHarness(Harness):
                     entry.get("name") for entry in dumped.get("trajectory", []) if entry.get("name")
                 ],
                 "trajectory": dumped.get("trajectory", []),
+                "turns": dumped.get("turns", []),
                 "status": "success",
                 # Run-level validity gate: a vetted task only promotes to the
                 # leaderboard when this run actually produced a usable result.
@@ -1042,6 +1043,7 @@ class DefaultEvalHarness(Harness):
             "tokens": {},
             "tools": [],
             "trajectory": [],
+            "turns": [],
             "skills": list(self._granted_skill_paths),
             "name": task.name,
             "folder": task.folder,
