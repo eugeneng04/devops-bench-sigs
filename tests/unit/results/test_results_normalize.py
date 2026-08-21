@@ -134,6 +134,63 @@ def test_normalize_tokens_float_coerced_to_int():
     assert normalize_tokens({"input": 12.0, "output": 3.9}) == (12, 3, None, None, None, None)
 
 
+def test_normalize_tokens_openclaw_camel_case_cache_keys() -> None:
+    """OpenClaw spells its cache buckets in camelCase; they must not be dropped.
+
+    Verbatim from a live ``oc`` run. Before the aliases existed, ``cacheRead``
+    matched nothing, so ``cached`` read as ``None`` and the buckets summed to
+    26385 against a reported total of 50773 — 48% of the run's billed tokens
+    invisible on every OpenClaw row.
+    """
+    tokens = {"input": 26362, "output": 23, "cacheRead": 24388, "total": 50773}
+    normalized = normalize_tokens(tokens)
+    assert normalized == (26362, 23, 24388, None, None, 50773)
+    assert sum(v for v in normalized[:5] if v is not None) == normalized.total
+
+
+def test_normalize_tokens_openclaw_cache_write_and_total_tokens() -> None:
+    """``cacheWrite`` and ``totalTokens`` are the other two OpenClaw spellings.
+
+    ``@openclaw/ai``'s ``parseChunkUsage`` builds every adapter's usage as
+    ``{input, output, cacheRead, cacheWrite, totalTokens}``, with ``input``
+    already net of both cache buckets — so all four buckets add up to the total.
+    """
+    tokens = {
+        "input": 100,
+        "output": 20,
+        "cacheRead": 300,
+        "cacheWrite": 40,
+        "totalTokens": 460,
+    }
+    normalized = normalize_tokens(tokens)
+    assert normalized == (100, 20, 300, None, 40, 460)
+    assert sum(v for v in normalized[:5] if v is not None) == normalized.total
+
+
+def test_normalize_tokens_snake_case_wins_over_camel_case() -> None:
+    """The canonical key keeps priority when a record carries both spellings."""
+    tokens = {"cached": 1, "cacheRead": 999, "cache_write": 2, "cacheWrite": 888}
+    normalized = normalize_tokens(tokens)
+    assert normalized.cached == 1
+    assert normalized.cache_write == 2
+
+
+def test_normalize_tokens_openclaw_cost_breakdown_is_not_read_as_tokens() -> None:
+    """OpenClaw nests a float ``cost`` map beside the counts; it must be ignored.
+
+    The nested map repeats the bucket names, so a flattening lookup would read
+    dollars as tokens.
+    """
+    tokens = {
+        "input": 100,
+        "output": 20,
+        "cacheRead": 300,
+        "total": 420,
+        "cost": {"input": 0.01, "output": 0.02, "cacheRead": 0.03, "total": 0.06},
+    }
+    assert normalize_tokens(tokens) == (100, 20, 300, None, None, 420)
+
+
 # -- extract_score -----------------------------------------------------------
 
 
