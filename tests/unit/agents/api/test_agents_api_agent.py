@@ -503,6 +503,67 @@ def test_extract_tokens_ollama_shape_without_detail_objects() -> None:
     }
 
 
+def test_extract_tokens_openai_shim_attributes_the_total_shortfall_to_reasoning() -> None:
+    """A shim can bill thinking into the total but omit ``completion_tokens_details``.
+
+    Observed live against Gemini's OpenAI-compatible endpoint: ``prompt=6,
+    completion=1, total=61``. Without this the 54 thinking tokens land in no
+    bucket, so the row's buckets under-sum its own total by 88%.
+    """
+    usage = SimpleNamespace(prompt_tokens=6, completion_tokens=1, total_tokens=61)
+    buckets = extract_tokens(SimpleNamespace(usage=usage))
+    assert buckets == {
+        "input": 6,
+        "cached": None,
+        "cache_write": None,
+        "reasoning": 54,
+        "output": 1,
+        "total": 61,
+    }
+    assert sum(v for k, v in buckets.items() if k != "total" and v is not None) == 61
+
+
+def test_extract_tokens_openai_reported_reasoning_is_not_re_derived() -> None:
+    """A reported ``reasoning_tokens`` wins; the shortfall rule must not fire.
+
+    Real OpenAI bills reasoning *inside* ``completion_tokens``, so
+    ``total == prompt + completion`` and deriving a second time would both
+    double-count and wrongly shrink ``output``.
+    """
+    usage = SimpleNamespace(
+        prompt_tokens=100,
+        completion_tokens=80,
+        total_tokens=180,
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=60),
+    )
+    assert extract_tokens(SimpleNamespace(usage=usage)) == {
+        "input": 100,
+        "cached": None,
+        "cache_write": None,
+        "reasoning": 60,
+        "output": 20,
+        "total": 180,
+    }
+
+
+def test_extract_tokens_openai_no_shortfall_leaves_reasoning_unreported() -> None:
+    """A non-reasoning model has no gap, so ``reasoning`` stays ``None``.
+
+    Verified live: ``gemini-3.1-flash-lite`` through the same shim reports a
+    gap of 0 where the reasoning model reports 54.
+    """
+    usage = SimpleNamespace(prompt_tokens=10, completion_tokens=20, total_tokens=30)
+    assert extract_tokens(SimpleNamespace(usage=usage))["reasoning"] is None
+
+
+def test_extract_tokens_openai_negative_shortfall_is_ignored() -> None:
+    """A total below the reported counts is a provider bug, not negative thinking."""
+    usage = SimpleNamespace(prompt_tokens=100, completion_tokens=50, total_tokens=120)
+    buckets = extract_tokens(SimpleNamespace(usage=usage))
+    assert buckets["reasoning"] is None
+    assert buckets["output"] == 50
+
+
 def test_extract_tokens_provider_total_wins_over_the_bucket_sum() -> None:
     """A provider-supplied total is passed through, never second-guessed."""
     usage = SimpleNamespace(prompt_token_count=5, candidates_token_count=7, total_token_count=99)

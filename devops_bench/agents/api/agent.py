@@ -252,18 +252,37 @@ def _openai_buckets(usage: Any) -> dict[str, int | None]:
     sits inside ``prompt_tokens`` and ``completion_tokens_details.reasoning_tokens``
     inside ``completion_tokens``. Ollama omits both detail objects entirely,
     which leaves those buckets ``None``.
+
+    OpenAI itself always satisfies ``total == prompt + completion``. An
+    OpenAI-compatible shim in front of a reasoning model need not: Gemini's
+    shim bills thinking into ``total_tokens`` while leaving
+    ``completion_tokens_details`` unset, so the thinking tokens appear in no
+    bucket at all. Any such shortfall is therefore attributed to ``reasoning``,
+    which is the only bucket that can account for it and the one the shim
+    declined to report. The guard is deliberately narrow — the provider must
+    have reported a total, left ``reasoning_tokens`` unset, and overshot the
+    two counts it did report.
     """
     prompt = _int_attr(usage, "prompt_tokens") or 0
     completion = _int_attr(usage, "completion_tokens") or 0
     cached = _nested_int_attr(usage, "prompt_tokens_details", "cached_tokens")
     reasoning = _nested_int_attr(usage, "completion_tokens_details", "reasoning_tokens")
+    total = _int_attr(usage, "total_tokens")
+    if reasoning is not None:
+        # Reported: billed inside ``completion_tokens``, so take it back out.
+        output = completion - reasoning
+    else:
+        output = completion
+        if total is not None and total > prompt + completion:
+            # Unreported but billed outside the two reported counts.
+            reasoning = total - prompt - completion
     return {
         "input": prompt - (cached or 0),
         "cached": cached,
         "cache_write": None,
         "reasoning": reasoning,
-        "output": completion - (reasoning or 0),
-        "total": _int_attr(usage, "total_tokens"),
+        "output": output,
+        "total": total,
     }
 
 
