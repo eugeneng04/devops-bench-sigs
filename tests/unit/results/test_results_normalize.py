@@ -459,31 +459,33 @@ def test_count_tool_calls_counts_entries_and_failures() -> None:
         {"name": "c", "status": "interrupted"},
         {"name": "d", "status": "completed"},
     ]
-    assert count_tool_calls(trajectory) == (4, 2)
+    assert count_tool_calls(trajectory) == (4, 1)
 
 
-def test_count_tool_calls_treats_interrupted_as_a_failure() -> None:
-    """An interrupted call produced no result, same as an errored one.
+def test_count_tool_calls_counts_only_error_as_a_failure() -> None:
+    """``called`` and ``interrupted`` are the same condition under two names.
 
-    Counting only ``error`` would report a run killed mid-tool as clean.
+    Both mean the parser never saw the call resolve. Only the antigravity
+    parser labels it ``interrupted``; four others leave the identical case as
+    ``called``, so counting it would make ``toolErrors`` incomparable across
+    the harness dimension the dashboard groups by.
     """
-    assert count_tool_calls([{"name": "a", "status": "interrupted"}]) == (1, 1)
-
-
-def test_count_tool_calls_does_not_treat_called_as_a_failure() -> None:
-    """``called`` means the parser never saw the call resolve.
-
-    That is a gap in our capture, not a tool the model broke, and counting it
-    would blame the model for a parsing miss.
-    """
+    assert count_tool_calls([{"name": "a", "status": "interrupted"}]) == (1, 0)
     assert count_tool_calls([{"name": "a", "status": "called"}]) == (1, 0)
 
 
-def test_count_tool_calls_handles_a_missing_or_malformed_trajectory() -> None:
-    """A malformed record should lose a count, not raise and kill the run."""
-    assert count_tool_calls(None) == (0, 0)
-    assert count_tool_calls([]) == (0, 0)
-    assert count_tool_calls("not a list") == (0, 0)
+def test_count_tool_calls_reports_none_when_no_trajectory_was_captured() -> None:
+    """A trajectory export can fail, and 0 would read as "made no calls".
+
+    Mirrors ``model_turns``, which uses ``None`` for the same situation.
+    """
+    assert count_tool_calls(None) == (None, None)
+    assert count_tool_calls([]) == (None, None)
+    assert count_tool_calls("not a list") == (None, None)
+
+
+def test_count_tool_calls_skips_malformed_entries() -> None:
+    """A malformed entry should lose a count, not raise and kill the run."""
     assert count_tool_calls([{"name": "a", "status": "error"}, "junk", None]) == (1, 1)
 
 
@@ -507,6 +509,6 @@ def test_build_rows_counts_tools_from_the_trajectory() -> None:
     assert (row.tool_calls, row.tool_errors) == (3, 1)
 
 
-def test_build_rows_defaults_tool_counts_for_a_record_with_no_trajectory() -> None:
+def test_build_rows_reports_none_tool_counts_for_a_record_with_no_trajectory() -> None:
     row = build_rows([{"name": "n", "folder": "f", "status": "failed"}], _manifest())[0]
-    assert (row.tool_calls, row.tool_errors) == (0, 0)
+    assert (row.tool_calls, row.tool_errors) == (None, None)

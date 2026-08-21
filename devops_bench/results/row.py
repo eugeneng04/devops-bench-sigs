@@ -119,13 +119,14 @@ class ResultRow(BaseModel):
         scoring_version: Scoring-framework version that produced ``outcome_score``
             (e.g. ``"v1"``); ``""`` for rows written before the framework landed.
         tool_score: Tool-invocation judge score in ``[0, 1]``, or ``None``.
-        tool_calls: Number of tool calls in the run's trajectory. The unit of
-            agentic work: two models with the same score and the same wall clock
-            can differ several-fold here, and the trajectory itself is too large
-            to aggregate over at dashboard time.
-        tool_errors: Number of those calls that failed or were interrupted. A
-            high count against a passing score means the model recovered; against
-            a failing one it usually means the environment broke, not the model.
+        tool_calls: Number of tool calls in the run's trajectory, or ``None``
+            when no trajectory was captured. The unit of agentic work: two
+            models with the same score and the same wall clock can differ
+            several-fold here, and the trajectory itself is too large to
+            aggregate over at dashboard time.
+        tool_errors: How many of those calls returned an error. A high count
+            against a passing score means the model recovered; against a
+            failing one it usually means the environment broke, not the model.
         latency_sec: Agent wall-clock seconds for the iteration.
         input_tokens: Non-cached prompt token count, or ``None`` when
             unreported. (Historical records that predate the canonical token
@@ -166,8 +167,8 @@ class ResultRow(BaseModel):
     catastrophic: bool = False
     scoring_version: str = ""
     tool_score: float | None
-    tool_calls: int = 0
-    tool_errors: int = 0
+    tool_calls: int | None = None
+    tool_errors: int | None = None
     latency_sec: float
     input_tokens: int | None
     output_tokens: int | None
