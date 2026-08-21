@@ -35,6 +35,7 @@ __all__ = [
     "TOOL_SCORE_KEY",
     "NormalizedTokens",
     "build_rows",
+    "count_tool_calls",
     "derive_augmentation",
     "extract_score",
     "normalize_tokens",
@@ -273,6 +274,33 @@ def _scoring_version(scores: Mapping[str, Any] | None) -> str:
     return ""
 
 
+#: Trajectory ``status`` values that mean the tool call did not deliver a
+#: result. ``called`` is deliberately excluded: it means the parser never saw
+#: the call resolve, which is a gap in our capture rather than a tool failure.
+_FAILED_TOOL_STATUSES = frozenset({"error", "interrupted"})
+
+
+def count_tool_calls(trajectory: Any) -> tuple[int, int]:
+    """Return ``(tool_calls, tool_errors)`` for a record's trajectory.
+
+    Every trajectory entry is a ``ToolCall.to_dict()`` mapping, so the entry
+    count is the call count. Entries that are not mappings are skipped rather
+    than raising — a malformed record should lose a count, not a whole run.
+
+    Args:
+        trajectory: The record's ``trajectory`` value, of any shape.
+
+    Returns:
+        The total number of tool calls and how many of them failed or were
+        interrupted.
+    """
+    if not isinstance(trajectory, list):
+        return 0, 0
+    entries = [entry for entry in trajectory if isinstance(entry, Mapping)]
+    errors = sum(1 for entry in entries if entry.get("status") in _FAILED_TOOL_STATUSES)
+    return len(entries), errors
+
+
 def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list[ResultRow]:
     """Flatten harness result records into :class:`ResultRow` rows for one run.
 
@@ -294,6 +322,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
         tokens = normalize_tokens(record.get("tokens"))
         correctness = _first_score(scores, _CORRECTNESS_KEYS)
         catastrophic_score = extract_score(scores, CATASTROPHIC_SCORE_KEY)
+        tool_calls, tool_errors = count_tool_calls(record.get("trajectory"))
         rows.append(
             ResultRow(
                 setup_id=manifest.setup_id,
@@ -311,6 +340,8 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 catastrophic=catastrophic_score == 0.0,
                 scoring_version=_scoring_version(scores),
                 tool_score=extract_score(scores, TOOL_SCORE_KEY),
+                tool_calls=tool_calls,
+                tool_errors=tool_errors,
                 latency_sec=float(record.get("latency") or 0.0),
                 input_tokens=tokens.input,
                 output_tokens=tokens.output,

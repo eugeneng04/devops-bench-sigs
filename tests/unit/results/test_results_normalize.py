@@ -23,7 +23,11 @@ from devops_bench.results import (
     normalize_tokens,
     setup_id,
 )
-from devops_bench.results.normalize import OUTCOME_SCORE_KEY, TOOL_SCORE_KEY
+from devops_bench.results.normalize import (
+    OUTCOME_SCORE_KEY,
+    TOOL_SCORE_KEY,
+    count_tool_calls,
+)
 
 
 def _manifest(**overrides):
@@ -168,6 +172,10 @@ def test_build_rows_success_record():
         "latency": 42.5,
         "tokens": {"prompt_tokens": 100, "candidates_tokens": 20},
         "terminal_reason": "completed",
+        "trajectory": [
+            {"name": "kubectl", "args": {}, "result": "ok", "status": "completed"},
+            {"name": "kubectl", "args": {}, "result": None, "status": "error"},
+        ],
         "scores": {
             OUTCOME_SCORE_KEY: {"score": 0.9, "success": True, "reason": "ok"},
             TOOL_SCORE_KEY: {"score": 0.7, "success": True, "reason": "ok"},
@@ -194,6 +202,8 @@ def test_build_rows_success_record():
         "catastrophic": False,
         "scoringVersion": "",
         "toolScore": 0.7,
+        "toolCalls": 2,
+        "toolErrors": 1,
         "latencySec": 42.5,
         "inputTokens": 100,
         "outputTokens": 20,
@@ -355,6 +365,8 @@ def test_result_row_keys_match_typescript_interface():
         "catastrophic",
         "scoringVersion",
         "toolScore",
+        "toolCalls",
+        "toolErrors",
         "latencySec",
         "inputTokens",
         "outputTokens",
@@ -435,3 +447,66 @@ def test_build_rows_carries_cache_write() -> None:
     row = build_rows([record], _manifest())[0]
     assert row.cache_write_tokens == 200
     assert row.total_tokens == 1245
+
+
+# --- tool-call counts ---
+
+
+def test_count_tool_calls_counts_entries_and_failures() -> None:
+    trajectory = [
+        {"name": "a", "status": "completed"},
+        {"name": "b", "status": "error"},
+        {"name": "c", "status": "interrupted"},
+        {"name": "d", "status": "completed"},
+    ]
+    assert count_tool_calls(trajectory) == (4, 2)
+
+
+def test_count_tool_calls_treats_interrupted_as_a_failure() -> None:
+    """An interrupted call produced no result, same as an errored one.
+
+    Counting only ``error`` would report a run killed mid-tool as clean.
+    """
+    assert count_tool_calls([{"name": "a", "status": "interrupted"}]) == (1, 1)
+
+
+def test_count_tool_calls_does_not_treat_called_as_a_failure() -> None:
+    """``called`` means the parser never saw the call resolve.
+
+    That is a gap in our capture, not a tool the model broke, and counting it
+    would blame the model for a parsing miss.
+    """
+    assert count_tool_calls([{"name": "a", "status": "called"}]) == (1, 0)
+
+
+def test_count_tool_calls_handles_a_missing_or_malformed_trajectory() -> None:
+    """A malformed record should lose a count, not raise and kill the run."""
+    assert count_tool_calls(None) == (0, 0)
+    assert count_tool_calls([]) == (0, 0)
+    assert count_tool_calls("not a list") == (0, 0)
+    assert count_tool_calls([{"name": "a", "status": "error"}, "junk", None]) == (1, 1)
+
+
+def test_build_rows_counts_tools_from_the_trajectory() -> None:
+    """The trajectory is too large to aggregate over at dashboard time.
+
+    Two models with the same score and the same wall clock can differ severalfold
+    in how much work they did to get there; nothing on the row said so.
+    """
+    record = {
+        "name": "n",
+        "folder": "f",
+        "status": "success",
+        "trajectory": [
+            {"name": "a", "status": "completed"},
+            {"name": "b", "status": "error"},
+            {"name": "c", "status": "completed"},
+        ],
+    }
+    row = build_rows([record], _manifest())[0]
+    assert (row.tool_calls, row.tool_errors) == (3, 1)
+
+
+def test_build_rows_defaults_tool_counts_for_a_record_with_no_trajectory() -> None:
+    row = build_rows([{"name": "n", "folder": "f", "status": "failed"}], _manifest())[0]
+    assert (row.tool_calls, row.tool_errors) == (0, 0)
