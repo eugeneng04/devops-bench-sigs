@@ -2,15 +2,13 @@
 name: devops-bench-review
 description: >
   Use when the user asks for a CODE review of devops-bench changes — e.g.
-  "review this PR", "review my changes", "review the working tree", "code-review
-  this diff", "is this harness/deployer/metric change sound". Reviews a PR
-  (number/URL) or the current working tree across eight code lenses —
-  correctness, testability, maintainability, API hygiene, domain modeling,
-  conventions, and security — and returns ranked, actionable findings with
-  severity + file:line evidence + a concrete fix. Review-only: it analyzes
-  statically and may run unit tests, ruff, and format checks, but it NEVER runs
-  benchmark evals or provisions infra. For a NEW or CHANGED benchmark task
-  (task.yaml + its stack), use the sibling `task-review` skill instead.
+  "review this PR", "review my changes", "review the working tree", "is this
+  harness/deployer/metric change sound". Reviews a PR (number/URL) or the
+  current working tree and returns ranked findings with severity, file:line
+  evidence, and a concrete fix. Review-only: static analysis plus unit
+  tests/ruff; it NEVER runs benchmark evals or provisions infra. For a NEW or
+  CHANGED benchmark task (task.yaml + its stack), use the sibling task-review
+  skill instead.
 ---
 
 # devops-bench code review
@@ -57,6 +55,22 @@ infra toolchain, and keep `rm`, `sudo`, `git push` and `git commit` denied
 outright. Exact syntax differs per tool and the right allowlist depends on where
 you run, so treat that as the shape rather than a config to copy.
 
+## Apply the CodeRabbit guidelines — read them live
+
+Read `.coderabbit.yaml` at the repository root and apply its review guidelines
+as part of this review:
+
+- `reviews.instructions` — repo-wide review rules; apply them to everything in
+  scope.
+- `reviews.path_instructions` — a list of entries; apply each entry's
+  `instructions` to the files in scope matching its `path` glob.
+- `reviews.path_filters` — exclusions (e.g. `!uv.lock`, `!vendor/**`); skip the
+  files CodeRabbit excludes.
+
+Treat these as mandatory lenses of equal standing with this skill's own. If
+`.coderabbit.yaml` or those keys are missing, fall back to this skill's lenses
+and say so in the review output.
+
 ## Gather the diff
 
 - **A PR** (number/URL): `gh pr view <pr> --json title,body,baseRefName,headRefOid,changedFiles`
@@ -76,8 +90,7 @@ or fails to fix it).
 
 Apply the lenses that fit the change. Most code wants Correctness, Testability, and
 Conventions; library/registry surfaces add API hygiene and Domain modeling.
-**Vendor neutrality is not optional** — run it on anything touching
-`devops_bench/` or `docs/`.
+Changes under `.agents/` add Agent-facing docs.
 
 ### Correctness
 
@@ -141,51 +154,18 @@ state that should be an enum, and parallel lists that should be one list of reco
   rationale). When you flag one, say whether the fix is "delete it" or "rewrite it
   to explain the *why*".
 
-### Vendor neutrality
+### Vendor neutrality — beyond the config
 
-**Run this lens on every change touching `devops_bench/` or `docs/`.** A
-`.coderabbit.yaml` rule covers the same ground and lists the same generic
-layers, but it keys on terminology and env-var reads, so the structural
-violations below are the ones a human review still has to find. Authors: run
-this before opening the PR.
+The terminology and env-var rules come from `.coderabbit.yaml` (step above).
+The checks below are the ones the config does not state — **run them on every
+change touching `devops_bench/` or `docs/`.** For the cloud-provider vs
+model-provider split (only the cloud axis is policed), see
+[glossary.md](../../../docs/components/glossary.md).
 
-The rule from [AGENTS.md](../../../AGENTS.md): user-facing text and the generic
-framework layers stay vendor-neutral. Provider specifics belong in
-provider-scoped code — the table below is the full list — or where they name a
-real provider artifact.
-
-The boundary that decides every call. Paths in the left column are under
-`devops_bench/`; `tasks/<provider>/**` on the right is the on-disk task tree at
-the repo root, which is a different thing from the `devops_bench/tasks/` schema
-package:
-
-| Generic — must stay neutral | Provider-scoped — specifics are fine |
-| --- | --- |
-| `core/`, `evalharness/`, `run.py`, `cli.py`, `tasks/`, `metrics/`, `verification/`, `chaos/`, `agents/`, `models/`, `results/`, `k8s/` | `providers/`, deployer implementations, `tf/`, `agents/cli/<vendor>/**`, `models/<vendor>.py`, `tasks/<provider>/**` |
-
-Write the pattern, not the instance: the carve-out is `tasks/<provider>/`, so
-`tasks/aws/` is as exempt as `tasks/gcp/` the day someone adds it.
-
-**Two different axes share the word "provider".** A *cloud provider* (`gcp`,
-`kind`) provisions the cluster; a *model provider* (`gemini`, `claude`,
-`ollama`) serves the LLM — see [glossary.md](../../../docs/components/glossary.md).
-This lens is about the cloud axis. Most of the Google strings in `devops_bench/`
-are on the model axis and are not findings: `models/gemini.py` is the
-google-genai adapter, `models/claude.py` reads `GCP_PROJECT_ID` because Vertex
-genuinely needs a project id, and `agents/cli/antigravity/` shells out to
-`gcloud` because that is what that agent CLI does. `agents/` and `models/` sit
-in the generic column for their shared layers; their per-vendor subtrees do not.
-
-What to look for, roughly in order of how often it slips through:
-
-- **A generic layer reading a provider env var.** `GCP_PROJECT_ID`,
-  `GOOGLE_CLOUD_*`, `GKE_*` resolved anywhere in the generic column is a finding
-  even when the surrounding prose is neutral — provider resolution belongs
-  behind the `PROVIDERS` registry. Grep the diff for `get_env(` and `os.environ`
-  and check which module the call lives in.
 - **Error and log messages.** The most-missed surface, because the code is
-  neutral and only the string is not: `"could not reach the GKE cluster"` raised
-  from `core/` should read `"could not reach the cluster"`.
+  neutral and only the string is not: `"could not reach the GKE cluster"`
+  raised from `core/` should read `"could not reach the cluster"`. Check log
+  strings as well as raised errors.
 - **Defaults and fallbacks.** A neutral parameter that quietly defaults to one
   provider (`location="us-central1"`, `provider="gcp"`) hard-codes a vendor
   through the back door. The established pattern is deduction that *raises*
@@ -198,15 +178,17 @@ What to look for, roughly in order of how often it slips through:
 - **Docs and docstring examples.** An example is user-facing text. Where a
   provider-specific example is genuinely clearest, label it as one rather than
   letting it read as the only way.
+- **Env-var reads.** Grep the diff for `get_env(` and `os.environ`. Treat
+  `GCP_PROJECT_ID`, `GOOGLE_CLOUD_*`, and `GKE_*` as the cloud families. The
+  module the read lives in — not the surrounding prose — decides. Provider
+  resolution belongs behind the `PROVIDERS` registry.
+- **Two task trees.** The config's `tasks/<provider>/` carve-out is the on-disk
+  task tree at the repo root, which is a different thing from the
+  `devops_bench/tasks/` schema package — the latter is a generic layer. Write
+  the pattern, not the instance: the carve-out is `tasks/<provider>/`, so
+  `tasks/aws/` is as exempt as `tasks/gcp/` the day someone adds it.
 
-Do **not** flag: anything in the provider-scoped column, a term naming a real
-artifact (`gcloud container clusters`, a `google_container_cluster` resource, the
-`gcp` provider key itself), a provider-shaped task under `tasks/<provider>/`, or
-a model-provider string on the model axis. Over-flagging is its own failure mode
-— it trains authors to ignore the lens.
-
-Give the neutral replacement, not just the objection: "cloud project id",
-"target Kubernetes cluster", "the configured provider".
+Over-flagging is its own failure mode — it trains authors to ignore the lens.
 
 ### Security
 
@@ -217,6 +199,34 @@ interpolated into a shell string — validation does not make interpolation safe
 so an allowlist is an extra check rather than a substitute, and `shell=True`
 with untrusted input is always a finding; no path traversal from un-sanitized names. Flag a
 secret echoed into logs.
+
+### Agent-facing docs (skills, AGENTS.md, references)
+
+Apply when the diff touches `.agents/**` or any `AGENTS.md`. These files are
+instructions an agent executes — review them as interfaces, not prose:
+
+- **Audience.** Every sentence tells the executing agent what to do, how to do
+  it, or the context needed to do it. Flag design rationale, maintainer or
+  author asides, and a document narrating its own structure or history.
+- **Frontmatter is a pointer, paid on every load.** The description carries
+  invocation triggers, a one-line identity, and handoffs to sibling skills.
+  Flag body content restated there — rule lists, key names, counts that can
+  desync from the body. `name:` matches the directory.
+- **Single source of truth.** Flag restated config, code, or command output
+  the agent could read live or reach by pointer. A copy is justified only when
+  the lookup is expensive or the convention is unwritten — the gotcha, the why.
+- **Right-sized loading.** Material every run needs is inline; material only
+  some paths need sits behind a link. Flag sprawl: a long flat section thins
+  attention across the excess.
+- **Checkable completion.** Steps end on a bound the agent can test ("every
+  touched function's callers checked"). Flag vague bounds ("ensure quality") —
+  they invite stopping early.
+- **Positive instructions.** State the target behavior. Keep a prohibition
+  only as a hard guardrail, paired with what to do instead.
+- **No-ops.** Flag instructions the agent already follows by default ("be
+  careful", "be thorough") — they spend load and change nothing.
+- **Co-location.** One concept's definition, rules, and caveats live under one
+  heading. Flag a meaning fragmented across sections.
 
 ## Verify, then present
 
