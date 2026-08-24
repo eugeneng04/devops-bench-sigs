@@ -358,6 +358,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 total_tokens=tokens.total,
                 status=record.get("status", "") or "",
                 terminal_reason=record.get("terminal_reason", "") or "",
+                timeout_sec=manifest.timeout_sec,
                 validated=bool(record.get("validated", False)),
             )
         )

@@ -683,6 +683,10 @@ class DefaultEvalHarness(Harness):
             model=model,
             harness=self.agent_type,
             augmentation=augmentation,
+            # Only the wall-clock cap: ``max_turns`` is read by the API agent
+            # alone, so stamping it would advertise a CLI arm a budget that
+            # never bound it.
+            timeout_sec=self._agent_config.timeout_sec,
         )
         rows = build_rows(detailed_results, manifest)
         self.reporter.write_rows(run_dir, [row.to_dict() for row in rows])
