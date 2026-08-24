@@ -611,8 +611,9 @@ def _make_conv_db(path, turns, *, with_gen_metadata=True):
 def test_db_token_state_ready_single_turn(tmp_path):
     db = tmp_path / "conv.db"
     _make_conv_db(db, [_usage_blob(14882, 0, 0, 7)])
-    state, tokens = parsing.db_token_state(db)
+    state, tokens, turns = parsing.db_token_state(db)
     assert state == "ready"
+    assert turns == 1
     assert tokens == {
         "input": 14882,
         "cached": 0,
@@ -626,8 +627,9 @@ def test_db_token_state_ready_single_turn(tmp_path):
 def test_db_token_state_sums_turns_with_cache_read(tmp_path):
     db = tmp_path / "conv.db"
     _make_conv_db(db, [_usage_blob(16592, 0, 234, 51), _usage_blob(4752, 12200, 352, 50)])
-    state, tokens = parsing.db_token_state(db)
+    state, tokens, turns = parsing.db_token_state(db)
     assert state == "ready"
+    assert turns == 2  # one decoded usage record per model round-trip
     assert tokens["input"] == 16592 + 4752
     assert tokens["cached"] == 12200  # f5
     assert tokens["reasoning"] == 234 + 352
@@ -644,8 +646,9 @@ def test_db_token_state_counts_fully_cached_turn(tmp_path):
     # fields); it must still be counted, not dropped.
     db = tmp_path / "conv.db"
     _make_conv_db(db, [_usage_blob(0, 12000, 30, 20)])
-    state, tokens = parsing.db_token_state(db)
+    state, tokens, turns = parsing.db_token_state(db)
     assert state == "ready"
+    assert turns == 1
     assert tokens["input"] == 0
     assert tokens["cached"] == 12000
     assert tokens["reasoning"] == 30
@@ -658,8 +661,9 @@ def test_db_token_state_counts_thinking_only_turn(tmp_path):
     # counted via f3 == f9.
     db = tmp_path / "conv.db"
     _make_conv_db(db, [_usage_blob(8000, 0, 500, 0)])
-    state, tokens = parsing.db_token_state(db)
+    state, tokens, turns = parsing.db_token_state(db)
     assert state == "ready"
+    assert turns == 1
     assert tokens["input"] == 8000
     assert tokens["reasoning"] == 500
     assert tokens["output"] == 0
@@ -670,24 +674,24 @@ def test_db_token_state_rejects_noise_record_with_zero_f3(tmp_path):
     noise = _pb_lfield(1, _pb_lfield(4, _pb_vfield(1, 50) + _pb_vfield(3, 0) + _pb_vfield(5, 1)))
     db = tmp_path / "conv.db"
     _make_conv_db(db, [noise])
-    assert parsing.db_token_state(db) == ("undecodable", None)
+    assert parsing.db_token_state(db) == ("undecodable", None, None)
 
 
 def test_db_token_state_undecodable_when_invariant_fails(tmp_path):
     # f3 != f9 + f10 -> schema drift, terminal.
     db = tmp_path / "conv.db"
     _make_conv_db(db, [_usage_blob(100, 0, 9, 5, f3=999)])
-    assert parsing.db_token_state(db) == ("undecodable", None)
+    assert parsing.db_token_state(db) == ("undecodable", None, None)
 
 
 def test_db_token_state_pending_when_usage_not_flushed(tmp_path):
     # No gen_metadata table yet, or table exists with zero rows: flush pending.
     db1 = tmp_path / "conv1.db"
     _make_conv_db(db1, [], with_gen_metadata=False)
-    assert parsing.db_token_state(db1) == ("pending", None)
+    assert parsing.db_token_state(db1) == ("pending", None, None)
     db2 = tmp_path / "conv2.db"
     _make_conv_db(db2, [])
-    assert parsing.db_token_state(db2) == ("pending", None)
+    assert parsing.db_token_state(db2) == ("pending", None, None)
 
 
 def test_db_token_state_pending_on_transient_read_error(tmp_path, monkeypatch):
@@ -705,14 +709,14 @@ def test_db_token_state_pending_on_transient_read_error(tmp_path, monkeypatch):
             pass
 
     monkeypatch.setattr(parsing.sqlite3, "connect", lambda *a, **k: _LockedCon())
-    assert parsing.db_token_state(db) == ("pending", None)
+    assert parsing.db_token_state(db) == ("pending", None, None)
 
 
 def test_db_token_state_absent_for_missing_or_nonconversation_db(tmp_path):
-    assert parsing.db_token_state(tmp_path / "nope.db") == ("absent", None)
+    assert parsing.db_token_state(tmp_path / "nope.db") == ("absent", None, None)
     empty = tmp_path / "empty.db"
     empty.write_bytes(b"")  # 0-byte file -> valid empty sqlite, no agy tables
-    assert parsing.db_token_state(empty) == ("absent", None)
+    assert parsing.db_token_state(empty) == ("absent", None, None)
 
 
 @mock.patch.object(pathlib.Path, "home")

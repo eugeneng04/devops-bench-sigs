@@ -24,11 +24,12 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import NamedTuple
 
 from devops_bench.agents.result import ToolCall
 from devops_bench.core import get_logger
 
-__all__ = ["parse_trajectory_export"]
+__all__ = ["TrajectoryExport", "parse_trajectory_export"]
 
 _log = get_logger("agents.cli.openclaw.parsing")
 
@@ -108,7 +109,31 @@ def _accumulate_cache_write(acc: dict, usage: object) -> None:
         acc["cacheWrite"] = acc.get("cacheWrite", 0) + written
 
 
-def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, list[str]]:
+class TrajectoryExport(NamedTuple):
+    """What one ``events.jsonl`` yielded.
+
+    Attributes:
+        trajectory: ``ToolCall.to_dict()`` mappings, in issue order.
+        tokens: Canonical usage summed across the run.
+        output: The agent's final answer text; ``""`` when none was found.
+        errors: Extraction failures worth surfacing.
+        model_turns: Model round-trips, or ``None`` when the export carried no
+            ``assistant.message`` events to count.
+    """
+
+    trajectory: list[dict]
+    tokens: dict
+    output: str
+    errors: list[str]
+    model_turns: int | None
+
+    @classmethod
+    def empty(cls, errors: list[str]) -> TrajectoryExport:
+        """Return an export that recovered nothing but ``errors``."""
+        return cls([], {}, "", errors, None)
+
+
+def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
     """Parse an ``oc sessions export-trajectory`` ``events.jsonl`` into the canonical shape.
 
     The export bundle's ``events.jsonl`` is line-delimited JSON. Each line is an
@@ -134,11 +159,12 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
         jsonl_text: Raw contents of ``events.jsonl`` inside the export bundle.
 
     Returns:
-        A ``(trajectory, tokens, output, errors)`` tuple. ``trajectory`` is a
-        list of ``ToolCall.to_dict()`` mappings; ``tokens`` is the usage summed
-        across every ``model.completed`` turn (not just the last), plus
-        ``cacheWrite`` summed across the per-call ``assistant.message`` events;
-        ``output`` is the agent's final answer text (``""`` when none was found).
+        A :class:`TrajectoryExport`. ``tokens`` is the usage summed across every
+        ``model.completed`` turn (not just the last), plus ``cacheWrite`` summed
+        across the per-call ``assistant.message`` events. ``model_turns`` counts
+        ``assistant.message`` events, one per model round-trip -- which is not
+        ``len(trajectory)``, because a single message can carry several
+        ``toolCall`` entries (seen live) and a text-only message carries none.
 
         There is no reasoning bucket: openclaw's usage payload carries none at
         any thinking level (checked live at ``off`` and ``high``), so
@@ -150,6 +176,7 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
     fallback_output: list[str] = []
     pending: dict[str, ToolCall] = {}
     trajectory: list[ToolCall] = []
+    model_turns = 0
 
     for lineno, raw in enumerate(jsonl_text.splitlines(), start=1):
         line = raw.strip()
@@ -214,6 +241,7 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
                 if joined:
                     output = joined
         elif etype == "assistant.message":
+            model_turns += 1
             msg = data.get("message") if isinstance(data.get("message"), dict) else {}
             _accumulate_cache_write(tokens, msg.get("usage"))
             txt = _join_text(msg.get("content"))
@@ -223,7 +251,13 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
     if not output and fallback_output:
         output = "\n".join(fallback_output)
 
-    return [call.to_dict() for call in trajectory], tokens, output, errors
+    return TrajectoryExport(
+        trajectory=[call.to_dict() for call in trajectory],
+        tokens=tokens,
+        output=output,
+        errors=errors,
+        model_turns=model_turns or None,
+    )
 
 
 def _read_export_bundle(workspace: Path) -> tuple[str, list[str]]:

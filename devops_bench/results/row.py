@@ -132,6 +132,9 @@ class ResultRow(BaseModel):
         tool_errors: How many of those calls returned an error. A high count
             against a passing score means the model recovered; against a
             failing one it usually means the environment broke, not the model.
+        model_turns: Model round-trips in the run, or ``None`` when the harness
+            cannot delimit them. Not ``tool_calls``: one turn can issue several
+            tool calls, and a text-only turn issues none.
         latency_sec: Agent wall-clock seconds for the iteration.
         input_tokens: Non-cached prompt token count, or ``None`` when
             unreported. (Historical records that predate the canonical token
@@ -179,6 +182,7 @@ class ResultRow(BaseModel):
     tool_score: float | None
     tool_calls: int | None = None
     tool_errors: int | None = None
+    model_turns: int | None = None
     latency_sec: float
     input_tokens: int | None
     output_tokens: int | None

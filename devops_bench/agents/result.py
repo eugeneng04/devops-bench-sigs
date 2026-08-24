@@ -100,6 +100,11 @@ class AgentResult:
             A run cut off at the turn cap or the wall-clock budget scores like a
             wrong answer, so without this an efficiency ceiling reads as a
             capability failure.
+        model_turns: How many times the model was called, or ``None`` when the
+            harness cannot tell. Distinct from ``len(trajectory)``: one model
+            turn can issue several tool calls at once, and a turn that only
+            writes text issues none. On an agentic loop the whole conversation
+            is re-sent every turn, so this is what input tokens grow with.
         metadata: Agent-specific extras (e.g. raw provider stats, session ids)
             that do not fit the typed fields above.
     """
@@ -110,6 +115,7 @@ class AgentResult:
     latency: float = 0.0
     errors: list[str] = field(default_factory=list)
     terminal_reason: str = ""
+    model_turns: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -131,6 +137,7 @@ class AgentResult:
             "latency": self.latency,
             "errors": list(self.errors),
             "terminal_reason": self.terminal_reason,
+            "model_turns": self.model_turns,
             "metadata": dict(self.metadata),
         }
 
