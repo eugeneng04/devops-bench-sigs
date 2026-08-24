@@ -689,6 +689,7 @@ _RESULTS_JSON_REQUIRED_KEYS: frozenset[str] = frozenset(
         "terminal_reason",
         "model_turns",
         "tool_wait_sec",
+        "served_models",
         "scores",
         "expected_output",
         "expected_output_raw",

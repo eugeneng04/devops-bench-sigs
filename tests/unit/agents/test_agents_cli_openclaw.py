@@ -227,6 +227,26 @@ def test_parse_trajectory_export_leaves_model_turns_none_without_messages() -> N
     assert parse_trajectory_export(blob).model_turns is None
 
 
+def test_parse_trajectory_export_records_every_model_that_answered() -> None:
+    """openclaw fails over mid-run, so the requested model can be the wrong label.
+
+    Two distinct ids across the run is the failover itself; both are kept, in
+    first-seen order, and a repeat is not counted twice.
+    """
+    blob = _events(
+        {"type": "assistant.message", "data": {"message": {"model": "gemini-3-flash-preview"}}},
+        {"type": "assistant.message", "data": {"message": {"model": "gemini-3-flash-preview"}}},
+        {"type": "assistant.message", "data": {"message": {"model": "claude-opus-4-5"}}},
+    )
+    export = parse_trajectory_export(blob)
+    assert export.served_models == ["gemini-3-flash-preview", "claude-opus-4-5"]
+
+
+def test_parse_trajectory_export_leaves_served_models_empty_when_unreported() -> None:
+    blob = _events({"type": "assistant.message", "data": {"message": {"content": []}}})
+    assert parse_trajectory_export(blob).served_models == []
+
+
 def test_parse_trajectory_export_times_tools_and_merges_concurrent_calls() -> None:
     """Two calls issued in one message overlap, so their spans count once.
 

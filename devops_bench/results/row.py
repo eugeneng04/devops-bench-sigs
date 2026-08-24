@@ -99,6 +99,14 @@ class ResultRow(BaseModel):
         setup_id: Run arm id; matches :attr:`Manifest.setup_id`.
         model: Model identifier; matches :attr:`Manifest.model`.
         harness: Canonical harness key; matches :attr:`Manifest.harness`.
+        served_model: The model that actually answered, when the harness
+            reports it; ``""`` when it does not. ``model`` is only what the run
+            *asked* for — a request for ``gemini-3-flash`` was served
+            ``gemini-3-flash-preview``, and openclaw fails over to a different
+            model mid-run — so a score attributed to ``model`` alone can name
+            the wrong one. Comma-joined in first-seen order on the rare run
+            that was served by more than one, which is itself the signal that
+            a failover happened.
         augmentation: Capability tokens; matches :attr:`Manifest.augmentation`.
         run_id: Run directory suffix; matches :attr:`Manifest.run_id`.
         t: UTC ISO-8601 run timestamp; matches :attr:`Manifest.t`.
@@ -173,6 +181,7 @@ class ResultRow(BaseModel):
     setup_id: str
     model: str
     harness: str
+    served_model: str = ""
     augmentation: list[str]
     run_id: str
     t: str

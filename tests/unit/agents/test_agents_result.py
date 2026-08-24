@@ -65,6 +65,7 @@ def test_agent_result_to_dict_is_serializable_copies() -> None:
         "errors": ["x"],
         "terminal_reason": "completed",
         "tool_wait_sec": None,
+        "served_models": [],
         "model_turns": None,
         "metadata": {"k": 1},
     }

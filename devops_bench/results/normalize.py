@@ -308,6 +308,19 @@ def count_tool_calls(trajectory: Any) -> tuple[int | None, int | None]:
     return len(entries), sum(1 for entry in entries if entry.get("status") == "error")
 
 
+def _served_model(value: Any) -> str:
+    """Join the models that actually answered into one row field.
+
+    Returns ``""`` for anything unusable, so a harness that reports nothing is
+    distinguishable from one that reported a model. More than one entry means
+    the run failed over mid-flight, which is worth seeing rather than
+    collapsing to the first.
+    """
+    if not isinstance(value, list):
+        return ""
+    return ",".join(v for v in value if isinstance(v, str) and v)
+
+
 def _non_negative_float_or_none(value: Any) -> float | None:
     """Coerce a recorded duration to a non-negative ``float``, else ``None``.
 
@@ -366,6 +379,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 tool_errors=tool_errors,
                 model_turns=turns if turns > 0 else None,
                 tool_wait_sec=_non_negative_float_or_none(record.get("tool_wait_sec")),
+                served_model=_served_model(record.get("served_models")),
                 latency_sec=float(record.get("latency") or 0.0),
                 input_tokens=tokens.input,
                 output_tokens=tokens.output,
