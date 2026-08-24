@@ -93,11 +93,11 @@ SAMPLE_EVENTS = _events(
 
 
 def test_parse_trajectory_export_folds_call_result_pairs() -> None:
-    trajectory, tokens, output, errors = parse_trajectory_export(SAMPLE_EVENTS)
-    assert errors == []
-    assert tokens == {"input": 5, "output": 10, "total": 15}
-    assert output == "All pods healthy."
-    assert trajectory == [
+    export = parse_trajectory_export(SAMPLE_EVENTS)
+    assert export.errors == []
+    assert export.tokens == {"input": 5, "output": 10, "total": 15}
+    assert export.output == "All pods healthy."
+    assert export.trajectory == [
         {
             "name": "kubectl_get_pods",
             "args": {"namespace": "default"},
@@ -129,10 +129,10 @@ def test_parse_trajectory_export_sums_usage_across_turns() -> None:
             "data": {"usage": {"input": 75, "output": 15, "total": 90}, "assistantTexts": ["done"]},
         },
     )
-    _trajectory, tokens, output, errors = parse_trajectory_export(blob)
-    assert errors == []
-    assert output == "done"
-    assert tokens == {"input": 425, "output": 65, "total": 490}
+    export = parse_trajectory_export(blob)
+    assert export.errors == []
+    assert export.output == "done"
+    assert export.tokens == {"input": 425, "output": 65, "total": 490}
 
 
 def test_parse_trajectory_export_sums_cache_write_from_per_call_events() -> None:
@@ -170,13 +170,13 @@ def test_parse_trajectory_export_sums_cache_write_from_per_call_events() -> None
             },
         },
     )
-    _trajectory, tokens, _output, errors = parse_trajectory_export(blob)
-    assert errors == []
-    assert tokens["cacheWrite"] == 19
+    export = parse_trajectory_export(blob)
+    assert export.errors == []
+    assert export.tokens["cacheWrite"] == 19
     # The rollup buckets are untouched — nothing is counted from both sources.
-    assert tokens["input"] == 182
-    assert tokens["output"] == 19
-    assert tokens["cacheRead"] == 322
+    assert export.tokens["input"] == 182
+    assert export.tokens["output"] == 19
+    assert export.tokens["cacheRead"] == 322
 
 
 def test_parse_trajectory_export_omits_cache_write_when_unreported() -> None:
@@ -189,8 +189,42 @@ def test_parse_trajectory_export_omits_cache_write_when_unreported() -> None:
         {"type": "assistant.message", "data": {"message": {"content": []}}},
         {"type": "model.completed", "data": {"usage": {"input": 10, "output": 2}}},
     )
-    _trajectory, tokens, _output, _errors = parse_trajectory_export(blob)
-    assert "cacheWrite" not in tokens
+    assert "cacheWrite" not in parse_trajectory_export(blob).tokens
+
+
+def test_parse_trajectory_export_counts_model_turns_not_tool_calls() -> None:
+    """One ``assistant.message`` can issue several tool calls, so the two differ.
+
+    Shape taken from a live openclaw run whose single message carried two
+    ``toolCall`` entries. Reporting ``len(trajectory)`` as turns would say three
+    round-trips happened where the provider was called twice, which is the
+    number input tokens actually grow with.
+    """
+    blob = _events(
+        {"type": "assistant.message", "data": {"message": {"content": []}}},
+        _tool_call("1", "kubectl_get_pods", {}),
+        _tool_result("1", "ok"),
+        _tool_call("2", "kubectl_describe", {}),
+        _tool_result("2", "ok"),
+        {"type": "assistant.message", "data": {"message": {"content": []}}},
+        {"type": "model.completed", "data": {"usage": {"input": 5}, "assistantTexts": ["done"]}},
+    )
+    export = parse_trajectory_export(blob)
+    assert export.model_turns == 2
+    assert len(export.trajectory) == 2
+
+
+def test_parse_trajectory_export_leaves_model_turns_none_without_messages() -> None:
+    """No ``assistant.message`` events means unmeasured, not zero turns.
+
+    An export that produced output cannot have taken zero round-trips, so ``0``
+    would be a parse miss dressed up as a fact and would drag a dashboard
+    average down.
+    """
+    blob = _events(
+        {"type": "model.completed", "data": {"usage": {"input": 5}, "assistantTexts": ["done"]}},
+    )
+    assert parse_trajectory_export(blob).model_turns is None
 
 
 def test_parse_trajectory_export_sums_nested_cost_breakdown() -> None:
@@ -199,10 +233,10 @@ def test_parse_trajectory_export_sums_nested_cost_breakdown() -> None:
         {"type": "model.completed", "data": {"usage": {"input": 10, "cost": {"total": 0.01}}}},
         {"type": "model.completed", "data": {"usage": {"input": 5, "cost": {"total": 0.02}}}},
     )
-    _trajectory, tokens, _output, errors = parse_trajectory_export(blob)
-    assert errors == []
-    assert tokens["input"] == 15
-    assert tokens["cost"]["total"] == pytest.approx(0.03)
+    export = parse_trajectory_export(blob)
+    assert export.errors == []
+    assert export.tokens["input"] == 15
+    assert export.tokens["cost"]["total"] == pytest.approx(0.03)
 
 
 def test_parse_trajectory_export_marks_failed_tool_result_as_error() -> None:
@@ -211,9 +245,9 @@ def test_parse_trajectory_export_marks_failed_tool_result_as_error() -> None:
         _tool_call("1", "exec", {"command": "false"}),
         _tool_result("1", "boom", is_error=True, status="error"),
     )
-    trajectory, _tokens, _output, errors = parse_trajectory_export(blob)
-    assert errors == []
-    assert trajectory[0]["status"] == "error"
+    export = parse_trajectory_export(blob)
+    assert export.errors == []
+    assert export.trajectory[0]["status"] == "error"
 
 
 def test_parse_trajectory_export_output_falls_back_to_assistant_message() -> None:
@@ -227,16 +261,16 @@ def test_parse_trajectory_export_output_falls_back_to_assistant_message() -> Non
         },
         {"type": "model.completed", "data": {"usage": {"input": 1, "output": 2}}},
     )
-    _trajectory, tokens, output, _errors = parse_trajectory_export(blob)
-    assert tokens == {"input": 1, "output": 2}
-    assert output == "done."
+    export = parse_trajectory_export(blob)
+    assert export.tokens == {"input": 1, "output": 2}
+    assert export.output == "done."
 
 
 def test_parse_trajectory_export_surfaces_decode_errors() -> None:
     blob = "{not json}\n" + json.dumps(_tool_call("1", "x", {})) + "\n"
-    trajectory, _tokens, _output, errors = parse_trajectory_export(blob)
-    assert any("parse error" in m for m in errors)
-    assert len(trajectory) == 1
+    export = parse_trajectory_export(blob)
+    assert any("parse error" in m for m in export.errors)
+    assert len(export.trajectory) == 1
 
 
 def test_parse_trajectory_export_drops_unpaired_result_and_surfaces_error() -> None:
@@ -248,12 +282,12 @@ def test_parse_trajectory_export_drops_unpaired_result_and_surfaces_error() -> N
     ``AgentResult.trajectory``; orphans are diagnostics, not trajectory entries.
     """
     blob = _events(_tool_result("ghost", "?"))
-    trajectory, _tokens, _output, errors = parse_trajectory_export(blob)
+    export = parse_trajectory_export(blob)
     # Orphan must NOT appear in the canonical trajectory.
-    assert trajectory == []
+    assert export.trajectory == []
     # ...but MUST be surfaced on errors so the run is never silent-empty.
-    assert any("without matching call" in m for m in errors)
-    assert any("ghost" in m for m in errors)
+    assert any("without matching call" in m for m in export.errors)
+    assert any("ghost" in m for m in export.errors)
 
 
 def test_strip_ansi_removes_color_codes() -> None:

@@ -330,6 +330,8 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
         correctness = _first_score(scores, _CORRECTNESS_KEYS)
         catastrophic_score = extract_score(scores, CATASTROPHIC_SCORE_KEY)
         tool_calls, tool_errors = count_tool_calls(record.get("trajectory"))
+        # 0 turns for a run that produced output is a parse miss, not a fact.
+        turns = _coerce_int(record.get("model_turns")) or 0
         rows.append(
             ResultRow(
                 setup_id=manifest.setup_id,
@@ -349,6 +351,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 tool_score=extract_score(scores, TOOL_SCORE_KEY),
                 tool_calls=tool_calls,
                 tool_errors=tool_errors,
+                model_turns=turns if turns > 0 else None,
                 latency_sec=float(record.get("latency") or 0.0),
                 input_tokens=tokens.input,
                 output_tokens=tokens.output,

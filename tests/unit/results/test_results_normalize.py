@@ -269,6 +269,7 @@ def test_build_rows_success_record():
         "cacheWriteTokens": None,
         "totalTokens": None,
         "status": "success",
+        "modelTurns": None,
         "terminalReason": "completed",
         "timeoutSec": None,
         "validated": False,
@@ -432,6 +433,7 @@ def test_result_row_keys_match_typescript_interface():
         "reasoningTokens",
         "cacheWriteTokens",
         "totalTokens",
+        "modelTurns",
         "terminalReason",
         "timeoutSec",
         "validated",
@@ -590,3 +592,39 @@ def test_build_rows_counts_tools_from_the_trajectory() -> None:
 def test_build_rows_reports_none_tool_counts_for_a_record_with_no_trajectory() -> None:
     row = build_rows([{"name": "n", "folder": "f", "status": "failed"}], _manifest())[0]
     assert (row.tool_calls, row.tool_errors) == (None, None)
+
+
+def test_build_rows_carries_model_turns_separately_from_tool_calls() -> None:
+    """One model turn can issue several tool calls, so the counts diverge.
+
+    Seen live in an openclaw run: a single ``assistant.message`` carried two
+    ``toolCall`` entries. Input tokens grow with turns, not with tool calls, so
+    a cost-per-turn read off ``toolCalls`` would be wrong by that factor.
+    """
+    record = {
+        "name": "n",
+        "folder": "f",
+        "status": "success",
+        "model_turns": 2,
+        "trajectory": [{"name": "a", "status": "completed"}] * 3,
+    }
+    row = build_rows([record], _manifest())[0]
+    assert (row.model_turns, row.tool_calls) == (2, 3)
+
+
+def test_build_rows_reports_unusable_model_turns_as_none() -> None:
+    """Zero, a bool, or a non-int all mean unmeasured, not "took no turns".
+
+    A record that produced output cannot have taken zero round-trips, and
+    ``True`` is an ``int`` in Python, so both would otherwise land on the row
+    as a real count and drag a dashboard average down.
+    """
+
+    def turns(value):
+        record = {"name": "n", "folder": "f", "status": "success", "model_turns": value}
+        return build_rows([record], _manifest())[0].model_turns
+
+    assert turns(0) is None
+    assert turns(True) is None
+    assert turns("4") is None
+    assert turns(None) is None

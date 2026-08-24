@@ -49,8 +49,8 @@ _DB_FLUSH_POLL_INTERVAL_SEC = 0.25
 _UNDECODABLE_MAX_ATTEMPTS = 2
 
 
-def _read_db_tokens(db_path: pathlib.Path) -> dict | None:
-    """Read canonical token usage from the conversation DB.
+def _read_db_state(db_path: pathlib.Path) -> parsing.DbTokenState:
+    """Read canonical token usage and the turn count from the conversation DB.
 
     Polls for the async flush while the DB reports ``pending``.
 
@@ -58,23 +58,23 @@ def _read_db_tokens(db_path: pathlib.Path) -> dict | None:
         db_path: Path to the ``conversations/<uuid>.db`` file.
 
     Returns:
-        The canonical token dict, or ``None`` when usage never materializes
-        (missing DB, or schema drift making the blobs undecodable).
+        The last :class:`~...parsing.DbTokenState` read. Its ``tokens`` /
+        ``turns`` are ``None`` when usage never materializes (missing DB, or
+        schema drift making the blobs undecodable).
     """
     undecodable_seen = 0
+    state = parsing.DbTokenState("absent", None, None)
     for attempt in range(_DB_FLUSH_POLL_ATTEMPTS):
-        state, tokens = parsing.db_token_state(db_path)
-        if state == "ready":
-            return tokens
-        if state == "absent":
-            return None
-        if state == "undecodable":
+        state = parsing.db_token_state(db_path)
+        if state.state in ("ready", "absent"):
+            return state
+        if state.state == "undecodable":
             undecodable_seen += 1
             if undecodable_seen >= _UNDECODABLE_MAX_ATTEMPTS:
-                return None
+                return state
         if attempt < _DB_FLUSH_POLL_ATTEMPTS - 1:
             time.sleep(_DB_FLUSH_POLL_INTERVAL_SEC)
-    return None
+    return state
 
 
 def _resolve_model_name(model: str) -> str:
@@ -330,6 +330,7 @@ class AgyCliAgent(base.AgentHarness):
             # Tokens live in the conversation DB, not the transcript; read them
             # here while the per-run workdir still exists.
             db_tokens: dict | None = None
+            model_turns: int | None = None
             if conv_dir.exists():
                 db_files = list(conv_dir.glob("*.db"))
                 if db_files:
@@ -348,7 +349,9 @@ class AgyCliAgent(base.AgentHarness):
                         session_text = transcript_path.read_text(encoding="utf-8")
                     else:
                         _log.warning("Transcript file not found: %s", transcript_path)
-                    db_tokens = _read_db_tokens(db_files[0])
+                    db_state = _read_db_state(db_files[0])
+                    db_tokens = db_state.tokens
+                    model_turns = db_state.turns
                 else:
                     _log.warning("No .db files found in %s", conv_dir)
             else:
@@ -415,5 +418,6 @@ class AgyCliAgent(base.AgentHarness):
             latency=agent_sec,
             errors=errors,
             terminal_reason=terminal_reason,
+            model_turns=model_turns,
             metadata=metadata,
         )

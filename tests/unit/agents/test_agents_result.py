@@ -64,6 +64,7 @@ def test_agent_result_to_dict_is_serializable_copies() -> None:
         "latency": 2.5,
         "errors": ["x"],
         "terminal_reason": "completed",
+        "model_turns": None,
         "metadata": {"k": 1},
     }
     # to_dict must hand the harness fresh containers so mutating the snapshot
