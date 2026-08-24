@@ -270,6 +270,7 @@ def test_build_rows_success_record():
         "totalTokens": None,
         "status": "success",
         "modelTurns": None,
+        "toolWaitSec": None,
         "terminalReason": "completed",
         "timeoutSec": None,
         "validated": False,
@@ -434,6 +435,7 @@ def test_result_row_keys_match_typescript_interface():
         "cacheWriteTokens",
         "totalTokens",
         "modelTurns",
+        "toolWaitSec",
         "terminalReason",
         "timeoutSec",
         "validated",
@@ -610,6 +612,25 @@ def test_build_rows_carries_model_turns_separately_from_tool_calls() -> None:
     }
     row = build_rows([record], _manifest())[0]
     assert (row.model_turns, row.tool_calls) == (2, 3)
+
+
+def test_build_rows_keeps_a_zero_tool_wait_but_drops_a_missing_one() -> None:
+    """Unlike a count, zero seconds inside tools is a real reading.
+
+    Tools that return within the transcript's millisecond resolution genuinely
+    measured ~0, so that must stay on the row; a harness that reports no
+    timings at all must not be averaged in as if it were instantaneous.
+    """
+
+    def wait(record_extra):
+        record = {"name": "n", "folder": "f", "status": "success", **record_extra}
+        return build_rows([record], _manifest())[0].tool_wait_sec
+
+    assert wait({"tool_wait_sec": 0}) == 0.0
+    assert wait({"tool_wait_sec": 1.75}) == 1.75
+    assert wait({}) is None
+    assert wait({"tool_wait_sec": -1.0}) is None
+    assert wait({"tool_wait_sec": True}) is None
 
 
 def test_build_rows_reports_unusable_model_turns_as_none() -> None:

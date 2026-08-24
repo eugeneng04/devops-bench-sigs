@@ -227,6 +227,28 @@ def test_parse_trajectory_export_leaves_model_turns_none_without_messages() -> N
     assert parse_trajectory_export(blob).model_turns is None
 
 
+def test_parse_trajectory_export_times_tools_and_merges_concurrent_calls() -> None:
+    """Two calls issued in one message overlap, so their spans count once.
+
+    Timestamps taken from a live export: both ``tool.call`` events landed on the
+    same millisecond. Summing the two durations would say the run spent longer
+    in tools than it ran for.
+    """
+    blob = _events(
+        {**_tool_call("1", "a", {}), "ts": "2026-08-24T17:44:45.862Z"},
+        {**_tool_call("2", "b", {}), "ts": "2026-08-24T17:44:45.862Z"},
+        {**_tool_result("1", "ok"), "ts": "2026-08-24T17:44:46.081Z"},
+        {**_tool_result("2", "ok"), "ts": "2026-08-24T17:44:46.362Z"},
+    )
+    assert parse_trajectory_export(blob).tool_wait_sec == pytest.approx(0.5, abs=1e-6)
+
+
+def test_parse_trajectory_export_leaves_tool_wait_none_without_timestamps() -> None:
+    """An export with no ``ts`` reports unmeasured, not zero seconds in tools."""
+    blob = _events(_tool_call("1", "a", {}), _tool_result("1", "ok"))
+    assert parse_trajectory_export(blob).tool_wait_sec is None
+
+
 def test_parse_trajectory_export_sums_nested_cost_breakdown() -> None:
     """Nested numeric mappings (e.g. a per-turn ``cost`` block) are summed too."""
     blob = _events(

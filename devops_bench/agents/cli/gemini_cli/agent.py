@@ -263,8 +263,9 @@ class GeminiCliAgent(AgentHarness):
                 )
             agent_sec = time.monotonic() - started
 
-        output, trajectory, tokens, parse_errors = parse_stream_json(completed.stdout or "")
-        errors: list[str] = list(parse_errors)
+        parsed = parse_stream_json(completed.stdout or "")
+        output, trajectory, tokens = parsed.output, parsed.trajectory, parsed.tokens
+        errors: list[str] = list(parsed.errors)
         if completed.returncode != 0:
             stderr = (completed.stderr or "").strip()
             errors.append(f"gemini exited {completed.returncode}: {stderr or '<no stderr>'}")
@@ -282,5 +283,6 @@ class GeminiCliAgent(AgentHarness):
             # The CLI's own turn cap is invisible from outside the process,
             # so a capped run lands in "completed".
             terminal_reason="error" if completed.returncode != 0 else "completed",
+            tool_wait_sec=parsed.tool_wait_sec,
             metadata=metadata,
         )

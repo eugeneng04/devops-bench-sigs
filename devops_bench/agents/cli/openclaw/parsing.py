@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from devops_bench.agents.result import ToolCall
+from devops_bench.agents.shared.timing import merged_span_sec, parse_event_time
 from devops_bench.core import get_logger
 
 __all__ = ["TrajectoryExport", "parse_trajectory_export"]
@@ -119,6 +120,8 @@ class TrajectoryExport(NamedTuple):
         errors: Extraction failures worth surfacing.
         model_turns: Model round-trips, or ``None`` when the export carried no
             ``assistant.message`` events to count.
+        tool_wait_sec: Wall-clock seconds inside tool calls, concurrent calls
+            counted once; ``None`` when no call could be timed.
     """
 
     trajectory: list[dict]
@@ -126,11 +129,12 @@ class TrajectoryExport(NamedTuple):
     output: str
     errors: list[str]
     model_turns: int | None
+    tool_wait_sec: float | None
 
     @classmethod
     def empty(cls, errors: list[str]) -> TrajectoryExport:
         """Return an export that recovered nothing but ``errors``."""
-        return cls([], {}, "", errors, None)
+        return cls([], {}, "", errors, None, None)
 
 
 def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
@@ -140,6 +144,7 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
     event with a dotted ``type`` and an event-specific ``data`` payload:
 
     - ``tool.call`` -> ``data.name`` / ``data.arguments`` / ``data.toolCallId``
+      (+ the event's top-level ``ts``, paired with the result's to time the call)
     - ``tool.result`` -> ``data.message`` with ``toolCallId`` + ``content[].text``
       (+ ``isError`` / ``details.status``)
     - ``model.completed`` -> ``data.usage`` (tokens) + ``data.assistantTexts``
@@ -177,6 +182,8 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
     pending: dict[str, ToolCall] = {}
     trajectory: list[ToolCall] = []
     model_turns = 0
+    started_at: dict[str, float] = {}
+    spans: list[tuple[float, float]] = []
 
     for lineno, raw in enumerate(jsonl_text.splitlines(), start=1):
         line = raw.strip()
@@ -191,6 +198,7 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
             continue
 
         etype = entry.get("type") or entry.get("event")
+        event_time = parse_event_time(entry.get("ts"))
         data = entry.get("data")
         if not isinstance(data, dict):
             data = {}
@@ -206,6 +214,8 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
             trajectory.append(call)
             if call_id:
                 pending[str(call_id)] = call
+                if event_time is not None:
+                    started_at[str(call_id)] = event_time
         elif etype == "tool.result":
             msg = data.get("message") if isinstance(data.get("message"), dict) else data
             call_id = msg.get("toolCallId") or msg.get("id") or ""
@@ -231,6 +241,9 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
                 continue
             target.result = text
             target.status = "error" if is_error else "completed"
+            start = started_at.pop(str(call_id), None)
+            if start is not None and event_time is not None and event_time >= start:
+                spans.append((start, event_time))
         elif etype == "model.completed":
             usage = data.get("usage")
             if isinstance(usage, dict):
@@ -257,6 +270,7 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
         output=output,
         errors=errors,
         model_turns=model_turns or None,
+        tool_wait_sec=merged_span_sec(spans),
     )
 
 
