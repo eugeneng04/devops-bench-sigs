@@ -135,6 +135,64 @@ def test_parse_trajectory_export_sums_usage_across_turns() -> None:
     assert tokens == {"input": 425, "output": 65, "total": 490}
 
 
+def test_parse_trajectory_export_sums_cache_write_from_per_call_events() -> None:
+    """``cacheWrite`` lives only on ``assistant.message``, not ``model.completed``.
+
+    Shape taken from a live export: the per-call usages sum to the
+    ``model.completed`` total for every bucket except ``cacheWrite``, which the
+    rollup drops. Cache writes are priced above input on Anthropic, so losing
+    the bucket understates what an openclaw run was billed.
+    """
+    blob = _events(
+        {
+            "type": "assistant.message",
+            "data": {
+                "message": {
+                    "content": [],
+                    "usage": {"input": 90, "output": 8, "cacheRead": 160, "cacheWrite": 12},
+                }
+            },
+        },
+        {
+            "type": "assistant.message",
+            "data": {
+                "message": {
+                    "content": [],
+                    "usage": {"input": 92, "output": 11, "cacheRead": 162, "cacheWrite": 7},
+                }
+            },
+        },
+        {
+            "type": "model.completed",
+            "data": {
+                "usage": {"input": 182, "output": 19, "cacheRead": 322, "total": 523},
+                "assistantTexts": ["done"],
+            },
+        },
+    )
+    _trajectory, tokens, _output, errors = parse_trajectory_export(blob)
+    assert errors == []
+    assert tokens["cacheWrite"] == 19
+    # The rollup buckets are untouched — nothing is counted from both sources.
+    assert tokens["input"] == 182
+    assert tokens["output"] == 19
+    assert tokens["cacheRead"] == 322
+
+
+def test_parse_trajectory_export_omits_cache_write_when_unreported() -> None:
+    """No ``cacheWrite`` anywhere means the key is absent, so the row reads None.
+
+    An older openclaw whose events carry no per-call usage must not be recorded
+    as having written zero cache tokens.
+    """
+    blob = _events(
+        {"type": "assistant.message", "data": {"message": {"content": []}}},
+        {"type": "model.completed", "data": {"usage": {"input": 10, "output": 2}}},
+    )
+    _trajectory, tokens, _output, _errors = parse_trajectory_export(blob)
+    assert "cacheWrite" not in tokens
+
+
 def test_parse_trajectory_export_sums_nested_cost_breakdown() -> None:
     """Nested numeric mappings (e.g. a per-turn ``cost`` block) are summed too."""
     blob = _events(

@@ -69,12 +69,16 @@ def _accumulate_usage(acc: dict, usage: dict) -> None:
     added; nested mappings (e.g. a ``cost`` breakdown) are summed recursively;
     booleans and other non-numeric values are ignored.
 
+    ``cacheWrite`` is skipped even though today's rollup omits it, so the bucket
+    keeps a single source (:func:`_accumulate_cache_write`) on any openclaw
+    version rather than double-counting on one that starts reporting it.
+
     Args:
         acc: Accumulator mutated in place.
         usage: A single turn's usage mapping.
     """
     for key, value in usage.items():
-        if isinstance(value, bool):
+        if key == "cacheWrite" or isinstance(value, bool):
             continue
         if isinstance(value, (int, float)):
             acc[key] = acc.get(key, 0) + value
@@ -82,6 +86,26 @@ def _accumulate_usage(acc: dict, usage: dict) -> None:
             nested = acc.setdefault(key, {})
             if isinstance(nested, dict):
                 _accumulate_usage(nested, value)
+
+
+def _accumulate_cache_write(acc: dict, usage: object) -> None:
+    """Add one model call's ``cacheWrite`` to the running usage accumulator.
+
+    ``model.completed.usage`` omits ``cacheWrite``; the per-call
+    ``assistant.message.usage`` is the only event that carries it. So this one
+    bucket is summed from here and every other bucket from ``model.completed``,
+    which otherwise reconciles to the token against the per-call events.
+
+    Args:
+        acc: Token accumulator mutated in place.
+        usage: A single ``assistant.message`` usage mapping, or anything else
+            (ignored).
+    """
+    if not isinstance(usage, dict):
+        return
+    written = usage.get("cacheWrite")
+    if isinstance(written, (int, float)) and not isinstance(written, bool):
+        acc["cacheWrite"] = acc.get("cacheWrite", 0) + written
 
 
 def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, list[str]]:
@@ -96,6 +120,8 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
     - ``model.completed`` -> ``data.usage`` (tokens) + ``data.assistantTexts``
       (the agent's final answer)
     - ``assistant.message`` -> ``data.message.content[].text`` (fallback output)
+      + ``data.message.usage.cacheWrite``, the only place cache-write tokens
+      appear (``model.completed`` omits that one bucket)
 
     Matching ``tool.call`` / ``tool.result`` pairs (keyed on ``toolCallId``) fold
     into one :class:`ToolCall` so the metrics layer sees the canonical trajectory
@@ -110,8 +136,13 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
     Returns:
         A ``(trajectory, tokens, output, errors)`` tuple. ``trajectory`` is a
         list of ``ToolCall.to_dict()`` mappings; ``tokens`` is the usage summed
-        across every ``model.completed`` turn (not just the last); ``output`` is
-        the agent's final answer text (``""`` when none was found).
+        across every ``model.completed`` turn (not just the last), plus
+        ``cacheWrite`` summed across the per-call ``assistant.message`` events;
+        ``output`` is the agent's final answer text (``""`` when none was found).
+
+        There is no reasoning bucket: openclaw's usage payload carries none at
+        any thinking level (checked live at ``off`` and ``high``), so
+        ``reasoning`` normalizes to ``None`` rather than a fabricated ``0``.
     """
     tokens: dict = {}
     errors: list[str] = []
@@ -184,6 +215,7 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
                     output = joined
         elif etype == "assistant.message":
             msg = data.get("message") if isinstance(data.get("message"), dict) else {}
+            _accumulate_cache_write(tokens, msg.get("usage"))
             txt = _join_text(msg.get("content"))
             if txt:
                 fallback_output.append(txt)
