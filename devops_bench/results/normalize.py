@@ -289,7 +289,7 @@ def _scoring_version(scores: Mapping[str, Any] | None) -> str:
     return ""
 
 
-def count_tool_calls(trajectory: Any) -> tuple[int | None, int | None]:
+def count_tool_calls(trajectory: Any, errors: Any = None) -> tuple[int | None, int | None]:
     """Return ``(tool_calls, tool_errors)`` for a record's trajectory.
 
     Only ``ToolCall.to_dict()`` entries count, recognised by a string ``name``.
@@ -304,22 +304,39 @@ def count_tool_calls(trajectory: Any) -> tuple[int | None, int | None]:
     resolve — labelled differently by different parsers, so counting either
     would make the column incomparable across harnesses.
 
-    An empty or non-list trajectory yields ``(None, None)``. A trajectory
-    export can fail (see the early returns in the openclaw harness), and a
-    zero that means "not captured" would sink a dashboard average. A trajectory
-    holding no tool calls at all is the same case, not a genuine zero — the
-    harness agrees, marking such a record ``validated=False``.
+    An empty trajectory is ambiguous on its own: a run that legitimately
+    answered without calling a tool and a run whose transcript export failed
+    both land there. ``errors`` breaks the tie, because every path that loses a
+    transcript reports why — the openclaw exporter appends its failure, a
+    timeout appends its own, and a failed record carries the exception. So an
+    empty trajectory alongside an empty ``errors`` list is a genuine ``(0, 0)``,
+    and anything else stays ``None`` rather than sinking a dashboard average
+    with a zero that means "not captured". This is the same test the harness
+    applies to ``validated`` (``not errors and bool(trajectory)``), minus the
+    part that discards a clean zero.
+
+    Args:
+        trajectory: The record's ``trajectory`` list, or ``None``.
+        errors: The record's ``errors`` list. Omit it when the caller cannot
+            tell whether the run reported one; an empty trajectory then stays
+            ``(None, None)`` rather than being claimed as a genuine zero.
+
+    Returns:
+        A ``(tool_calls, tool_errors)`` pair, each ``int`` or ``None``.
     """
-    if not isinstance(trajectory, list) or not trajectory:
+    if not isinstance(trajectory, list):
         return None, None
     calls = [
         entry
         for entry in trajectory
         if isinstance(entry, Mapping) and isinstance(entry.get("name"), str)
     ]
-    if not calls:
+    if calls:
+        return len(calls), sum(1 for entry in calls if entry.get("status") == "error")
+    # Entries that parsed as nothing are a malformed export, not a clean run.
+    if trajectory or not isinstance(errors, list) or errors:
         return None, None
-    return len(calls), sum(1 for entry in calls if entry.get("status") == "error")
+    return 0, 0
 
 
 def _served_model(value: Any) -> str:
@@ -369,7 +386,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
         tokens = normalize_tokens(record.get("tokens"))
         correctness = _first_score(scores, _CORRECTNESS_KEYS)
         catastrophic_score = extract_score(scores, CATASTROPHIC_SCORE_KEY)
-        tool_calls, tool_errors = count_tool_calls(record.get("trajectory"))
+        tool_calls, tool_errors = count_tool_calls(record.get("trajectory"), record.get("errors"))
         # 0 turns for a run that produced output is a parse miss, not a fact.
         turns = _coerce_int(record.get("model_turns")) or 0
         rows.append(

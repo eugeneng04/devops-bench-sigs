@@ -561,11 +561,32 @@ def test_count_tool_calls_counts_only_error_as_a_failure() -> None:
 def test_count_tool_calls_reports_none_when_no_trajectory_was_captured() -> None:
     """A trajectory export can fail, and 0 would read as "made no calls".
 
-    Mirrors ``model_turns``, which uses ``None`` for the same situation.
+    Mirrors ``model_turns``, which uses ``None`` for the same situation. With no
+    ``errors`` argument the caller cannot say which case an empty list is, so it
+    stays unknown.
     """
     assert count_tool_calls(None) == (None, None)
     assert count_tool_calls([]) == (None, None)
     assert count_tool_calls("not a list") == (None, None)
+
+
+def test_count_tool_calls_reports_a_clean_run_that_called_no_tool_as_zero() -> None:
+    """An empty trajectory with no errors is a fact, not missing telemetry.
+
+    A run can answer from the model alone. Reporting ``None`` there drops it out
+    of the dashboard average instead of recording the zero it earned.
+    """
+    assert count_tool_calls([], []) == (0, 0)
+
+
+def test_count_tool_calls_reports_none_when_an_empty_trajectory_came_with_errors() -> None:
+    """Every path that loses a transcript says so in ``errors``.
+
+    The openclaw exporter appends its failure, a timeout appends its own, and a
+    failed record carries the exception — so an error next to an empty
+    trajectory means "not captured", never "called no tools".
+    """
+    assert count_tool_calls([], ["oc export-trajectory exited 1"]) == (None, None)
 
 
 def test_count_tool_calls_ignores_interleaved_text_turns() -> None:
