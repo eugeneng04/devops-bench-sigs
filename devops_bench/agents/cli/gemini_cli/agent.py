@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -240,6 +241,7 @@ class GeminiCliAgent(AgentHarness):
                 (gemini_dir / _GEMINI_SETTINGS_FILE).write_text(
                     json.dumps(settings, indent=2), encoding="utf-8"
                 )
+            started = time.monotonic()
             try:
                 completed = run(
                     argv,
@@ -251,11 +253,15 @@ class GeminiCliAgent(AgentHarness):
             except SubprocessError as exc:
                 return AgentResult.errored(
                     f"gemini subprocess error: {exc}",
+                    latency=time.monotonic() - started,
                     terminal_reason="timeout" if exc.timed_out else "error",
                 )
             except OSError as exc:
                 # Missing / non-executable binary; core.subprocess.run does not wrap.
-                return AgentResult.errored(f"gemini binary unavailable: {exc}")
+                return AgentResult.errored(
+                    f"gemini binary unavailable: {exc}", latency=time.monotonic() - started
+                )
+            agent_sec = time.monotonic() - started
 
         output, trajectory, tokens, parse_errors = parse_stream_json(completed.stdout or "")
         errors: list[str] = list(parse_errors)
@@ -271,6 +277,7 @@ class GeminiCliAgent(AgentHarness):
             output=output,
             trajectory=trajectory,
             tokens=tokens,
+            latency=agent_sec,
             errors=errors,
             # The CLI's own turn cap is invisible from outside the process,
             # so a capped run lands in "completed".

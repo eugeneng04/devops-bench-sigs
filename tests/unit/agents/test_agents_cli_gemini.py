@@ -277,6 +277,48 @@ def test_execute_passes_timeout_to_subprocess(monkeypatch: pytest.MonkeyPatch) -
     assert captured["timeout"] == 15.5
 
 
+class _FakeClock:
+    """Monotonic clock that only moves when a fake explicitly advances it."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def test_latency_excludes_workspace_setup_and_stream_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Latency is the agent turn only, so it stays comparable across harnesses."""
+    clock = _FakeClock()
+    monkeypatch.setattr(gemini_mod, "time", SimpleNamespace(monotonic=clock.monotonic))
+
+    def fake_run(argv, **kwargs):
+        clock.now += 5.0
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    def slow_parse(text):
+        clock.now += 100.0
+        return "", [], {}, []
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    monkeypatch.setattr(gemini_mod, "parse_stream_json", slow_parse)
+    assert GeminiCliAgent(AgentConfig(target="gemini")).run("p").latency == 5.0
+
+
+def test_timeout_result_carries_the_elapsed_agent_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(gemini_mod, "time", SimpleNamespace(monotonic=clock.monotonic))
+
+    def fake_run(argv, **kwargs):
+        clock.now += 7.0
+        raise SubprocessError(argv, returncode=-1, stdout="", stderr="", timed_out=True)
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    assert GeminiCliAgent(AgentConfig(target="gemini")).run("p").latency == 7.0
+
+
 def test_execute_wires_extra_env_into_subprocess_call(monkeypatch: pytest.MonkeyPatch) -> None:
     """Call-site wiring: GEMINI_MODEL / GOOGLE_API_KEY actually reach `run(...)`."""
     captured: dict = {}

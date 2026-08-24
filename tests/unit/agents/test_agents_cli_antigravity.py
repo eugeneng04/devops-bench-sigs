@@ -504,6 +504,47 @@ def test_agy_cli_agent_execute_flow_missing_transcript_falls_back_to_stdout(
     assert "Empty session log" in result.errors
 
 
+class _FakeClock:
+    """Monotonic clock that only moves when a fake explicitly advances it."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+
+@mock.patch.object(pathlib.Path, "home")
+@mock.patch.object(devops_subprocess, "run")
+def test_latency_excludes_transcript_recovery(mock_run, mock_home, tmp_path, monkeypatch):
+    """Latency is the agent turn only — the DB read and transcript parse are ours."""
+    mock_home.return_value = tmp_path
+    clock = _FakeClock()
+    monkeypatch.setattr(
+        agy_mod, "time", SimpleNamespace(monotonic=clock.monotonic, sleep=lambda _s: None)
+    )
+
+    def side_effect(*args, **kwargs):
+        clock.now += 5.0
+        _write_sample_transcript(kwargs.get("cwd") or tmp_path)
+        return SimpleNamespace(args=["agy"], returncode=0, stdout="", stderr="")
+
+    mock_run.side_effect = side_effect
+
+    def slow_parse(text):
+        clock.now += 100.0
+        return "", [], parsing.empty_tokens(), []
+
+    monkeypatch.setattr(agy_mod.parsing, "parse_session_jsonl", slow_parse)
+
+    config = agents_config.AgentConfig(
+        target="/bin/agy",
+        model="gemini-3.5-flash",
+        capabilities=capabilities.AllCapabilities(),
+    )
+    assert agy_mod.AgyCliAgent(config)._execute("run task").latency == 5.0
+
+
 def test_empty_tokens_all_none():
     assert parsing.empty_tokens() == {
         "input": None,
