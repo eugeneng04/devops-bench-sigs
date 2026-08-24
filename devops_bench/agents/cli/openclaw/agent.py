@@ -57,6 +57,7 @@ import os
 import shlex
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -457,6 +458,7 @@ class OpenClawAgent(AgentHarness):
             # consuming Vertex quota). Run in its own process group
             # (start_new_session=True) and os.killpg(...) on timeout. Tracked as a
             # separate, more intrusive change to generalize across all CLI agents.
+            started = time.monotonic()
             try:
                 # bash -c (as argv, never shell=True) so nvm.sh can be sourced;
                 # every value interpolated into `command` is shlex.quoted.
@@ -471,10 +473,14 @@ class OpenClawAgent(AgentHarness):
                 # With check=False the only SubprocessError here is a timeout.
                 return AgentResult.errored(
                     f"oc agent timed out after {self.config.timeout_sec}s",
+                    latency=time.monotonic() - started,
                     terminal_reason="timeout",
                 )
             except OSError as exc:
-                return AgentResult.errored(f"oc binary unavailable: {exc}")
+                return AgentResult.errored(
+                    f"oc binary unavailable: {exc}", latency=time.monotonic() - started
+                )
+            agent_sec = time.monotonic() - started
 
             stdout_text = _strip_ansi(completed.stdout or "")
             errors: list[str] = []
@@ -497,6 +503,7 @@ class OpenClawAgent(AgentHarness):
             output=output,
             trajectory=trajectory,
             tokens=tokens,
+            latency=agent_sec,
             errors=errors,
             # ``oc``'s own turn cap is invisible from outside the process, so
             # a capped run lands in "completed". A failed trajectory export is

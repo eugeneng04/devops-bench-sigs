@@ -294,6 +294,7 @@ class AgyCliAgent(base.AgentHarness):
 
             completed: devops_subprocess.CompletedProcess | None = None
             timeout_exc: core.SubprocessError | None = None
+            started = time.monotonic()
             try:
                 completed = devops_subprocess.run(
                     argv,
@@ -310,7 +311,8 @@ class AgyCliAgent(base.AgentHarness):
                 timeout_exc = exc
             except OSError as exc:
                 return agents_result.AgentResult.errored(
-                    f"antigravity-cli binary unavailable: {exc}"
+                    f"antigravity-cli binary unavailable: {exc}",
+                    latency=time.monotonic() - started,
                 )
             finally:
                 # agy only needs the token while running. Remove the copy once it
@@ -318,6 +320,7 @@ class AgyCliAgent(base.AgentHarness):
                 # is deliberately retained for artifact collection.
                 if copied_token is not None:
                     copied_token.unlink(missing_ok=True)
+            agent_sec = time.monotonic() - started
 
             # All logs and conversations land under agy_config_dir since we
             # passed --gemini_dir.
@@ -409,6 +412,7 @@ class AgyCliAgent(base.AgentHarness):
             output=output,
             trajectory=trajectory,
             tokens=tokens,
+            latency=agent_sec,
             errors=errors,
             terminal_reason=terminal_reason,
             metadata=metadata,

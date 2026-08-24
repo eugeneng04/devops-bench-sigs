@@ -467,6 +467,59 @@ def test_execute_passes_timeout_to_bash(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert captured["timeout"] == 12.5
 
 
+class _FakeClock:
+    """Monotonic clock that only moves when a fake explicitly advances it."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def _install_fake_clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
+    clock = _FakeClock()
+    monkeypatch.setattr(oc_mod, "time", SimpleNamespace(monotonic=clock.monotonic))
+    return clock
+
+
+def test_latency_excludes_the_trajectory_export(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The reported latency is the agent turn, not the turn plus our export.
+
+    Exporting the trajectory afterwards is harness work; billing it to the
+    agent makes openclaw look slower than a harness that has no export step.
+    """
+    clock = _install_fake_clock(monkeypatch)
+
+    def fake_bash(cmd, **kwargs):
+        clock.now += 5.0
+        return _make_subprocess_result("ok", "", 0)
+
+    def fake_core_run(argv, **kwargs):
+        clock.now += 100.0
+        return _make_subprocess_result(json.dumps([]), "", 0)
+
+    _install_oc_run(monkeypatch, fake_bash, fake_core_run)
+    result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("p")
+    assert result.latency == 5.0
+
+
+def test_timeout_result_carries_the_elapsed_agent_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    clock = _install_fake_clock(monkeypatch)
+
+    def fake_bash(cmd, **kwargs):
+        clock.now += 7.0
+        raise SubprocessError(["/bin/bash", "-c", cmd], returncode=-1, stdout="", stderr="")
+
+    _install_oc_run(monkeypatch, fake_bash)
+    result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=7.0)).run("p")
+    assert result.latency == 7.0
+
+
 # Tests for the now-deleted legacy surface — fail-fast if SSH transport returns.
 
 
