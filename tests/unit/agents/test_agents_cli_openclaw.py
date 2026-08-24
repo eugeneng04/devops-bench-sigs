@@ -173,6 +173,15 @@ def test_parse_trajectory_export_sums_cache_write_from_per_call_events() -> None
     export = parse_trajectory_export(blob)
     assert export.errors == []
     assert export.tokens["cacheWrite"] == 19
+    # The rollup total omits cacheWrite too, so it is folded back in: the
+    # canonical contract is that total is the sum of every bucket.
+    assert export.tokens["total"] == 182 + 19 + 322 + 19
+    assert export.tokens["total"] == (
+        export.tokens["input"]
+        + export.tokens["output"]
+        + export.tokens["cacheRead"]
+        + export.tokens["cacheWrite"]
+    )
     # The rollup buckets are untouched — nothing is counted from both sources.
     assert export.tokens["input"] == 182
     assert export.tokens["output"] == 19
@@ -279,6 +288,32 @@ def test_parse_trajectory_export_sums_nested_cost_breakdown() -> None:
     assert export.errors == []
     assert export.tokens["input"] == 15
     assert export.tokens["cost"]["total"] == pytest.approx(0.03)
+
+
+def test_parse_trajectory_export_keeps_cache_write_inside_a_nested_cost_block() -> None:
+    """The top-level ``cacheWrite`` skip must not reach into the cost breakdown.
+
+    The token bucket is skipped so it keeps one source, but cost dollars have no
+    second source -- dropping them would leave the itemized costs short of their
+    own total.
+    """
+    blob = _events(
+        {
+            "type": "model.completed",
+            "data": {
+                "usage": {
+                    "input": 10,
+                    "cacheWrite": 4,
+                    "cost": {"input": 0.5, "cacheWrite": 0.25, "total": 0.75},
+                }
+            },
+        },
+    )
+    tokens = parse_trajectory_export(blob).tokens
+    # The rollup's own cacheWrite is still ignored (single-sourced elsewhere)...
+    assert "cacheWrite" not in tokens
+    # ...but the nested cost entry survives.
+    assert tokens["cost"] == {"input": 0.5, "cacheWrite": 0.25, "total": 0.75}
 
 
 def test_parse_trajectory_export_marks_failed_tool_result_as_error() -> None:
@@ -579,7 +614,9 @@ def test_execute_records_export_subprocess_failure(
 def test_execute_records_bash_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     def fake_bash(cmd, **kwargs):
         # core.subprocess.run wraps TimeoutExpired in SubprocessError.
-        raise SubprocessError(["/bin/bash", "-c", cmd], returncode=-1, stdout="", stderr="")
+        raise SubprocessError(
+            ["/bin/bash", "-c", cmd], returncode=-1, stdout="", stderr="", timed_out=True
+        )
 
     _install_oc_run(monkeypatch, fake_bash)
     result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=5.0)).run("p")
@@ -587,6 +624,47 @@ def test_execute_records_bash_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert "timed out" in result.errors[0]
     assert result.trajectory == []
     assert result.terminal_reason == "timeout"
+
+
+def test_execute_recovers_telemetry_from_a_timed_out_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A killed agent turn still exported its session; the row keeps that telemetry.
+
+    The budget ends the turn, not the session on disk, and export-trajectory is
+    a separate subprocess. Nulling the trajectory here would blank the counters
+    on exactly the rows where "how far did it get" is the question.
+    """
+
+    def fake_bash(cmd, **kwargs):
+        raise SubprocessError(
+            ["/bin/bash", "-c", cmd], returncode=-1, stdout="", stderr="", timed_out=True
+        )
+
+    _install_oc_run(monkeypatch, fake_bash, _bundle_writer(SAMPLE_EVENTS))
+    result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=5.0)).run("p")
+    assert result.terminal_reason == "timeout"
+    assert any("timed out" in e for e in result.errors)
+    # The partial run's work survives rather than being discarded with the kill.
+    assert len(result.trajectory) == 2
+    assert result.tokens == {"input": 5, "output": 10, "total": 15}
+    assert result.output == "All pods healthy."
+
+
+def test_execute_non_timeout_subprocess_error_is_not_labelled_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``terminal_reason`` follows ``exc.timed_out``, not the exception type."""
+
+    def fake_bash(cmd, **kwargs):
+        raise SubprocessError(
+            ["/bin/bash", "-c", cmd], returncode=-1, stdout="", stderr="", timed_out=False
+        )
+
+    _install_oc_run(monkeypatch, fake_bash)
+    result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=5.0)).run("p")
+    assert result.terminal_reason == "error"
+    assert not any("timed out" in e for e in result.errors)
 
 
 def test_execute_passes_timeout_to_bash(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

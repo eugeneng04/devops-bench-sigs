@@ -62,7 +62,7 @@ def _join_text(content: object) -> str:
     return ""
 
 
-def _accumulate_usage(acc: dict, usage: dict) -> None:
+def _accumulate_usage(acc: dict, usage: dict, *, top_level: bool = True) -> None:
     """Sum one turn's token usage into a running accumulator, in place.
 
     OpenClaw emits a ``model.completed`` event per turn (per model call), each
@@ -71,23 +71,28 @@ def _accumulate_usage(acc: dict, usage: dict) -> None:
     added; nested mappings (e.g. a ``cost`` breakdown) are summed recursively;
     booleans and other non-numeric values are ignored.
 
-    ``cacheWrite`` is skipped even though today's rollup omits it, so the bucket
-    keeps a single source (:func:`_accumulate_cache_write`) on any openclaw
-    version rather than double-counting on one that starts reporting it.
+    The top-level ``cacheWrite`` is skipped even though today's rollup omits it,
+    so the bucket keeps a single source (:func:`_accumulate_cache_write`) on any
+    openclaw version rather than double-counting on one that starts reporting
+    it. The skip is deliberately not applied inside nested mappings: a ``cost``
+    breakdown itemizes cache-write *dollars*, which have no second source, so
+    dropping that entry would leave the sub-buckets short of their own total.
 
     Args:
         acc: Accumulator mutated in place.
         usage: A single turn's usage mapping.
+        top_level: Whether ``usage`` is the usage mapping itself rather than a
+            nested breakdown inside it.
     """
     for key, value in usage.items():
-        if key == "cacheWrite" or isinstance(value, bool):
+        if (top_level and key == "cacheWrite") or isinstance(value, bool):
             continue
         if isinstance(value, (int, float)):
             acc[key] = acc.get(key, 0) + value
         elif isinstance(value, dict):
             nested = acc.setdefault(key, {})
             if isinstance(nested, dict):
-                _accumulate_usage(nested, value)
+                _accumulate_usage(nested, value, top_level=False)
 
 
 def _accumulate_cache_write(acc: dict, usage: object) -> None:
@@ -108,6 +113,30 @@ def _accumulate_cache_write(acc: dict, usage: object) -> None:
     written = usage.get("cacheWrite")
     if isinstance(written, (int, float)) and not isinstance(written, bool):
         acc["cacheWrite"] = acc.get("cacheWrite", 0) + written
+
+
+def _fold_cache_write_into_total(acc: dict) -> None:
+    """Add the recovered ``cacheWrite`` to the rollup total, in place.
+
+    ``model.completed`` omits ``cacheWrite`` from both the buckets *and* the
+    ``total`` it reports, so a total copied through verbatim understates the run
+    by exactly the cache writes :func:`_accumulate_cache_write` recovered. The
+    canonical contract is that ``total`` is the sum of every bucket (see
+    :data:`~devops_bench.agents.result.TOKEN_BUCKETS`), and cache writes are
+    billed above input on Anthropic, so leaving the gap would understate the
+    priciest bucket on every openclaw run.
+
+    Args:
+        acc: Token accumulator mutated in place. Left untouched when no
+            ``cacheWrite`` was recovered or the rollup reported no total.
+    """
+    written = acc.get("cacheWrite")
+    if not isinstance(written, (int, float)):
+        return
+    for key in ("total", "totalTokens"):
+        current = acc.get(key)
+        if isinstance(current, (int, float)):
+            acc[key] = current + written
 
 
 class TrajectoryExport(NamedTuple):
@@ -170,7 +199,8 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
     Returns:
         A :class:`TrajectoryExport`. ``tokens`` is the usage summed across every
         ``model.completed`` turn (not just the last), plus ``cacheWrite`` summed
-        across the per-call ``assistant.message`` events. ``model_turns`` counts
+        across the per-call ``assistant.message`` events and folded into the
+        reported total, which omits it too. ``model_turns`` counts
         ``assistant.message`` events, one per model round-trip -- which is not
         ``len(trajectory)``, because a single message can carry several
         ``toolCall`` entries (seen live) and a text-only message carries none.
@@ -271,6 +301,7 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
 
     if not output and fallback_output:
         output = "\n".join(fallback_output)
+    _fold_cache_write_into_total(tokens)
 
     return TrajectoryExport(
         trajectory=[call.to_dict() for call in trajectory],

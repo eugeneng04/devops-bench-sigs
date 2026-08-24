@@ -75,8 +75,11 @@ CATASTROPHIC_SCORE_KEY = score_keys.VERIFICATION_CATASTROPHIC_KEY
 # tool's spelling is part of this contract. OpenClaw emits camelCase
 # ``cacheRead`` / ``cacheWrite`` / ``totalTokens`` from every one of its
 # provider adapters, with ``input`` already net of both cache buckets — see
-# ``@openclaw/ai``'s ``parseChunkUsage``, whose own total is
-# ``input + output + cacheRead + cacheWrite``.
+# ``@openclaw/ai``'s ``parseChunkUsage``, whose per-call total is
+# ``input + output + cacheRead + cacheWrite``. The session rollup on
+# ``model.completed`` is a different total that drops ``cacheWrite`` from both
+# its buckets and its sum, so the openclaw parser folds that bucket back in
+# before the record is written; totals here are read, never recomputed.
 _INPUT_TOKEN_KEYS = ("input", "prompt_tokens", "prompt_token_count", "input_tokens")
 _OUTPUT_TOKEN_KEYS = (
     "output",
@@ -300,11 +303,14 @@ def count_tool_calls(trajectory: Any) -> tuple[int | None, int | None]:
 
     An empty or non-list trajectory yields ``(None, None)``. A trajectory
     export can fail (see the early returns in the openclaw harness), and a
-    zero that means "not captured" would sink a dashboard average.
+    zero that means "not captured" would sink a dashboard average. A trajectory
+    holding nothing but non-mappings is the same case, not a genuine zero.
     """
     if not isinstance(trajectory, list) or not trajectory:
         return None, None
     entries = [entry for entry in trajectory if isinstance(entry, Mapping)]
+    if not entries:
+        return None, None
     return len(entries), sum(1 for entry in entries if entry.get("status") == "error")
 
 

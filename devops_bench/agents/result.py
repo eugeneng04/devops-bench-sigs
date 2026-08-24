@@ -91,8 +91,11 @@ class AgentResult:
             same canonical entry shape so metrics consume one schema.
         tokens: Provider-reported token usage (shape is provider-defined; pass
             through verbatim).
-        latency: Total wall-clock seconds spent inside the agent run, stamped
-            by :meth:`AgentHarness.run`.
+        latency: Wall-clock seconds of the agent turn itself. A harness that
+            can measure the span more precisely than the whole ``run()`` call
+            -- the CLI harnesses bracket their subprocess -- stamps this in
+            ``_execute``; :meth:`AgentHarness.run` backfills the whole-run
+            elapsed only when it was left at zero.
         errors: Human-readable error or extraction-failure messages. **Empty**
             on a clean run; populated when a known-error path (subprocess
             failure, parse miss, timeout) is reached — never silently dropped.

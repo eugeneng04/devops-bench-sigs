@@ -573,6 +573,16 @@ def test_count_tool_calls_skips_malformed_entries() -> None:
     assert count_tool_calls([{"name": "a", "status": "error"}, "junk", None]) == (1, 1)
 
 
+def test_count_tool_calls_reports_none_when_every_entry_is_malformed() -> None:
+    """All-junk is the "not captured" case, not a run that made zero calls.
+
+    Skipping non-mappings can empty the list, and a confident 0 there would sink
+    a dashboard average on exactly the corrupted records the skip exists to
+    survive.
+    """
+    assert count_tool_calls(["junk", None]) == (None, None)
+
+
 def test_build_rows_counts_tools_from_the_trajectory() -> None:
     """The trajectory is too large to aggregate over at dashboard time.
 

@@ -251,10 +251,21 @@ class GeminiCliAgent(AgentHarness):
                     timeout=self.config.timeout_sec,
                 )
             except SubprocessError as exc:
-                return AgentResult.errored(
-                    f"gemini subprocess error: {exc}",
+                # The stream-json written before the kill is a valid prefix of
+                # the event stream, so the trajectory and tokens the run did
+                # manage are still parseable. Recovering them keeps a timed-out
+                # gemini row comparable with openclaw's and antigravity's,
+                # which also recover partial telemetry.
+                partial = parse_stream_json(exc.stdout or "")
+                return AgentResult(
+                    output=partial.output or f"Error: gemini subprocess error: {exc}",
+                    trajectory=partial.trajectory,
+                    tokens=partial.tokens,
                     latency=time.monotonic() - started,
+                    errors=[f"gemini subprocess error: {exc}", *partial.errors],
                     terminal_reason="timeout" if exc.timed_out else "error",
+                    tool_wait_sec=partial.tool_wait_sec,
+                    served_models=partial.served_models,
                 )
             except OSError as exc:
                 # Missing / non-executable binary; core.subprocess.run does not wrap.

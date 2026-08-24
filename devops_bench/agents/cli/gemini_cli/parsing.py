@@ -69,7 +69,9 @@ class StreamParse(NamedTuple):
         output: Concatenated assistant text.
         trajectory: ``ToolCall.to_dict()`` mappings, ordered as emitted.
         tokens: Canonical token buckets from the terminal ``result.stats``.
-        errors: Decode failures and unmatched ``tool_result`` events.
+        errors: Decode failures, unmatched ``tool_result`` events, and the
+            stream's own ``error`` events (e.g. a provider rate limit), which
+            can accompany an otherwise clean exit.
         tool_wait_sec: Wall-clock seconds inside tool calls, concurrent calls
             counted once; ``None`` when no call could be timed.
         served_models: Distinct model ids the CLI actually used, in first-seen
@@ -101,7 +103,7 @@ def parse_stream_json(stdout: str) -> StreamParse:
     | ``tool_use``    | ``tool_name``, ``tool_id``, ``parameters``, ``timestamp``|
     | ``tool_result`` | ``tool_id``, ``status``, ``timestamp`` (no payload)     |
     | ``error``       | recorded on the errors list                             |
-    | ``result``      | ``stats`` (token usage, ``models``); terminal status    |
+    | ``result``      | ``output``/``response``, ``stats`` (tokens, ``models``) |
 
     Args:
         stdout: Raw process stdout, possibly empty.

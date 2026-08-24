@@ -339,6 +339,31 @@ def test_execute_reports_a_timeout_apart_from_a_subprocess_failure(
     assert GeminiCliAgent(AgentConfig(target="gemini")).run("p").terminal_reason == "timeout"
 
 
+def test_execute_recovers_partial_telemetry_from_a_timed_out_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stdout written before the kill is a valid prefix of the event stream.
+
+    Discarding it blanks the counters on exactly the rows where how far the run
+    got is the question, and leaves gemini's timeout rows incomparable with the
+    other two CLI harnesses, which both recover partial telemetry.
+    """
+    partial = _stream(
+        {"type": "tool_use", "id": "c1", "name": "list_pods", "input": {}},
+        {"type": "tool_result", "tool_use_id": "c1", "content": "pod-a"},
+    )
+
+    def fake_run(argv, **kwargs):
+        raise SubprocessError(argv, returncode=-1, stdout=partial, stderr="", timed_out=True)
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    result = GeminiCliAgent(AgentConfig(target="gemini")).run("p")
+    assert result.terminal_reason == "timeout"
+    assert result.has_errors()
+    assert len(result.trajectory) == 1
+    assert result.trajectory[0]["name"] == "list_pods"
+
+
 def test_execute_handles_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(argv, **kwargs):
         raise OSError("not found")

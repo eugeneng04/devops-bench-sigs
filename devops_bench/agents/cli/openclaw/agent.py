@@ -470,24 +470,34 @@ class OpenClawAgent(AgentHarness):
                     check=False,
                     timeout=self.config.timeout_sec,
                 )
-            except SubprocessError:
-                # With check=False the only SubprocessError here is a timeout.
-                return AgentResult.errored(
-                    f"oc agent timed out after {self.config.timeout_sec}s",
-                    latency=time.monotonic() - started,
-                    terminal_reason="timeout",
-                )
+            except SubprocessError as exc:
+                # Deliberately no early return. The kill ends the agent turn,
+                # but the session it wrote survives in ``OPENCLAW_STATE_DIR``
+                # and export-trajectory is a separate subprocess, so the tokens
+                # and tool calls it managed before the budget hit are still
+                # recoverable -- and a timed-out row is exactly where "how far
+                # did it get" is worth knowing. Antigravity recovers its
+                # transcript the same way.
+                completed, timed_out, agent_stdout = None, exc.timed_out, exc.stdout
             except OSError as exc:
                 return AgentResult.errored(
                     f"oc binary unavailable: {exc}", latency=time.monotonic() - started
                 )
+            else:
+                timed_out, agent_stdout = False, completed.stdout
             agent_sec = time.monotonic() - started
 
-            stdout_text = _strip_ansi(completed.stdout or "")
+            stdout_text = _strip_ansi(agent_stdout or "")
             errors: list[str] = []
             metadata: dict = {}
 
-            if completed.returncode != 0:
+            if completed is None:
+                errors.append(
+                    f"oc agent timed out after {self.config.timeout_sec}s"
+                    if timed_out
+                    else "oc agent subprocess failed before returning"
+                )
+            elif completed.returncode != 0:
                 stderr = (completed.stderr or "").strip()
                 errors.append(f"oc agent exited {completed.returncode}: {stderr or '<no stderr>'}")
                 metadata["returncode"] = completed.returncode
@@ -497,6 +507,13 @@ class OpenClawAgent(AgentHarness):
 
         # Bundle text is clean; bash stdout carries debug noise — fall back only if empty.
         output = export.output if export.output else stdout_text
+        if not output and errors:
+            output = f"Error: {errors[0]}"
+
+        if completed is None:
+            reason = "timeout" if timed_out else "error"
+        else:
+            reason = "error" if completed.returncode != 0 else "completed"
 
         return AgentResult(
             output=output,
@@ -507,7 +524,7 @@ class OpenClawAgent(AgentHarness):
             # ``oc``'s own turn cap is invisible from outside the process, so
             # a capped run lands in "completed". A failed trajectory export is
             # not a reason the *agent* stopped, so it does not change this.
-            terminal_reason="error" if completed.returncode != 0 else "completed",
+            terminal_reason=reason,
             tool_wait_sec=export.tool_wait_sec,
             served_models=export.served_models,
             model_turns=export.model_turns,
