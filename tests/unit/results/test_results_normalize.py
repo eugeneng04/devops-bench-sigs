@@ -270,6 +270,7 @@ def test_build_rows_success_record():
         "totalTokens": None,
         "status": "success",
         "terminalReason": "completed",
+        "timeoutSec": None,
         "validated": False,
     }
 
@@ -432,6 +433,7 @@ def test_result_row_keys_match_typescript_interface():
         "cacheWriteTokens",
         "totalTokens",
         "terminalReason",
+        "timeoutSec",
         "validated",
     }
     row = build_rows(
@@ -450,7 +452,26 @@ def test_manifest_to_dict_keys():
         "model",
         "harness",
         "augmentation",
+        "timeoutSec",
     }
+
+
+def test_build_rows_carries_the_run_timeout_onto_every_row():
+    """The wall-clock budget rides on the row, not just the manifest.
+
+    Ingest uploads ``rows.json`` alone and never reads ``manifest.json``, so a
+    run-level setting that stays on the manifest never reaches the dashboard.
+    Without it, "timed out" cannot be told from "finished with room to spare".
+    """
+    manifest = _manifest().model_copy(update={"timeout_sec": 900.0})
+    rows = build_rows(
+        [
+            {"name": "a", "folder": "a", "status": "success"},
+            {"name": "b", "folder": "b", "status": "failed"},
+        ],
+        manifest,
+    )
+    assert [row.to_dict()["timeoutSec"] for row in rows] == [900.0, 900.0]
 
 
 def test_build_rows_propagates_validated():

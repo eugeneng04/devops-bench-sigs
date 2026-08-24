@@ -63,6 +63,10 @@ class Manifest(BaseModel):
             ``api``).
         augmentation: Capability tokens active for the run (e.g.
             ``["mcp", "skills"]``); an empty list denotes the baseline arm.
+        timeout_sec: The per-task wall-clock budget the agent ran under, or
+            ``None`` when uncapped. "Timed out" and "used 90% of its budget"
+            are both uninterpretable without it, and the budget is a run
+            setting that no row can recover after the fact.
     """
 
     model_config = _MODEL_CONFIG
@@ -74,6 +78,7 @@ class Manifest(BaseModel):
     model: str
     harness: str
     augmentation: list[str]
+    timeout_sec: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-serializable mapping written to ``manifest.json``."""
@@ -146,6 +151,11 @@ class ResultRow(BaseModel):
             ``"timeout"``, ``"error"``, or ``""`` when unreported. Distinct
             from ``status``, which describes the record: a run the harness
             killed at its wall-clock budget still reads ``status: "success"``.
+        timeout_sec: The wall-clock budget this iteration ran under; matches
+            :attr:`Manifest.timeout_sec`. Carried on the row because ingest
+            uploads ``rows.json`` alone — the manifest is never read — so a
+            run-level setting only reaches the dashboard by riding along.
+            ``None`` when uncapped.
         validated: Whether the task is vetted as correct and eligible for the
             leaderboard; ingest gates promotion on this (default ``False``).
     """
@@ -178,6 +188,7 @@ class ResultRow(BaseModel):
     total_tokens: int | None = None
     status: str
     terminal_reason: str = ""
+    timeout_sec: float | None = None
     validated: bool = False
 
     def to_dict(self) -> dict[str, Any]:
