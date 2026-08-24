@@ -391,6 +391,7 @@ def test_agy_cli_agent_execute_flow(mock_run, mock_home, tmp_path):
     )
     assert len(result.trajectory) == 2
     assert result.errors == []
+    assert result.terminal_reason == "completed"
     assert mock_run.called
 
     # Verify argv
@@ -447,7 +448,36 @@ def test_agy_cli_agent_execute_flow_nonzero_exit_records_error_and_metadata(
 
     assert result.errors == ["agy exited 1: boom"]
     assert result.metadata["returncode"] == 1
+    assert result.terminal_reason == "error"
     # The transcript was still recovered even though the run failed.
+    assert "Cluster-a is running v1.30" in result.output
+
+
+@mock.patch.object(pathlib.Path, "home")
+@mock.patch.object(devops_subprocess, "run")
+def test_agy_cli_agent_execute_flow_timeout_reports_timeout_not_error(
+    mock_run, mock_home, tmp_path
+):
+    """A killed run still recovers its partial transcript, so ``errors`` alone
+    cannot say whether agy failed or simply ran past the budget."""
+    mock_home.return_value = tmp_path
+
+    def side_effect(*args, **kwargs):
+        _write_sample_transcript(kwargs.get("cwd") or tmp_path)
+        raise SubprocessError(["agy"], returncode=-1, stdout="", stderr="", timed_out=True)
+
+    mock_run.side_effect = side_effect
+
+    config = agents_config.AgentConfig(
+        target="/bin/agy",
+        model="gemini-3.5-flash",
+        capabilities=capabilities.AllCapabilities(),
+    )
+    result = agy_mod.AgyCliAgent(config)._execute("run task")
+
+    assert result.terminal_reason == "timeout"
+    assert result.has_errors()
+    # The partial transcript survived the kill.
     assert "Cluster-a is running v1.30" in result.output
 
 

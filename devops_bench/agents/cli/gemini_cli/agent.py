@@ -249,7 +249,10 @@ class GeminiCliAgent(AgentHarness):
                     timeout=self.config.timeout_sec,
                 )
             except SubprocessError as exc:
-                return AgentResult.errored(f"gemini subprocess error: {exc}")
+                return AgentResult.errored(
+                    f"gemini subprocess error: {exc}",
+                    terminal_reason="timeout" if exc.timed_out else "error",
+                )
             except OSError as exc:
                 # Missing / non-executable binary; core.subprocess.run does not wrap.
                 return AgentResult.errored(f"gemini binary unavailable: {exc}")
@@ -269,5 +272,8 @@ class GeminiCliAgent(AgentHarness):
             trajectory=trajectory,
             tokens=tokens,
             errors=errors,
+            # The CLI's own turn cap is invisible from outside the process,
+            # so a capped run lands in "completed".
+            terminal_reason="error" if completed.returncode != 0 else "completed",
             metadata=metadata,
         )

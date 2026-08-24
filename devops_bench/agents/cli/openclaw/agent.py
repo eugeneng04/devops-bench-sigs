@@ -469,7 +469,10 @@ class OpenClawAgent(AgentHarness):
                 )
             except SubprocessError:
                 # With check=False the only SubprocessError here is a timeout.
-                return AgentResult.errored(f"oc agent timed out after {self.config.timeout_sec}s")
+                return AgentResult.errored(
+                    f"oc agent timed out after {self.config.timeout_sec}s",
+                    terminal_reason="timeout",
+                )
             except OSError as exc:
                 return AgentResult.errored(f"oc binary unavailable: {exc}")
 
@@ -495,6 +498,10 @@ class OpenClawAgent(AgentHarness):
             trajectory=trajectory,
             tokens=tokens,
             errors=errors,
+            # ``oc``'s own turn cap is invisible from outside the process, so
+            # a capped run lands in "completed". A failed trajectory export is
+            # not a reason the *agent* stopped, so it does not change this.
+            terminal_reason="error" if completed.returncode != 0 else "completed",
             metadata=metadata,
         )
 

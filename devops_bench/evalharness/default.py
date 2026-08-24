@@ -942,6 +942,7 @@ class DefaultEvalHarness(Harness):
                     task.validated and not agent_errors and bool(dumped.get("trajectory"))
                 ),
                 "errors": agent_errors,
+                "terminal_reason": dumped.get("terminal_reason", ""),
                 # First-error scalar so a parser reading ``error`` finds the
                 # same key on the success shape (None when nothing went wrong).
                 "error": agent_errors[0] if agent_errors else None,
@@ -1048,6 +1049,10 @@ class DefaultEvalHarness(Harness):
             "status": "",
             "error": None,
             "errors": [],
+            # Why the agent stopped (see ``agents.result.TERMINAL_REASONS``).
+            # Empty on a failed record: the harness never got far enough to
+            # observe the agent's own ending.
+            "terminal_reason": "",
             # ``scores`` (the per-metric mapping) is populated by ``_score`` for
             # success records; failed records leave it as the empty dict so the
             # key is always present. There is no aggregate scalar score: the

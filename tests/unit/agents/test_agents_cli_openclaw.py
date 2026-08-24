@@ -357,6 +357,7 @@ def test_execute_happy_path_emits_canonical_trajectory(
     agent = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=30.0))
     result = agent.run("audit pods in default")
     assert result.errors == []
+    assert result.terminal_reason == "completed"
     assert len(result.trajectory) == 2
     assert result.trajectory[0]["name"] == "kubectl_get_pods"
     assert result.tokens == {"input": 5, "output": 10, "total": 15}
@@ -451,6 +452,7 @@ def test_execute_records_bash_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path:
     assert result.has_errors()
     assert "timed out" in result.errors[0]
     assert result.trajectory == []
+    assert result.terminal_reason == "timeout"
 
 
 def test_execute_passes_timeout_to_bash(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

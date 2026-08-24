@@ -167,6 +167,7 @@ def test_build_rows_success_record():
         "status": "success",
         "latency": 42.5,
         "tokens": {"prompt_tokens": 100, "candidates_tokens": 20},
+        "terminal_reason": "completed",
         "scores": {
             OUTCOME_SCORE_KEY: {"score": 0.9, "success": True, "reason": "ok"},
             TOOL_SCORE_KEY: {"score": 0.7, "success": True, "reason": "ok"},
@@ -201,8 +202,31 @@ def test_build_rows_success_record():
         "cacheWriteTokens": None,
         "totalTokens": None,
         "status": "success",
+        "terminalReason": "completed",
         "validated": False,
     }
+
+
+def test_build_rows_defaults_terminal_reason_for_records_that_omit_it() -> None:
+    """Records written before the field existed read as unreported, not clean.
+
+    ``""`` must not collapse to ``"completed"`` — an old row cannot claim the
+    agent finished on its own when nothing recorded that it did.
+    """
+    rows = build_rows([{"name": "n", "folder": "f", "status": "success"}], _manifest())
+    assert rows[0].terminal_reason == ""
+
+
+def test_build_rows_carries_a_cut_off_run_through_as_success() -> None:
+    """A cut-off run still reads ``status: "success"`` — that is the point.
+
+    The record status describes the harness, not the agent, so
+    ``terminal_reason`` is the only thing separating "the harness killed it"
+    from "it answered badly".
+    """
+    record = {"name": "n", "folder": "f", "status": "success", "terminal_reason": "timeout"}
+    row = build_rows([record], _manifest())[0]
+    assert (row.status, row.terminal_reason) == ("success", "timeout")
 
 
 def test_build_rows_maps_all_v1_score_components() -> None:
@@ -338,6 +362,7 @@ def test_result_row_keys_match_typescript_interface():
         "reasoningTokens",
         "cacheWriteTokens",
         "totalTokens",
+        "terminalReason",
         "validated",
     }
     row = build_rows(

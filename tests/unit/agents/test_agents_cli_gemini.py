@@ -206,6 +206,7 @@ def test_execute_returns_typed_result_with_trajectory(monkeypatch: pytest.Monkey
     assert result.output == "Done."
     assert len(result.trajectory) == 2
     assert result.errors == []
+    assert result.terminal_reason == "completed"
     assert result.tokens == {"prompt_token_count": 10, "candidates_token_count": 20}
     assert captured["timeout"] == 30.0
     assert captured["argv"][0].endswith("gemini-x")
@@ -223,17 +224,35 @@ def test_execute_records_non_zero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.has_errors()
     assert any("exited 2" in e for e in result.errors)
     assert result.metadata.get("returncode") == 2
+    assert result.terminal_reason == "error"
 
 
 def test_execute_handles_subprocess_error(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(argv, **kwargs):
-        raise SubprocessError(argv, returncode=-1, stdout="", stderr="timeout")
+        raise SubprocessError(argv, returncode=-1, stdout="", stderr="failed")
 
     monkeypatch.setattr(gemini_mod, "run", fake_run)
     result = GeminiCliAgent(AgentConfig(target="gemini")).run("p")
     assert result.has_errors()
     assert "subprocess error" in result.errors[0]
     assert result.trajectory == []
+    assert result.terminal_reason == "error"
+
+
+def test_execute_reports_a_timeout_apart_from_a_subprocess_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both arrive as SubprocessError with returncode -1; only the flag differs.
+
+    A model that ran out of wall clock and one whose CLI crashed are the same
+    row otherwise, and they mean opposite things about the model.
+    """
+
+    def fake_run(argv, **kwargs):
+        raise SubprocessError(argv, returncode=-1, stdout="", stderr="", timed_out=True)
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    assert GeminiCliAgent(AgentConfig(target="gemini")).run("p").terminal_reason == "timeout"
 
 
 def test_execute_handles_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
