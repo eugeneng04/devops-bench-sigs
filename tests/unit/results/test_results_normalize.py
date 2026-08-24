@@ -568,6 +568,21 @@ def test_count_tool_calls_reports_none_when_no_trajectory_was_captured() -> None
     assert count_tool_calls("not a list") == (None, None)
 
 
+def test_count_tool_calls_ignores_interleaved_text_turns() -> None:
+    """``AgentResult`` lets an API agent interleave text turns with tool calls.
+
+    A text turn is a mapping too, so counting entries rather than tool calls
+    would inflate ``toolCalls`` on exactly the harness the column is meant to
+    compare against the CLI ones.
+    """
+    trajectory = [
+        {"name": "a", "status": "completed"},
+        {"role": "assistant", "text": "thinking about it"},
+        {"name": "b", "status": "error"},
+    ]
+    assert count_tool_calls(trajectory) == (2, 1)
+
+
 def test_count_tool_calls_skips_malformed_entries() -> None:
     """A malformed entry should lose a count, not raise and kill the run."""
     assert count_tool_calls([{"name": "a", "status": "error"}, "junk", None]) == (1, 1)

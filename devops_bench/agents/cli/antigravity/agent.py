@@ -315,12 +315,15 @@ class AgyCliAgent(base.AgentHarness):
                     latency=time.monotonic() - started,
                 )
             finally:
+                # Stamp the span before cleanup: unlinking the token is harness
+                # work, not agent work, so a slow filesystem would otherwise
+                # land in the number this column exists to make comparable.
+                agent_sec = time.monotonic() - started
                 # agy only needs the token while running. Remove the copy once it
                 # exits so the live credential never lingers in a workspace that
                 # is deliberately retained for artifact collection.
                 if copied_token is not None:
                     copied_token.unlink(missing_ok=True)
-            agent_sec = time.monotonic() - started
 
             # All logs and conversations land under agy_config_dir since we
             # passed --gemini_dir.

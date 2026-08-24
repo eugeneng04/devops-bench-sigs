@@ -183,7 +183,7 @@ A flattened view, one row per setup × task × run × iteration, defined in [`ro
 | `toolWaitSec` | How much of `latencySec` was spent waiting on tools, concurrent calls counted once. Without it a cold cluster and a slow model are the same number. |
 | `servedModel` | The model that actually answered, which is not always the one requested. More than one comma-joined entry means the provider failed over mid-run. |
 
-Token buckets are `inputTokens`, `cachedTokens`, `cacheWriteTokens`, `reasoningTokens`, `outputTokens` and `totalTokens`, where the total is the sum of the rest. A bucket the harness did not report is `null`, never `0`.
+Token buckets are `inputTokens`, `cachedTokens`, `cacheWriteTokens`, `reasoningTokens`, `outputTokens` and `totalTokens`. On canonical telemetry the total is the sum of the rest; totals are read from the record and never recomputed, so a pre-canonical row can carry a total that excludes cached or reasoning tokens. A bucket the harness did not report is `null`, never `0`.
 
 Four things are deliberate here:
 

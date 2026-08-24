@@ -292,9 +292,12 @@ def _scoring_version(scores: Mapping[str, Any] | None) -> str:
 def count_tool_calls(trajectory: Any) -> tuple[int | None, int | None]:
     """Return ``(tool_calls, tool_errors)`` for a record's trajectory.
 
-    Every trajectory entry is a ``ToolCall.to_dict()`` mapping, so the entry
-    count is the call count. Entries that are not mappings are skipped rather
-    than raising — a malformed record should lose a count, not a whole run.
+    Only ``ToolCall.to_dict()`` entries count, recognised by a string ``name``.
+    Every harness emits nothing else today, but :class:`AgentResult` documents
+    its trajectory as tool calls "optionally interleaved with text turns by API
+    agents", and a text turn is a mapping too — counting one would inflate the
+    column. Entries that are not mappings are skipped rather than raising: a
+    malformed record should lose a count, not a whole run.
 
     Only ``status == "error"`` counts as an error. ``called`` and
     ``interrupted`` are the same condition — a call the parser never saw
@@ -304,14 +307,19 @@ def count_tool_calls(trajectory: Any) -> tuple[int | None, int | None]:
     An empty or non-list trajectory yields ``(None, None)``. A trajectory
     export can fail (see the early returns in the openclaw harness), and a
     zero that means "not captured" would sink a dashboard average. A trajectory
-    holding nothing but non-mappings is the same case, not a genuine zero.
+    holding no tool calls at all is the same case, not a genuine zero — the
+    harness agrees, marking such a record ``validated=False``.
     """
     if not isinstance(trajectory, list) or not trajectory:
         return None, None
-    entries = [entry for entry in trajectory if isinstance(entry, Mapping)]
-    if not entries:
+    calls = [
+        entry
+        for entry in trajectory
+        if isinstance(entry, Mapping) and isinstance(entry.get("name"), str)
+    ]
+    if not calls:
         return None, None
-    return len(entries), sum(1 for entry in entries if entry.get("status") == "error")
+    return len(calls), sum(1 for entry in calls if entry.get("status") == "error")
 
 
 def _served_model(value: Any) -> str:

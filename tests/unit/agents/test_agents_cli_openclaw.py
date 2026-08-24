@@ -725,11 +725,14 @@ def test_timeout_result_carries_the_elapsed_agent_time(
 
     def fake_bash(cmd, **kwargs):
         clock.now += 7.0
-        raise SubprocessError(["/bin/bash", "-c", cmd], returncode=-1, stdout="", stderr="")
+        raise SubprocessError(
+            ["/bin/bash", "-c", cmd], returncode=-1, stdout="", stderr="", timed_out=True
+        )
 
     _install_oc_run(monkeypatch, fake_bash)
     result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=7.0)).run("p")
     assert result.latency == 7.0
+    assert result.terminal_reason == "timeout"
 
 
 # Tests for the now-deleted legacy surface — fail-fast if SSH transport returns.
