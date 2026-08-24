@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from typing import NamedTuple
 
 from devops_bench.agents.result import ToolCall, empty_tokens
+from devops_bench.agents.shared.timing import merged_span_sec, parse_event_time
 
-__all__: list[str] = ["parse_stream_json"]
+__all__: list[str] = ["StreamParse", "parse_stream_json"]
 
 
 def _int_or_none(value: object) -> int | None:
@@ -60,7 +62,26 @@ def _canonical_tokens(stats: Mapping[str, object]) -> dict[str, int | None]:
     return tokens
 
 
-def parse_stream_json(stdout: str) -> tuple[str, list[dict], dict, list[str]]:
+class StreamParse(NamedTuple):
+    """What one ``--output-format stream-json`` stdout stream yielded.
+
+    Attributes:
+        output: Concatenated assistant text.
+        trajectory: ``ToolCall.to_dict()`` mappings, ordered as emitted.
+        tokens: Canonical token buckets from the terminal ``result.stats``.
+        errors: Decode failures and unmatched ``tool_result`` events.
+        tool_wait_sec: Wall-clock seconds inside tool calls, concurrent calls
+            counted once; ``None`` when no call could be timed.
+    """
+
+    output: str
+    trajectory: list[dict]
+    tokens: dict
+    errors: list[str]
+    tool_wait_sec: float | None
+
+
+def parse_stream_json(stdout: str) -> StreamParse:
     """Parse a Gemini ``--output-format stream-json`` stdout stream.
 
     The stream is newline-delimited JSON events. The parser is intentionally
@@ -72,8 +93,8 @@ def parse_stream_json(stdout: str) -> tuple[str, list[dict], dict, list[str]]:
     |-----------------|---------------------------------------------------------|
     | ``init``        | (ignored)                                               |
     | ``message``     | ``role`` (assistant text accumulated into the output)   |
-    | ``tool_use``    | ``tool_name``, ``tool_id``, ``parameters``              |
-    | ``tool_result`` | ``tool_id``, ``status`` (no payload in the stream)      |
+    | ``tool_use``    | ``tool_name``, ``tool_id``, ``parameters``, ``timestamp``|
+    | ``tool_result`` | ``tool_id``, ``status``, ``timestamp`` (no payload)     |
     | ``error``       | recorded on the errors list                             |
     | ``result``      | ``stats`` (token usage); terminal status                |
 
@@ -81,14 +102,18 @@ def parse_stream_json(stdout: str) -> tuple[str, list[dict], dict, list[str]]:
         stdout: Raw process stdout, possibly empty.
 
     Returns:
-        A ``(output, trajectory, tokens, errors)`` tuple. ``trajectory`` is a
-        list of ``ToolCall.to_dict()`` mappings ordered as emitted.
+        A :class:`StreamParse`. Every event carries a ``timestamp``, so pairing
+        ``tool_use`` with its ``tool_result`` gives each call a real duration
+        and the run a total tool wait -- without which a slow cluster and a slow
+        model are the same number on the leaderboard.
     """
     output_parts: list[str] = []
     tokens: dict = {}
     errors: list[str] = []
     pending: dict[str, ToolCall] = {}
     trajectory: list[ToolCall] = []
+    started_at: dict[str, float] = {}
+    spans: list[tuple[float, float]] = []
 
     for lineno, raw in enumerate(stdout.splitlines(), start=1):
         line = raw.strip()
@@ -103,6 +128,7 @@ def parse_stream_json(stdout: str) -> tuple[str, list[dict], dict, list[str]]:
             continue
 
         etype = event.get("type")
+        event_time = parse_event_time(event.get("timestamp"))
         if etype == "message":
             # ``role="user"`` echoes the prompt and is skipped.
             if event.get("role") in ("assistant", "model"):
@@ -129,6 +155,8 @@ def parse_stream_json(stdout: str) -> tuple[str, list[dict], dict, list[str]]:
             trajectory.append(call)
             if call_id:
                 pending[str(call_id)] = call
+                if event_time is not None:
+                    started_at[str(call_id)] = event_time
         elif etype == "tool_result":
             call_id = event.get("tool_id") or event.get("tool_use_id") or event.get("id") or ""
             target = pending.pop(str(call_id), None) if call_id else None
@@ -147,6 +175,9 @@ def parse_stream_json(stdout: str) -> tuple[str, list[dict], dict, list[str]]:
             status = str(event.get("status", "")).lower()
             failed = bool(event.get("is_error")) or status in ("error", "failed", "failure")
             target.status = "error" if failed else "completed"
+            start = started_at.pop(str(call_id), None)
+            if start is not None and event_time is not None and event_time >= start:
+                spans.append((start, event_time))
         elif etype == "error":
             msg = event.get("message") or event.get("error") or str(event)
             errors.append(f"stream-json error event: {msg}")
@@ -164,4 +195,10 @@ def parse_stream_json(stdout: str) -> tuple[str, list[dict], dict, list[str]]:
             elif isinstance(usage, dict):
                 tokens = usage
 
-    return "".join(output_parts), [call.to_dict() for call in trajectory], tokens, errors
+    return StreamParse(
+        output="".join(output_parts),
+        trajectory=[call.to_dict() for call in trajectory],
+        tokens=tokens,
+        errors=errors,
+        tool_wait_sec=merged_span_sec(spans),
+    )

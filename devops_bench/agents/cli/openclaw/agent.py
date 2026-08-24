@@ -508,6 +508,7 @@ class OpenClawAgent(AgentHarness):
             # a capped run lands in "completed". A failed trajectory export is
             # not a reason the *agent* stopped, so it does not change this.
             terminal_reason="error" if completed.returncode != 0 else "completed",
+            tool_wait_sec=export.tool_wait_sec,
             model_turns=export.model_turns,
             metadata=metadata,
         )

@@ -100,6 +100,10 @@ class AgentResult:
             A run cut off at the turn cap or the wall-clock budget scores like a
             wrong answer, so without this an efficiency ceiling reads as a
             capability failure.
+        tool_wait_sec: Wall-clock seconds the run spent inside tool calls, with
+            concurrent calls counted once, or ``None`` when the transcript
+            carried no timings. ``latency`` alone cannot separate a slow model
+            from a slow environment, and the leaderboard ranks on latency.
         model_turns: How many times the model was called, or ``None`` when the
             harness cannot tell. Distinct from ``len(trajectory)``: one model
             turn can issue several tool calls at once, and a turn that only
@@ -115,6 +119,7 @@ class AgentResult:
     latency: float = 0.0
     errors: list[str] = field(default_factory=list)
     terminal_reason: str = ""
+    tool_wait_sec: float | None = None
     model_turns: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -137,6 +142,7 @@ class AgentResult:
             "latency": self.latency,
             "errors": list(self.errors),
             "terminal_reason": self.terminal_reason,
+            "tool_wait_sec": self.tool_wait_sec,
             "model_turns": self.model_turns,
             "metadata": dict(self.metadata),
         }

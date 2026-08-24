@@ -136,6 +136,11 @@ class ResultRow(BaseModel):
             cannot delimit them. Not ``tool_calls``: one turn can issue several
             tool calls, and a text-only turn issues none.
         latency_sec: Agent wall-clock seconds for the iteration.
+        tool_wait_sec: How much of ``latency_sec`` was spent waiting on tool
+            calls, with concurrent calls counted once, or ``None`` when the
+            harness reported no timings. Without it a run against a cold
+            cluster and a genuinely slow model are the same number on a
+            leaderboard that ranks latency lower-is-better.
         input_tokens: Non-cached prompt token count, or ``None`` when
             unreported. (Historical records that predate the canonical token
             schema may include cached tokens here.)
@@ -184,6 +189,7 @@ class ResultRow(BaseModel):
     tool_errors: int | None = None
     model_turns: int | None = None
     latency_sec: float
+    tool_wait_sec: float | None = None
     input_tokens: int | None
     output_tokens: int | None
     cached_tokens: int | None = None

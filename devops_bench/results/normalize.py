@@ -308,6 +308,19 @@ def count_tool_calls(trajectory: Any) -> tuple[int | None, int | None]:
     return len(entries), sum(1 for entry in entries if entry.get("status") == "error")
 
 
+def _non_negative_float_or_none(value: Any) -> float | None:
+    """Coerce a recorded duration to a non-negative ``float``, else ``None``.
+
+    Unlike a count, ``0.0`` is a real measurement here -- tools that returned
+    inside the transcript's millisecond resolution -- so only a missing,
+    non-numeric, or negative value becomes ``None``. Booleans are rejected
+    because ``True`` is a ``float``-comparable ``int`` in Python.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if value >= 0 else None
+
+
 def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list[ResultRow]:
     """Flatten harness result records into :class:`ResultRow` rows for one run.
 
@@ -352,6 +365,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 tool_calls=tool_calls,
                 tool_errors=tool_errors,
                 model_turns=turns if turns > 0 else None,
+                tool_wait_sec=_non_negative_float_or_none(record.get("tool_wait_sec")),
                 latency_sec=float(record.get("latency") or 0.0),
                 input_tokens=tokens.input,
                 output_tokens=tokens.output,
