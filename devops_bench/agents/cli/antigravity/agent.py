@@ -396,10 +396,20 @@ class AgyCliAgent(base.AgentHarness):
         if not output and completed is not None and completed.stdout:
             output = completed.stdout.strip()
 
+        if timeout_exc is not None:
+            terminal_reason = "timeout" if timeout_exc.timed_out else "error"
+        elif completed.returncode != 0:
+            terminal_reason = "error"
+        else:
+            # agy's own turn cap is invisible from outside the process, so a
+            # capped run lands here.
+            terminal_reason = "completed"
+
         return agents_result.AgentResult(
             output=output,
             trajectory=trajectory,
             tokens=tokens,
             errors=errors,
+            terminal_reason=terminal_reason,
             metadata=metadata,
         )

@@ -319,6 +319,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 cache_write_tokens=tokens.cache_write,
                 total_tokens=tokens.total,
                 status=record.get("status", "") or "",
+                terminal_reason=record.get("terminal_reason", "") or "",
                 validated=bool(record.get("validated", False)),
             )
         )

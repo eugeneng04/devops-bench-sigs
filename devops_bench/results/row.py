@@ -134,6 +134,10 @@ class ResultRow(BaseModel):
         total_tokens: Provider-reported or bucket-sum total, or ``None`` when
             unreported. Semantics vary for pre-canonical records.
         status: Terminal record status, ``"success"`` or ``"failed"``.
+        terminal_reason: Why the *agent* stopped — ``"completed"``,
+            ``"timeout"``, ``"error"``, or ``""`` when unreported. Distinct
+            from ``status``, which describes the record: a run the harness
+            killed at its wall-clock budget still reads ``status: "success"``.
         validated: Whether the task is vetted as correct and eligible for the
             leaderboard; ingest gates promotion on this (default ``False``).
     """
@@ -163,6 +167,7 @@ class ResultRow(BaseModel):
     cache_write_tokens: int | None = None
     total_tokens: int | None = None
     status: str
+    terminal_reason: str = ""
     validated: bool = False
 
     def to_dict(self) -> dict[str, Any]:

@@ -14,7 +14,7 @@
 
 """Unit tests for devops_bench.agents.result."""
 
-from devops_bench.agents.result import AgentResult, ToolCall
+from devops_bench.agents.result import TERMINAL_REASONS, AgentResult, ToolCall
 
 
 def test_tool_call_to_dict_round_trip() -> None:
@@ -40,6 +40,9 @@ def test_agent_result_defaults_to_empty_collections() -> None:
     assert result.metadata == {}
     assert result.latency == 0.0
     assert not result.has_errors()
+    # Unreported, not "finished cleanly" — a harness that has not been taught
+    # to set this must not be read as having observed a clean ending.
+    assert result.terminal_reason == ""
 
 
 def test_agent_result_to_dict_is_serializable_copies() -> None:
@@ -50,6 +53,7 @@ def test_agent_result_to_dict_is_serializable_copies() -> None:
         tokens={"prompt": 1},
         latency=2.5,
         errors=["x"],
+        terminal_reason="completed",
         metadata={"k": 1},
     )
     out = result.to_dict()
@@ -59,6 +63,7 @@ def test_agent_result_to_dict_is_serializable_copies() -> None:
         "tokens": {"prompt": 1},
         "latency": 2.5,
         "errors": ["x"],
+        "terminal_reason": "completed",
         "metadata": {"k": 1},
     }
     # to_dict must hand the harness fresh containers so mutating the snapshot
@@ -80,6 +85,23 @@ def test_agent_result_errored_classmethod_populates_errors() -> None:
     assert result.errors == ["boom"]
     assert result.latency == 1.25
     assert result.has_errors()
+    assert result.terminal_reason == "error"
+
+
+def test_agent_result_errored_can_report_a_timeout_instead() -> None:
+    """A run the harness cut off at its budget is not the agent failing.
+
+    Both populate ``errors``, so ``errors`` alone cannot tell a slow model from
+    a broken one.
+    """
+    result = AgentResult.errored("timed out after 600s", terminal_reason="timeout")
+    assert result.terminal_reason == "timeout"
+    assert result.has_errors()
+
+
+def test_terminal_reasons_are_the_documented_set() -> None:
+    """Pinned so a harness cannot invent a value the dashboard will not group."""
+    assert TERMINAL_REASONS == ("", "completed", "timeout", "error")
 
 
 def test_agent_result_has_errors_is_false_on_clean_run() -> None:

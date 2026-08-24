@@ -19,12 +19,29 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__: list[str] = ["AgentResult", "TOKEN_BUCKETS", "ToolCall", "empty_tokens"]
+__all__: list[str] = [
+    "AgentResult",
+    "TERMINAL_REASONS",
+    "TOKEN_BUCKETS",
+    "ToolCall",
+    "empty_tokens",
+]
 
 # Canonical token buckets every harness maps onto: ``input`` is the non-cached
 # prompt, ``cached`` is cache-read only (cache writes go in ``cache_write``),
 # ``output`` excludes ``reasoning``, and ``total`` is the sum of all buckets.
 TOKEN_BUCKETS: tuple[str, ...] = ("input", "cached", "cache_write", "reasoning", "output", "total")
+
+#: Why an agent run stopped, as the *harness* observed it.
+#:
+#: - ``completed``: the agent handed control back on its own. A CLI agent's own
+#:   internal turn cap is invisible from outside the process, so a capped run
+#:   lands here too.
+#: - ``timeout``: the harness's wall-clock budget aborted the run.
+#: - ``error``: the run failed (subprocess fault, provider error, crash).
+#: - ``""``: not reported. Kept distinct from ``completed`` so a harness that
+#:   has not been taught to set this is not read as having finished cleanly.
+TERMINAL_REASONS: tuple[str, ...] = ("", "completed", "timeout", "error")
 
 
 def empty_tokens() -> dict[str, int | None]:
@@ -76,6 +93,10 @@ class AgentResult:
         errors: Human-readable error or extraction-failure messages. **Empty**
             on a clean run; populated when a known-error path (subprocess
             failure, parse miss, timeout) is reached — never silently dropped.
+        terminal_reason: Why the run stopped; one of :data:`TERMINAL_REASONS`.
+            A run cut off at the turn cap or the wall-clock budget scores like a
+            wrong answer, so without this an efficiency ceiling reads as a
+            capability failure.
         metadata: Agent-specific extras (e.g. raw provider stats, session ids)
             that do not fit the typed fields above.
     """
@@ -85,6 +106,7 @@ class AgentResult:
     tokens: dict[str, Any] = field(default_factory=dict)
     latency: float = 0.0
     errors: list[str] = field(default_factory=list)
+    terminal_reason: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -105,6 +127,7 @@ class AgentResult:
             "tokens": dict(self.tokens),
             "latency": self.latency,
             "errors": list(self.errors),
+            "terminal_reason": self.terminal_reason,
             "metadata": dict(self.metadata),
         }
 
@@ -117,15 +140,26 @@ class AgentResult:
         return bool(self.errors)
 
     @classmethod
-    def errored(cls, msg: str, *, latency: float = 0.0) -> AgentResult:
+    def errored(
+        cls, msg: str, *, latency: float = 0.0, terminal_reason: str = "error"
+    ) -> AgentResult:
         """Build a result representing a failed run.
 
         Args:
             msg: Error message to surface on :attr:`errors` and ``output``.
             latency: Elapsed seconds before the failure, when available.
+            terminal_reason: Why the run stopped. Defaults to ``"error"``; pass
+                ``"timeout"`` when the harness cut the run off at its budget,
+                which is a different signal from the agent failing.
 
         Returns:
             An :class:`AgentResult` with empty trajectory and the message in
             both ``output`` and ``errors``.
         """
-        return cls(output=f"Error: {msg}", trajectory=[], latency=latency, errors=[msg])
+        return cls(
+            output=f"Error: {msg}",
+            trajectory=[],
+            latency=latency,
+            errors=[msg],
+            terminal_reason=terminal_reason,
+        )
