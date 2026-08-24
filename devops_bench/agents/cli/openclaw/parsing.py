@@ -122,6 +122,8 @@ class TrajectoryExport(NamedTuple):
             ``assistant.message`` events to count.
         tool_wait_sec: Wall-clock seconds inside tool calls, concurrent calls
             counted once; ``None`` when no call could be timed.
+        served_models: Distinct model ids the provider answered with, in
+            first-seen order.
     """
 
     trajectory: list[dict]
@@ -130,11 +132,12 @@ class TrajectoryExport(NamedTuple):
     errors: list[str]
     model_turns: int | None
     tool_wait_sec: float | None
+    served_models: list[str]
 
     @classmethod
     def empty(cls, errors: list[str]) -> TrajectoryExport:
         """Return an export that recovered nothing but ``errors``."""
-        return cls([], {}, "", errors, None, None)
+        return cls([], {}, "", errors, None, None, [])
 
 
 def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
@@ -150,6 +153,7 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
     - ``model.completed`` -> ``data.usage`` (tokens) + ``data.assistantTexts``
       (the agent's final answer)
     - ``assistant.message`` -> ``data.message.content[].text`` (fallback output)
+      + ``data.message.model``, the model that actually answered the call
       + ``data.message.usage.cacheWrite``, the only place cache-write tokens
       appear (``model.completed`` omits that one bucket)
 
@@ -184,6 +188,7 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
     model_turns = 0
     started_at: dict[str, float] = {}
     spans: list[tuple[float, float]] = []
+    served_models: list[str] = []
 
     for lineno, raw in enumerate(jsonl_text.splitlines(), start=1):
         line = raw.strip()
@@ -256,6 +261,9 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
         elif etype == "assistant.message":
             model_turns += 1
             msg = data.get("message") if isinstance(data.get("message"), dict) else {}
+            served = msg.get("model")
+            if isinstance(served, str) and served and served not in served_models:
+                served_models.append(served)
             _accumulate_cache_write(tokens, msg.get("usage"))
             txt = _join_text(msg.get("content"))
             if txt:
@@ -271,6 +279,7 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
         errors=errors,
         model_turns=model_turns or None,
         tool_wait_sec=merged_span_sec(spans),
+        served_models=served_models,
     )
 
 

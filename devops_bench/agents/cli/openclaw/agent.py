@@ -509,6 +509,7 @@ class OpenClawAgent(AgentHarness):
             # not a reason the *agent* stopped, so it does not change this.
             terminal_reason="error" if completed.returncode != 0 else "completed",
             tool_wait_sec=export.tool_wait_sec,
+            served_models=export.served_models,
             model_turns=export.model_turns,
             metadata=metadata,
         )

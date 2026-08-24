@@ -103,6 +103,36 @@ def test_parse_stream_json_emits_canonical_trajectory() -> None:
     ]
 
 
+def test_parse_stream_json_records_the_model_the_cli_resolved_to() -> None:
+    """The requested id can be an alias, so the row must carry what answered.
+
+    Both sources are read: ``init.model`` names the resolved id up front, and
+    ``result.stats.models`` is keyed per model so a mid-run switch appears as a
+    second key. A repeat across the two is not counted twice.
+    """
+    blob = "\n".join(
+        json.dumps(e)
+        for e in (
+            {"type": "init", "model": "gemini-3.5-flash"},
+            {
+                "type": "result",
+                "stats": {
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "total_tokens": 12,
+                    "models": {"gemini-3.5-flash": {}, "gemini-3.5-pro": {}},
+                },
+            },
+        )
+    )
+    assert parse_stream_json(blob).served_models == ["gemini-3.5-flash", "gemini-3.5-pro"]
+
+
+def test_parse_stream_json_leaves_served_models_empty_when_unreported() -> None:
+    blob = json.dumps({"type": "result", "stats": {"input_tokens": 1}})
+    assert parse_stream_json(blob).served_models == []
+
+
 def test_parse_stream_json_times_tools_and_merges_concurrent_calls() -> None:
     """Overlapping calls count once, so tool wait can never exceed the run.
 
@@ -190,6 +220,7 @@ def test_parse_stream_json_empty_input_returns_empty() -> None:
     assert parsed.tokens == {}
     assert parsed.errors == []
     assert parsed.tool_wait_sec is None
+    assert parsed.served_models == []
 
 
 def test_build_argv_disables_extensions_when_no_allowed_tools() -> None:

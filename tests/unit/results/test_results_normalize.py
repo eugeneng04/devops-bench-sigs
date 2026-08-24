@@ -271,6 +271,7 @@ def test_build_rows_success_record():
         "status": "success",
         "modelTurns": None,
         "toolWaitSec": None,
+        "servedModel": "",
         "terminalReason": "completed",
         "timeoutSec": None,
         "validated": False,
@@ -436,6 +437,7 @@ def test_result_row_keys_match_typescript_interface():
         "totalTokens",
         "modelTurns",
         "toolWaitSec",
+        "servedModel",
         "terminalReason",
         "timeoutSec",
         "validated",
@@ -612,6 +614,24 @@ def test_build_rows_carries_model_turns_separately_from_tool_calls() -> None:
     }
     row = build_rows([record], _manifest())[0]
     assert (row.model_turns, row.tool_calls) == (2, 3)
+
+
+def test_build_rows_joins_served_models_so_a_failover_stays_visible() -> None:
+    """``model`` is the requested id; a failover means it is not what ran.
+
+    Collapsing to the first entry would hide exactly the case the field exists
+    for, so both are kept.
+    """
+
+    def served(value):
+        record = {"name": "n", "folder": "f", "status": "success", "served_models": value}
+        return build_rows([record], _manifest())[0].served_model
+
+    assert served(["gemini-3-flash-preview"]) == "gemini-3-flash-preview"
+    assert served(["a", "b"]) == "a,b"
+    assert served([]) == ""
+    assert served(None) == ""
+    assert served("a") == ""
 
 
 def test_build_rows_keeps_a_zero_tool_wait_but_drops_a_missing_one() -> None:

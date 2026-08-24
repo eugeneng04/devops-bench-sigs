@@ -72,6 +72,10 @@ class StreamParse(NamedTuple):
         errors: Decode failures and unmatched ``tool_result`` events.
         tool_wait_sec: Wall-clock seconds inside tool calls, concurrent calls
             counted once; ``None`` when no call could be timed.
+        served_models: Distinct model ids the CLI actually used, in first-seen
+            order -- ``init.model`` plus every key of ``result.stats.models``,
+            since the requested id can be an alias (``gemini-3-flash`` resolved
+            to ``gemini-3-flash-preview`` in a live run).
     """
 
     output: str
@@ -79,6 +83,7 @@ class StreamParse(NamedTuple):
     tokens: dict
     errors: list[str]
     tool_wait_sec: float | None
+    served_models: list[str]
 
 
 def parse_stream_json(stdout: str) -> StreamParse:
@@ -91,12 +96,12 @@ def parse_stream_json(stdout: str) -> StreamParse:
 
     | Event type      | Fields read                                              |
     |-----------------|---------------------------------------------------------|
-    | ``init``        | (ignored)                                               |
+    | ``init``        | ``model`` (the id the CLI resolved to)                  |
     | ``message``     | ``role`` (assistant text accumulated into the output)   |
     | ``tool_use``    | ``tool_name``, ``tool_id``, ``parameters``, ``timestamp``|
     | ``tool_result`` | ``tool_id``, ``status``, ``timestamp`` (no payload)     |
     | ``error``       | recorded on the errors list                             |
-    | ``result``      | ``stats`` (token usage); terminal status                |
+    | ``result``      | ``stats`` (token usage, ``models``); terminal status    |
 
     Args:
         stdout: Raw process stdout, possibly empty.
@@ -114,6 +119,12 @@ def parse_stream_json(stdout: str) -> StreamParse:
     trajectory: list[ToolCall] = []
     started_at: dict[str, float] = {}
     spans: list[tuple[float, float]] = []
+    served_models: list[str] = []
+
+    def note_model(value: object) -> None:
+        if isinstance(value, str) and value and value not in served_models:
+            served_models.append(value)
+
 
     for lineno, raw in enumerate(stdout.splitlines(), start=1):
         line = raw.strip()
@@ -129,7 +140,9 @@ def parse_stream_json(stdout: str) -> StreamParse:
 
         etype = event.get("type")
         event_time = parse_event_time(event.get("timestamp"))
-        if etype == "message":
+        if etype == "init":
+            note_model(event.get("model"))
+        elif etype == "message":
             # ``role="user"`` echoes the prompt and is skipped.
             if event.get("role") in ("assistant", "model"):
                 content = event.get("content")
@@ -192,6 +205,12 @@ def parse_stream_json(stdout: str) -> StreamParse:
             usage = event.get("tokens") or event.get("usage")
             if isinstance(stats, dict):
                 tokens = _canonical_tokens(stats)
+                # ``stats.models`` is keyed by the model that served each slice
+                # of the usage, so a mid-run switch shows up as a second key.
+                per_model = stats.get("models")
+                if isinstance(per_model, Mapping):
+                    for name in per_model:
+                        note_model(name)
             elif isinstance(usage, dict):
                 tokens = usage
 
@@ -201,4 +220,5 @@ def parse_stream_json(stdout: str) -> StreamParse:
         tokens=tokens,
         errors=errors,
         tool_wait_sec=merged_span_sec(spans),
+        served_models=served_models,
     )

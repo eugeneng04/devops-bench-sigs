@@ -949,6 +949,7 @@ class DefaultEvalHarness(Harness):
                 "terminal_reason": dumped.get("terminal_reason", ""),
                 "model_turns": dumped.get("model_turns"),
                 "tool_wait_sec": dumped.get("tool_wait_sec"),
+                "served_models": dumped.get("served_models") or [],
                 # First-error scalar so a parser reading ``error`` finds the
                 # same key on the success shape (None when nothing went wrong).
                 "error": agent_errors[0] if agent_errors else None,
@@ -1063,6 +1064,7 @@ class DefaultEvalHarness(Harness):
             # record the harness never ran.
             "model_turns": None,
             "tool_wait_sec": None,
+            "served_models": [],
             # ``scores`` (the per-metric mapping) is populated by ``_score`` for
             # success records; failed records leave it as the empty dict so the
             # key is always present. There is no aggregate scalar score: the

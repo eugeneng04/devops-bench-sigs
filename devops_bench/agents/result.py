@@ -104,6 +104,12 @@ class AgentResult:
             concurrent calls counted once, or ``None`` when the transcript
             carried no timings. ``latency`` alone cannot separate a slow model
             from a slow environment, and the leaderboard ranks on latency.
+        served_models: Model ids the provider actually answered with, in
+            first-seen order. Config names the *requested* model; openclaw
+            fails over mid-run and both CLIs may resolve an alias (a run asking
+            for ``gemini-3-flash`` was served ``gemini-3-flash-preview``), so
+            without this a leaderboard attributes a score to the wrong model.
+            Empty when the harness reports none.
         model_turns: How many times the model was called, or ``None`` when the
             harness cannot tell. Distinct from ``len(trajectory)``: one model
             turn can issue several tool calls at once, and a turn that only
@@ -120,6 +126,7 @@ class AgentResult:
     errors: list[str] = field(default_factory=list)
     terminal_reason: str = ""
     tool_wait_sec: float | None = None
+    served_models: list[str] = field(default_factory=list)
     model_turns: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -143,6 +150,7 @@ class AgentResult:
             "errors": list(self.errors),
             "terminal_reason": self.terminal_reason,
             "tool_wait_sec": self.tool_wait_sec,
+            "served_models": list(self.served_models),
             "model_turns": self.model_turns,
             "metadata": dict(self.metadata),
         }
