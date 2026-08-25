@@ -25,7 +25,9 @@ the run-scoped home directory ``$HERMES_HOME``:
 * **MCP servers** — command-bearing bindings become ``mcp_servers`` entries in
   ``$HERMES_HOME/config.yaml``.
 * **Skills** — ``config.capabilities.skills.paths`` are materialized under
-  ``$HERMES_HOME/skills/<name>/SKILL.md``.
+  ``$HERMES_HOME/skills/<name>/SKILL.md``. Hermes's own bundled skill catalog
+  and its repo-local skill discovery are both switched off, so the granted
+  skills are the only ones the agent is offered.
 * **Rules** — ``config.capabilities.rules.text`` is prepended to the prompt
   (``hermes chat`` has no dedicated system-prompt flag).
 * **Model auth** — ``config.api_key`` is threaded into the provider env vars
@@ -77,6 +79,24 @@ _CONFIG_FILE = "config.yaml"
 _STATE_DB = "state.db"
 _SOUL_FILE = "SOUL.md"
 _SKILLS_DIRNAME = "skills"
+
+# Marker file hermes checks on startup: with it present the bundled skill sync
+# is cut down to hermes's own essential skill instead of installing all 82.
+# Without it every run is granted a skill catalog (``devops``, ``mlops``, ...)
+# the capability matrix never granted, and the run's ``.hermes`` carries the
+# ~6 MB of skill packs into the artifacts.
+_NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
+
+# Installation artifacts hermes materializes inside its home: a vendored binary,
+# the models.dev catalog download, and its request cache. ~22 MB per task with
+# nothing to say about what the agent did, so they are dropped before the
+# harness snapshots the workspace. Run evidence (state.db, config, logs) stays.
+_HOME_INSTALL_ARTIFACTS: tuple[str, ...] = (
+    "bin",
+    "cache",
+    "models_dev_cache.json",
+    "models_dev_cache.etag",
+)
 
 # ruamel's safe round-trip: block style keeps the generated config readable if a
 # run is inspected after the fact.
@@ -130,6 +150,24 @@ def _hermes_provider(provider: str) -> str:
     return name
 
 
+def _prune_install_artifacts(home: Path) -> None:
+    """Drop hermes's own installation files from the run home.
+
+    Called once the state DB has been read, so the workspace snapshot the eval
+    harness takes carries the run's evidence rather than a copy of the hermes
+    installation. Best-effort: a failed removal only costs disk.
+    """
+    for name in _HOME_INSTALL_ARTIFACTS:
+        target = home / name
+        try:
+            if target.is_dir():
+                shutil.rmtree(target)
+            elif target.exists():
+                target.unlink()
+        except OSError as exc:
+            _log.warning("Failed to prune %s from the hermes run home: %s", name, exc)
+
+
 def _prepend_rules(rules_text: str, prompt: str) -> str:
     """Return ``prompt`` with the granted rules prepended as a system brief."""
     if not rules_text.strip():
@@ -179,7 +217,13 @@ class HermesAgent(AgentHarness):
         return candidate if os.path.exists(candidate) else "hermes"
 
     def _prepare_config(self, run_dir: Path, mcp_servers: tuple[McpBinding, ...]) -> None:
-        """Write the run-scoped ``config.yaml``, merging in the MCP servers."""
+        """Write the run-scoped ``config.yaml``, merging in the MCP servers.
+
+        Also lays down the opt-out marker for hermes's bundled skill catalog, so
+        the only skills the agent sees are the ones the run actually granted.
+        """
+        (run_dir / _NO_BUNDLED_SKILLS_MARKER).touch()
+
         if self.inherit_user_config:
             user_dir = Path(os.path.expanduser("~/.hermes"))
             for name in (_CONFIG_FILE, _SOUL_FILE):
@@ -216,6 +260,15 @@ class HermesAgent(AgentHarness):
                     for entry in servers.values():
                         entry.setdefault("env", {})[key] = value
             config_data["mcp_servers"] = {**(config_data.get("mcp_servers") or {}), **servers}
+
+        # Hermes otherwise sources ``<git root>/.hermes/skills`` and
+        # ``<git root>/.agents/skills`` when the session starts inside a
+        # checkout, which would hand the agent skills the run never granted.
+        skills_config = config_data.get("skills")
+        config_data["skills"] = {
+            **(skills_config if isinstance(skills_config, dict) else {}),
+            "project_discovery": False,
+        }
 
         buffer = io.StringIO()
         _yaml.dump(config_data, buffer)
@@ -264,13 +317,15 @@ class HermesAgent(AgentHarness):
                 # The killed run still flushed whatever it completed, so report
                 # that partial trajectory rather than discarding the run.
                 trajectory, errors = extract_trajectory_from_db(db_path)
+                tokens = extract_tokens_from_db(db_path)
+                _prune_install_artifacts(hermes_home)
                 return AgentResult(
                     output=(
                         f"Timeout expired.\n\n=== STDOUT ===\n{exc.stdout or ''}"
                         f"\n\n=== STDERR ===\n{exc.stderr or ''}"
                     ),
                     trajectory=trajectory,
-                    tokens=extract_tokens_from_db(db_path),
+                    tokens=tokens,
                     errors=[f"hermes agent timed out after {self.config.timeout_sec:g}s", *errors],
                     metadata={"timeout": True},
                 )
@@ -306,6 +361,7 @@ class HermesAgent(AgentHarness):
                     "hermes agent recorded no model usage despite exiting 0; "
                     f"the model was never reached: {stderr or '<no stderr>'}"
                 )
+            _prune_install_artifacts(hermes_home)
 
         return AgentResult(
             output=completed.stdout or "",

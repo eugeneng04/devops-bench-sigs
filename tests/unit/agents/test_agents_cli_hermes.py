@@ -211,6 +211,46 @@ def test_prepare_config_writes_the_granted_mcp_servers(tmp_path: Path) -> None:
     assert data["mcp_servers"] == {"k8s": {"command": "k8s-mcp", "args": ["--stdio"]}}
 
 
+def test_prepare_config_opts_out_of_the_skills_the_run_never_granted(tmp_path: Path) -> None:
+    """Hermes installs 82 bundled skills and sources repo-local ones; either
+    would hand the agent capabilities the matrix withheld."""
+    HermesAgent(AgentConfig())._prepare_config(tmp_path, ())
+
+    assert (tmp_path / ".no-bundled-skills").exists()
+    data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert data["skills"]["project_discovery"] is False
+
+
+def test_prepare_config_keeps_seeded_skill_settings_while_forcing_discovery_off(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "config.yaml").write_text(
+        "skills:\n  external_dirs: ['/team']\n  project_discovery: true\n", encoding="utf-8"
+    )
+
+    HermesAgent(AgentConfig())._prepare_config(tmp_path, ())
+
+    data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert data["skills"] == {"external_dirs": ["/team"], "project_discovery": False}
+
+
+def test_prune_install_artifacts_keeps_the_run_evidence(tmp_path: Path) -> None:
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "tirith").write_bytes(b"\x00")
+    (tmp_path / "cache").mkdir()
+    (tmp_path / "models_dev_cache.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "state.db").write_bytes(b"\x00")
+    (tmp_path / "config.yaml").write_text("{}", encoding="utf-8")
+
+    agent_mod._prune_install_artifacts(tmp_path)
+
+    assert not (tmp_path / "bin").exists()
+    assert not (tmp_path / "cache").exists()
+    assert not (tmp_path / "models_dev_cache.json").exists()
+    assert (tmp_path / "state.db").exists()
+    assert (tmp_path / "config.yaml").exists()
+
+
 def test_prepare_config_forwards_the_run_isolation_env_to_mcp_servers(tmp_path: Path) -> None:
     """hermes filters an MCP child's env to an allowlist plus the declared keys,
     so the run's cluster and cloud config have to be named explicitly."""
@@ -258,7 +298,10 @@ def test_prepare_config_ignores_a_seeded_config_that_is_not_a_mapping(tmp_path: 
     agent._prepare_config(tmp_path, (McpBinding(name="k8s", command=("k8s-mcp",)),))
 
     data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
-    assert data == {"mcp_servers": {"k8s": {"command": "k8s-mcp"}}}
+    assert data == {
+        "mcp_servers": {"k8s": {"command": "k8s-mcp"}},
+        "skills": {"project_discovery": False},
+    }
 
 
 def test_prepare_config_survives_an_unparseable_seeded_config(tmp_path: Path) -> None:
