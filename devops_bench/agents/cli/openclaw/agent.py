@@ -531,9 +531,7 @@ class OpenClawAgent(AgentHarness):
             metadata=metadata,
         )
 
-    def _extract_trajectory(
-        self, oc_bin: str, env_overlay: dict[str, str]
-    ) -> TrajectoryExport:
+    def _extract_trajectory(self, oc_bin: str, env_overlay: dict[str, str]) -> TrajectoryExport:
         """Run ``oc sessions`` + ``export-trajectory`` and parse the bundle.
 
         ``env_overlay`` carries ``OPENCLAW_STATE_DIR`` (and ``OPENCLAW_CONFIG_PATH``

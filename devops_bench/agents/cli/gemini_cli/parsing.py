@@ -127,7 +127,6 @@ def parse_stream_json(stdout: str) -> StreamParse:
         if isinstance(value, str) and value and value not in served_models:
             served_models.append(value)
 
-
     for lineno, raw in enumerate(stdout.splitlines(), start=1):
         line = raw.strip()
         if not line:
