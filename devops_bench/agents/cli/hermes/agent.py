@@ -216,6 +216,22 @@ class HermesAgent(AgentHarness):
         candidate = os.path.expanduser("~/.local/bin/hermes")
         return candidate if os.path.exists(candidate) else "hermes"
 
+    def _mcp_isolation_env(self) -> dict[str, str]:
+        """Resolve the isolation vars an MCP server needs, in the CLI's own order.
+
+        ``run_env`` publishes the per-run ``KUBECONFIG`` / ``CLOUDSDK_CONFIG`` on
+        ``os.environ``, while ``config.extra_env`` is the operator's override and
+        wins in :func:`_build_env`. Reading only one of the two would hand the
+        MCP servers a different cluster (or gcloud config) than hermes itself
+        got, so both are consulted in the same precedence.
+        """
+        resolved: dict[str, str] = {}
+        for key in _MCP_ISOLATION_ENVS:
+            value = self.config.extra_env.get(key) or os.environ.get(key)
+            if value:
+                resolved[key] = value
+        return resolved
+
     def _prepare_config(self, run_dir: Path, mcp_servers: tuple[McpBinding, ...]) -> None:
         """Write the run-scoped ``config.yaml``, merging in the MCP servers.
 
@@ -254,12 +270,21 @@ class HermesAgent(AgentHarness):
             # MCP servers are spawned by hermes, so they inherit its env rather
             # than the harness's; pass the run's isolation vars through
             # explicitly or the servers fall back to the ambient ones.
-            for key in _MCP_ISOLATION_ENVS:
-                value = os.environ.get(key)
-                if value:
-                    for entry in servers.values():
-                        entry.setdefault("env", {})[key] = value
-            config_data["mcp_servers"] = {**(config_data.get("mcp_servers") or {}), **servers}
+            for key, value in self._mcp_isolation_env().items():
+                for entry in servers.values():
+                    entry.setdefault("env", {})[key] = value
+            seeded = config_data.get("mcp_servers")
+            if seeded is not None and not isinstance(seeded, dict):
+                # A seeded ``mcp_servers: disabled`` (or a list) parses fine but
+                # would raise TypeError on the merge below, aborting the run
+                # before hermes ever starts.
+                _log.warning(
+                    "Ignoring existing mcp_servers in %s: expected a mapping, got %s",
+                    _CONFIG_FILE,
+                    type(seeded).__name__,
+                )
+                seeded = None
+            config_data["mcp_servers"] = {**(seeded or {}), **servers}
 
         # Hermes otherwise sources ``<git root>/.hermes/skills`` and
         # ``<git root>/.agents/skills`` when the session starts inside a

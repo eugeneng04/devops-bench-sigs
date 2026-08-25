@@ -304,6 +304,41 @@ def test_prepare_config_ignores_a_seeded_config_that_is_not_a_mapping(tmp_path: 
     }
 
 
+def test_prepare_config_ignores_a_seeded_mcp_servers_that_is_not_a_mapping(
+    tmp_path: Path,
+) -> None:
+    """``mcp_servers: disabled`` must not abort the run on the merge."""
+    (tmp_path / "config.yaml").write_text("mcp_servers: disabled\n", encoding="utf-8")
+    agent = HermesAgent(AgentConfig())
+
+    agent._prepare_config(tmp_path, (McpBinding(name="k8s", command=("k8s-mcp",)),))
+
+    data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert data["mcp_servers"] == {"k8s": {"command": "k8s-mcp"}}
+
+
+def test_prepare_config_prefers_the_configured_isolation_override(tmp_path: Path) -> None:
+    """``extra_env`` wins over the ambient value, as it does in ``_build_env``."""
+    agent = HermesAgent(AgentConfig(extra_env={"KUBECONFIG": "/override/kubeconfig"}))
+
+    with patch.dict(os.environ, {"KUBECONFIG": "/run/kubeconfig"}):
+        agent._prepare_config(tmp_path, (McpBinding(name="k8s", command=("k8s-mcp",)),))
+
+    data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert data["mcp_servers"]["k8s"]["env"]["KUBECONFIG"] == "/override/kubeconfig"
+
+
+def test_prepare_config_omits_the_env_block_without_isolation(tmp_path: Path) -> None:
+    """A non-isolated run leaves the server on the ambient environment."""
+    agent = HermesAgent(AgentConfig())
+
+    with patch.dict(os.environ, {}, clear=True):
+        agent._prepare_config(tmp_path, (McpBinding(name="k8s", command=("k8s-mcp",)),))
+
+    data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert "env" not in data["mcp_servers"]["k8s"]
+
+
 def test_prepare_config_survives_an_unparseable_seeded_config(tmp_path: Path) -> None:
     (tmp_path / "config.yaml").write_text("::: not yaml :::\n", encoding="utf-8")
     agent = HermesAgent(AgentConfig())
