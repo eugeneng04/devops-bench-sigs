@@ -157,7 +157,7 @@ def parse_stream_json(stdout: str) -> tuple[str, list[dict], dict, list[str]]:
     | ``assistant`` | ``tool_use`` → pending ToolCalls; ``text`` → output;      |
     |               | ``thinking`` / ``redacted_thinking`` dropped              |
     | ``user``      | ``tool_result`` blocks matched to pending ToolCalls       |
-    | ``result``    | terminal: authoritative answer, token usage, error subtype|
+    | ``result``    | terminal: authoritative answer, token usage, failure flag |
 
     The accumulated assistant ``text`` doubles as a fallback answer when no
     terminal ``result`` event arrives (a truncated pipe) or when it carries an
@@ -264,9 +264,10 @@ def parse_stream_json(stdout: str) -> tuple[str, list[dict], dict, list[str]]:
                 target.status = "error" if block.get("is_error") else "completed"
         elif etype == "result":
             # Terminal event: ``result`` is the authoritative answer, ``usage``
-            # holds token accounting, and an ``error_*`` subtype flags failure.
-            # Guard against a later degenerate ``result`` (empty answer / no
-            # usage) clobbering an earlier good one.
+            # holds token accounting, and failure shows up as either an
+            # ``error_*`` subtype or an ``is_error`` flag. Guard against a later
+            # degenerate ``result`` (empty answer / no usage) clobbering an
+            # earlier good one.
             tail = event.get("result")
             if isinstance(tail, str) and not result_output:
                 result_output = tail
@@ -277,6 +278,14 @@ def parse_stream_json(stdout: str) -> tuple[str, list[dict], dict, list[str]]:
             subtype = event.get("subtype")
             if isinstance(subtype, str) and subtype.startswith("error_"):
                 errors.append(f"stream-json result error: {subtype}")
+            elif event.get("is_error"):
+                # A failed API call can still carry ``subtype: "success"`` and
+                # exit 0 (observed: a 404 model-not-found, whose ``result`` is
+                # the provider's error text). Without this the run would score
+                # as clean with an empty trajectory and zeroed usage.
+                status = event.get("api_error_status")
+                detail = f" (api status {status})" if status is not None else ""
+                errors.append(f"stream-json result flagged is_error{detail}")
 
     # ``result_output`` may be an empty string (error subtypes emit ``""``); fall
     # back to the accumulated assistant text so a real partial answer survives.

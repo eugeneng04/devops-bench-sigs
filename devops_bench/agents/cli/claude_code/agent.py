@@ -83,6 +83,14 @@ _log = get_logger("agents.cli.claude_code")
 # ``metadata`` and ``errors``), so every path clips it to the same tail.
 _STDERR_TAIL_CHARS = 2000
 
+# Under ``-p`` the CLI reads a piped prompt from stdin and waits out a 3s
+# timeout before giving up when stdin stays open with nothing on it — which is
+# what an inherited stdin looks like. Handing it an empty string closes the pipe
+# immediately: ~3.7s saved per task, and no "no stdin data received" warning
+# polluting ``metadata["stderr"]`` (and, on a non-zero exit, the error message,
+# where it would displace the real cause).
+_CLOSED_STDIN = ""
+
 
 def _stderr_tail(stderr: str | None) -> str:
     """Stripped last :data:`_STDERR_TAIL_CHARS` characters of ``stderr``."""
@@ -348,6 +356,7 @@ class ClaudeCodeAgent(AgentHarness):
                         cwd=workdir,
                         check=False,
                         timeout=self.config.timeout_sec,
+                        input=_CLOSED_STDIN,
                     )
                 except SubprocessError as exc:
                     # str(exc) embeds the child's full stderr, so rebuild the

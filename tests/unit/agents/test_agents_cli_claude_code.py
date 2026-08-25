@@ -250,6 +250,42 @@ def test_parse_stream_json_records_error_result_subtype() -> None:
     assert errors == ["stream-json result error: error_max_turns"]
 
 
+def test_parse_stream_json_records_is_error_under_a_success_subtype() -> None:
+    """An API failure can exit 0 under ``subtype: "success"`` with ``is_error``
+    set (observed: a 404 model-not-found), which must not score as a clean run."""
+    blob = _stream(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": True,
+            "api_error_status": 404,
+            "result": "The model x is not available on your vertex deployment.",
+        }
+    )
+    output, _trajectory, _tokens, errors = parse_stream_json(blob)
+    assert output == "The model x is not available on your vertex deployment."
+    assert errors == ["stream-json result flagged is_error (api status 404)"]
+
+
+def test_parse_stream_json_records_is_error_without_an_api_status() -> None:
+    blob = _stream({"type": "result", "subtype": "success", "is_error": True, "result": "nope"})
+    _output, _trajectory, _tokens, errors = parse_stream_json(blob)
+    assert errors == ["stream-json result flagged is_error"]
+
+
+def test_parse_stream_json_does_not_double_report_an_error_subtype() -> None:
+    """``error_*`` subtypes also carry ``is_error``; one error line, not two."""
+    blob = _stream({"type": "result", "subtype": "error_max_turns", "is_error": True, "result": ""})
+    _output, _trajectory, _tokens, errors = parse_stream_json(blob)
+    assert errors == ["stream-json result error: error_max_turns"]
+
+
+def test_parse_stream_json_ignores_a_false_is_error() -> None:
+    blob = _stream({"type": "result", "subtype": "success", "is_error": False, "result": "ok"})
+    _output, _trajectory, _tokens, errors = parse_stream_json(blob)
+    assert errors == []
+
+
 def test_parse_stream_json_empty_input_returns_empty() -> None:
     assert parse_stream_json("") == ("", [], _tok(), [])
 
@@ -844,6 +880,20 @@ def test_execute_returns_typed_result_with_trajectory(monkeypatch: pytest.Monkey
     assert captured["timeout"] == 30.0
     assert captured["argv"][0].endswith("claude-x")
     assert captured["argv"][-2:] == ["--", "ping"]
+
+
+def test_execute_closes_child_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An inherited stdin makes the CLI wait out its 3s piped-prompt timeout on
+    every run and warn on stderr; an empty ``input`` closes the pipe at once."""
+    captured: dict = {}
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        captured["input"] = kwargs.get("input")
+        return SimpleNamespace(stdout=SAMPLE_STREAM, stderr="", returncode=0)
+
+    monkeypatch.setattr(claude_mod, "run", fake_run)
+    ClaudeCodeAgent(AgentConfig(target="claude")).run("p")
+    assert captured["input"] == ""
 
 
 def test_execute_wires_extra_env_into_subprocess_call(monkeypatch: pytest.MonkeyPatch) -> None:
