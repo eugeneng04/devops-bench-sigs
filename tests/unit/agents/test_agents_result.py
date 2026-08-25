@@ -14,6 +14,8 @@
 
 """Unit tests for devops_bench.agents.result."""
 
+import pytest
+
 from devops_bench.agents.result import TERMINAL_REASONS, AgentResult, ToolCall
 
 
@@ -105,6 +107,17 @@ def test_agent_result_errored_can_report_a_timeout_instead() -> None:
 def test_terminal_reasons_are_the_documented_set() -> None:
     """Pinned so a harness cannot invent a value the dashboard will not group."""
     assert TERMINAL_REASONS == ("", "completed", "timeout", "error")
+
+
+@pytest.mark.parametrize("reason", TERMINAL_REASONS)
+def test_agent_result_accepts_every_documented_terminal_reason(reason: str) -> None:
+    assert AgentResult(output="", trajectory=[], terminal_reason=reason).terminal_reason == reason
+
+
+def test_agent_result_rejects_an_unknown_terminal_reason() -> None:
+    """A value outside the set reaches the dashboard and groups under nothing."""
+    with pytest.raises(ValueError, match="terminal_reason"):
+        AgentResult(output="", trajectory=[], terminal_reason="cancelled")
 
 
 def test_agent_result_has_errors_is_false_on_clean_run() -> None:

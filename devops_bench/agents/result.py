@@ -99,20 +99,20 @@ class AgentResult:
         errors: Human-readable error or extraction-failure messages. **Empty**
             on a clean run; populated when a known-error path (subprocess
             failure, parse miss, timeout) is reached — never silently dropped.
-        terminal_reason: Why the run stopped; one of :data:`TERMINAL_REASONS`.
-            A run cut off at the turn cap or the wall-clock budget scores like a
-            wrong answer, so without this an efficiency ceiling reads as a
-            capability failure.
+        terminal_reason: Why the run stopped; one of :data:`TERMINAL_REASONS`,
+            rejected with ``ValueError`` otherwise. A run cut off at the turn
+            cap or the wall-clock budget scores like a wrong answer, so without
+            this an efficiency ceiling reads as a capability failure.
         tool_wait_sec: Wall-clock seconds the run spent inside tool calls, with
             concurrent calls counted once, or ``None`` when the transcript
             carried no timings. ``latency`` alone cannot separate a slow model
             from a slow environment, and the leaderboard ranks on latency.
         served_models: Model ids the provider actually answered with, in
-            first-seen order. Config names the *requested* model; openclaw
-            fails over mid-run and both CLIs may resolve an alias (a run asking
-            for ``gemini-3-flash`` was served ``gemini-3-flash-preview``), so
-            without this a leaderboard attributes a score to the wrong model.
-            Empty when the harness reports none.
+            first-seen order. Config names the *requested* model; an agent may
+            fail over to another model mid-run, and a requested alias can
+            resolve to a dated or preview id, so without this a leaderboard
+            attributes a score to the wrong model. Empty when the harness
+            reports none.
         model_turns: How many times the model was called, or ``None`` when the
             harness cannot tell. Distinct from ``len(trajectory)``: one model
             turn can issue several tool calls at once, and a turn that only
@@ -132,6 +132,15 @@ class AgentResult:
     served_models: list[str] = field(default_factory=list)
     model_turns: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # An unrecognized reason survives serialization and reaches the
+        # dashboard, where it matches no grouping and is dropped without a
+        # warning. A harness inventing one is a bug, so fail at the source.
+        if self.terminal_reason not in TERMINAL_REASONS:
+            raise ValueError(
+                f"terminal_reason must be one of {TERMINAL_REASONS}, got {self.terminal_reason!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-serializable mapping consumed by the harness.

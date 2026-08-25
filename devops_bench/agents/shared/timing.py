@@ -48,9 +48,9 @@ def parse_event_time(value: object) -> float | None:
 def merged_span_sec(intervals: list[tuple[float, float]]) -> float | None:
     """Return the wall-clock seconds covered by ``intervals``, overlaps counted once.
 
-    Agents dispatch tool calls in batches: one openclaw message issued two calls
-    stamped at the same millisecond, and both ran concurrently. Summing their
-    durations would report more tool time than the run took in total, so
+    Agents dispatch tool calls in batches: a single model turn can issue several
+    calls stamped at the same millisecond that then run concurrently. Summing
+    their durations would report more tool time than the run took in total, so
     overlapping intervals are merged before measuring.
 
     Args:
