@@ -61,7 +61,7 @@ from devops_bench.agents.shared.cli_capabilities import (
     build_mcp_servers,
     materialize_skills,
 )
-from devops_bench.core import SubprocessError, get_logger
+from devops_bench.core import ConfigError, SubprocessError, get_logger
 from devops_bench.core.model_providers import resolve_provider
 from devops_bench.core.subprocess import run
 
@@ -82,6 +82,52 @@ _SKILLS_DIRNAME = "skills"
 # run is inspected after the fact.
 _yaml = YAML(typ="safe")
 _yaml.default_flow_style = False
+
+
+# Canonical bench provider -> the name hermes's ``--provider`` accepts. Not
+# derivable from ``ProviderSpec``: hermes's ``vertex`` is Google-Vertex-Gemini
+# only, and its OpenAI transport is spelled ``openai-api``, so mapping through
+# ``adapter_family`` silently misroutes Claude-on-Vertex and hard-fails OpenAI.
+_HERMES_PROVIDERS: dict[str, str] = {
+    "google": "gemini",
+    "google-vertex": "vertex",
+    "anthropic": "anthropic",
+    "anthropic-bedrock": "bedrock",
+    "openai": "openai-api",
+    "ollama": "ollama",
+}
+
+# Run-isolation env vars forwarded into every MCP server's ``env`` block. Hermes
+# filters an MCP subprocess's environment down to an allowlist (PATH/HOME/... )
+# plus whatever the server config names, so a per-run KUBECONFIG/CLOUDSDK_CONFIG
+# would otherwise be dropped and the server would read the developer's ambient
+# cluster and cloud config instead of the run's.
+_MCP_ISOLATION_ENVS: tuple[str, ...] = ("KUBECONFIG", "CLOUDSDK_CONFIG")
+
+
+def _hermes_provider(provider: str) -> str:
+    """Map a bench provider alias onto the name ``hermes chat --provider`` takes.
+
+    Args:
+        provider: Raw ``AGENT_PROVIDER`` value.
+
+    Returns:
+        The hermes provider name.
+
+    Raises:
+        ConfigError: If hermes has no equivalent for the resolved provider.
+    """
+    canonical = resolve_provider(provider).canonical
+    name = _HERMES_PROVIDERS.get(canonical)
+    if name is None:
+        # anthropic-vertex today: hermes's "vertex" serves Gemini only, so there
+        # is no way to ask it for Claude on Vertex. Fail loudly rather than let
+        # the run silently answer with a Gemini model.
+        raise ConfigError(
+            f"provider {canonical!r} has no hermes equivalent; "
+            f"supported: {', '.join(sorted(_HERMES_PROVIDERS))}"
+        )
+    return name
 
 
 def _prepend_rules(rules_text: str, prompt: str) -> str:
@@ -162,12 +208,13 @@ class HermesAgent(AgentHarness):
         servers = build_mcp_servers(mcp_servers)
         if servers:
             # MCP servers are spawned by hermes, so they inherit its env rather
-            # than the harness's; pass the run's cluster config through
-            # explicitly or the servers fall back to the ambient one.
-            kubeconfig = os.environ.get("KUBECONFIG")
-            if kubeconfig:
-                for entry in servers.values():
-                    entry.setdefault("env", {})["KUBECONFIG"] = kubeconfig
+            # than the harness's; pass the run's isolation vars through
+            # explicitly or the servers fall back to the ambient ones.
+            for key in _MCP_ISOLATION_ENVS:
+                value = os.environ.get(key)
+                if value:
+                    for entry in servers.values():
+                        entry.setdefault("env", {})[key] = value
             config_data["mcp_servers"] = {**(config_data.get("mcp_servers") or {}), **servers}
 
         buffer = io.StringIO()
@@ -175,7 +222,11 @@ class HermesAgent(AgentHarness):
         config_path.write_text(buffer.getvalue(), encoding="utf-8")
 
     def _build_command(self, prompt: str) -> list[str]:
-        """Build the ``hermes chat`` argv for this run."""
+        """Build the ``hermes chat`` argv for this run.
+
+        Raises:
+            ConfigError: If the resolved provider has no hermes equivalent.
+        """
         # ``--query=<prompt>`` as one token: the prompt is attacker-influenced
         # task text, and a separate argv element starting with ``-`` would be
         # parsed as a flag.
@@ -183,12 +234,7 @@ class HermesAgent(AgentHarness):
         if self.config.model:
             cmd.extend(["-m", self.config.model])
         if self.config.provider:
-            spec = resolve_provider(self.config.provider)
-            # hermes names the Vertex transport "vertex"; every other provider
-            # matches the adapter family name.
-            cmd.extend(
-                ["--provider", "vertex" if spec.backend == "vertex" else spec.adapter_family]
-            )
+            cmd.extend(["--provider", _hermes_provider(self.config.provider)])
         return cmd
 
     def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
@@ -250,6 +296,16 @@ class HermesAgent(AgentHarness):
             trajectory, export_errors = extract_trajectory_from_db(db_path)
             errors.extend(export_errors)
             tokens = extract_tokens_from_db(db_path)
+            if completed.returncode == 0 and not tokens["total"]:
+                # hermes exits 0 on an unknown provider, a rejected API key, or
+                # an API call whose retries all failed. Without this the run
+                # looks like a genuinely bad answer instead of an infra failure,
+                # because no model usage was ever recorded.
+                stderr = (completed.stderr or "").strip()
+                errors.append(
+                    "hermes agent recorded no model usage despite exiting 0; "
+                    f"the model was never reached: {stderr or '<no stderr>'}"
+                )
 
         return AgentResult(
             output=completed.stdout or "",

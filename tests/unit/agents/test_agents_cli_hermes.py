@@ -36,7 +36,7 @@ from devops_bench.agents.cli.hermes.parsing import (
 )
 from devops_bench.agents.config import AgentConfig
 from devops_bench.agents.result import TOKEN_BUCKETS, empty_tokens
-from devops_bench.core.errors import SubprocessError
+from devops_bench.core.errors import ConfigError, SubprocessError
 from devops_bench.results.normalize import normalize_tokens
 
 _yaml = YAML(typ="safe")
@@ -165,10 +165,33 @@ def test_build_command_maps_vertex_onto_the_vertex_backend() -> None:
     ]
 
 
-def test_build_command_uses_the_adapter_family_for_direct_providers() -> None:
-    cmd = HermesAgent(AgentConfig(target="/bin/hermes", provider="anthropic"))._build_command("hi")
+@pytest.mark.parametrize(
+    ("provider", "expected"),
+    [
+        ("google", "gemini"),
+        ("google-vertex", "vertex"),
+        ("anthropic", "anthropic"),
+        ("anthropic-bedrock", "bedrock"),
+        ("openai", "openai-api"),
+        ("ollama", "ollama"),
+    ],
+)
+def test_build_command_maps_each_provider_onto_a_hermes_provider_name(
+    provider: str, expected: str
+) -> None:
+    """The emitted name must be one hermes's own registry accepts."""
+    cmd = HermesAgent(AgentConfig(target="/bin/hermes", provider=provider))._build_command("hi")
 
-    assert cmd == ["/bin/hermes", "chat", "--query=hi", "--provider", "claude"]
+    assert cmd == ["/bin/hermes", "chat", "--query=hi", "--provider", expected]
+
+
+def test_build_command_rejects_a_provider_hermes_cannot_serve() -> None:
+    """Hermes's ``vertex`` is Gemini-only, so Claude-on-Vertex must not silently
+    route to a Gemini model."""
+    agent = HermesAgent(AgentConfig(target="/bin/hermes", provider="anthropic-vertex"))
+
+    with pytest.raises(ConfigError, match="no hermes equivalent"):
+        agent._build_command("hi")
 
 
 def test_build_command_binds_a_dash_leading_prompt_to_the_query_flag() -> None:
@@ -186,6 +209,23 @@ def test_prepare_config_writes_the_granted_mcp_servers(tmp_path: Path) -> None:
 
     data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
     assert data["mcp_servers"] == {"k8s": {"command": "k8s-mcp", "args": ["--stdio"]}}
+
+
+def test_prepare_config_forwards_the_run_isolation_env_to_mcp_servers(tmp_path: Path) -> None:
+    """hermes filters an MCP child's env to an allowlist plus the declared keys,
+    so the run's cluster and cloud config have to be named explicitly."""
+    agent = HermesAgent(AgentConfig())
+
+    with patch.dict(
+        os.environ, {"KUBECONFIG": "/run/kubeconfig", "CLOUDSDK_CONFIG": "/run/gcloud"}
+    ):
+        agent._prepare_config(tmp_path, (McpBinding(name="k8s", command=("k8s-mcp",)),))
+
+    data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert data["mcp_servers"]["k8s"]["env"] == {
+        "KUBECONFIG": "/run/kubeconfig",
+        "CLOUDSDK_CONFIG": "/run/gcloud",
+    }
 
 
 def test_prepare_config_merges_over_a_null_mcp_servers_key(tmp_path: Path) -> None:
@@ -370,6 +410,23 @@ def test_execute_records_a_nonzero_exit_without_losing_the_trajectory() -> None:
     assert result.metadata["returncode"] == 3
     assert any("hermes agent exited 3: boom" in err for err in result.errors)
     assert result.tokens["input"] == 2748
+
+
+def test_execute_flags_a_zero_exit_that_never_reached_the_model() -> None:
+    """hermes exits 0 on a rejected key or exhausted retries; an unflagged run
+    would be scored as a bad answer instead of an infrastructure failure."""
+
+    def fake_run(
+        cmd: list[str], check: bool, cwd: str, timeout: float | None, extra_env: dict[str, str]
+    ) -> SimpleNamespace:
+        _seed_state_db(Path(extra_env["HERMES_HOME"]), counts=(0, 0, 0, 0, 0))
+        return SimpleNamespace(returncode=0, stdout="", stderr="API key not valid")
+
+    with patch.object(agent_mod, "run", side_effect=fake_run):
+        result = HermesAgent(AgentConfig(target="/bin/hermes")).run("hello")
+
+    assert result.has_errors()
+    assert any("no model usage" in err and "API key not valid" in err for err in result.errors)
 
 
 def test_execute_on_timeout_reports_what_the_killed_run_flushed() -> None:
