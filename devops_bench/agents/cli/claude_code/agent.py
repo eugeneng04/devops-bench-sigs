@@ -54,7 +54,7 @@ from pathlib import Path
 from devops_bench.agents.base import AGENTS, AgentHarness
 from devops_bench.agents.cli.claude_code.parsing import parse_stream_json
 from devops_bench.agents.config import AgentConfig
-from devops_bench.agents.result import AgentResult, empty_tokens
+from devops_bench.agents.result import AgentResult
 from devops_bench.agents.shared.cli_capabilities import (
     agent_workdir,
     build_mcp_servers,
@@ -121,20 +121,6 @@ def _claude_version(target: str) -> tuple[int, int, int] | None:
     if completed.returncode != 0 or not match:
         return None
     return (int(match[1]), int(match[2]), int(match[3]))
-
-
-def _errored_with_tokens(msg: str, *, stderr: str | None = None) -> AgentResult:
-    """An errored result carrying the canonical all-``None`` token shape.
-
-    ``stderr`` (clipped tail) is attached to ``metadata`` when present, so the
-    no-stdout failure path keeps the same diagnostic signal as the other paths.
-    """
-    result = AgentResult.errored(msg)
-    result.tokens = empty_tokens()
-    tail = _stderr_tail(stderr)
-    if tail:
-        result.metadata["stderr"] = tail
-    return result
 
 
 def _build_argv(
@@ -331,7 +317,7 @@ class ClaudeCodeAgent(AgentHarness):
                 mcp_config_path = str(mcp_path)
                 version = _claude_version(target)
                 if version is not None and version < _MCP_WAIT_MIN_VERSION:
-                    return _errored_with_tokens(
+                    return AgentResult.errored(
                         "claude "
                         + ".".join(str(part) for part in version)
                         + " predates the --mcp-config startup wait (needs "
@@ -361,43 +347,40 @@ class ClaudeCodeAgent(AgentHarness):
                 except SubprocessError as exc:
                     # str(exc) embeds the child's full stderr, so rebuild the
                     # message from the clipped tail rather than interpolating it.
-                    stderr = _stderr_tail(exc.stderr)
-                    reason = (
-                        f"claude subprocess error: exit {exc.returncode}: {stderr or '<no stderr>'}"
-                    )
                     # A timeout raises with the partial stream-json captured
-                    # before the kill; recover the trajectory instead of dropping it.
-                    if exc.stdout:
-                        output, trajectory, tokens, parse_errors = parse_stream_json(exc.stdout)
-                        metadata: dict = {"returncode": exc.returncode}
-                        if stderr:
-                            metadata["stderr"] = stderr
-                        return AgentResult(
-                            output=output or reason,
-                            trajectory=trajectory,
-                            tokens=tokens,
-                            errors=[*parse_errors, reason],
-                            metadata=metadata,
-                        )
-                    return _errored_with_tokens(reason, stderr=exc.stderr)
+                    # before the kill; fall through so the trajectory is
+                    # recovered rather than dropped.
+                    stderr = _stderr_tail(exc.stderr)
+                    returncode = exc.returncode
+                    stdout = exc.stdout or ""
+                    reason = (
+                        f"claude subprocess error: exit {returncode}: {stderr or '<no stderr>'}"
+                    )
                 except OSError as exc:
                     # Spawn failure core.subprocess.run does not wrap: usually a
                     # missing / non-executable binary, but also a vanished cwd.
-                    return _errored_with_tokens(f"failed to spawn claude: {exc}")
+                    return AgentResult.errored(f"failed to spawn claude: {exc}")
+                else:
+                    stderr = _stderr_tail(completed.stderr)
+                    returncode = completed.returncode
+                    stdout = completed.stdout or ""
+                    reason = (
+                        None
+                        if returncode == 0
+                        else f"claude exited {returncode}: {stderr or '<no stderr>'}"
+                    )
 
-        output, trajectory, tokens, parse_errors = parse_stream_json(completed.stdout or "")
+        output, trajectory, tokens, parse_errors = parse_stream_json(stdout)
         errors: list[str] = list(parse_errors)
-        metadata = {}
-        stderr = _stderr_tail(completed.stderr)
+        metadata: dict = {}
         if stderr:
             # Keep stderr for diagnosis even on a clean exit — e.g. MCP startup
             # warnings that leave the process returncode at 0.
             metadata["stderr"] = stderr
-        if completed.returncode != 0:
-            errors.append(f"claude exited {completed.returncode}: {stderr or '<no stderr>'}")
-            if not output:
-                output = f"Error: claude exited {completed.returncode}"
-            metadata["returncode"] = completed.returncode
+        if reason is not None:
+            errors.append(reason)
+            metadata["returncode"] = returncode
+            output = output or f"Error: {reason}"
         return AgentResult(
             output=output,
             trajectory=trajectory,

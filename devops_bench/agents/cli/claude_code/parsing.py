@@ -153,7 +153,7 @@ def parse_stream_json(stdout: str) -> tuple[str, list[dict], dict, list[str]]:
 
     | Event type    | Handling                                                  |
     |---------------|-----------------------------------------------------------|
-    | ``system``    | ``init`` metadata, ignored                                |
+    | ``system``    | ``init`` MCP statuses checked; other metadata ignored     |
     | ``assistant`` | ``tool_use`` → pending ToolCalls; ``text`` → output;      |
     |               | ``thinking`` / ``redacted_thinking`` dropped              |
     | ``user``      | ``tool_result`` blocks matched to pending ToolCalls       |
@@ -234,8 +234,9 @@ def parse_stream_json(stdout: str) -> tuple[str, list[dict], dict, list[str]]:
                     continue  # not part of the tool-calls-only trajectory
                 elif btype == "tool_use":
                     args = block.get("input")
+                    raw_name = block.get("name")
                     call = ToolCall(
-                        name=_normalize_tool_name(block.get("name", "")),
+                        name=_normalize_tool_name(raw_name if isinstance(raw_name, str) else ""),
                         args=args if isinstance(args, dict) else {},
                         status="called",
                     )

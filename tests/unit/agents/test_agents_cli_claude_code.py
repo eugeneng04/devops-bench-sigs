@@ -48,8 +48,13 @@ def _stream(*events: dict) -> str:
     return "\n".join(json.dumps(event) for event in events) + "\n"
 
 
-def _assistant(*blocks: dict) -> dict:
-    return {"type": "assistant", "message": {"content": list(blocks)}}
+def _assistant(*blocks: dict, msg_id: str | None = None, usage: dict | None = None) -> dict:
+    message: dict = {"content": list(blocks)}
+    if msg_id is not None:
+        message["id"] = msg_id
+    if usage is not None:
+        message["usage"] = usage
+    return {"type": "assistant", "message": message}
 
 
 def _user(*blocks: dict) -> dict:
@@ -394,24 +399,14 @@ def test_parse_stream_json_falls_back_to_accumulated_usage_without_result_event(
     counts, summed from the per-turn assistant ``usage``. ``output`` stays
     unreported — see the next test."""
     blob = _stream(
-        {
-            "type": "assistant",
-            "message": {
-                "content": [{"type": "text", "text": "a"}],
-                "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 2},
-            },
-        },
-        {
-            "type": "assistant",
-            "message": {
-                "content": [{"type": "text", "text": "b"}],
-                "usage": {
-                    "input_tokens": 20,
-                    "output_tokens": 7,
-                    "cache_creation_input_tokens": 3,
-                },
-            },
-        },
+        _assistant(
+            {"type": "text", "text": "a"},
+            usage={"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 2},
+        ),
+        _assistant(
+            {"type": "text", "text": "b"},
+            usage={"input_tokens": 20, "output_tokens": 7, "cache_creation_input_tokens": 3},
+        ),
     )
     output, _trajectory, tokens, errors = parse_stream_json(blob)
     assert output == "ab"
@@ -424,14 +419,11 @@ def test_parse_stream_json_accumulator_leaves_output_unreported() -> None:
     handful of tokens against a real terminal count in the thousands. Summing it
     would persist an invented number, so the bucket is left ``None``."""
     blob = _stream(
-        {
-            "type": "assistant",
-            "message": {
-                "id": "msg_1",
-                "content": [{"type": "text", "text": "..."}],
-                "usage": {"input_tokens": 4, "output_tokens": 3},
-            },
-        },
+        _assistant(
+            {"type": "text", "text": "..."},
+            msg_id="msg_1",
+            usage={"input_tokens": 4, "output_tokens": 3},
+        ),
     )
     _output, _trajectory, tokens, _errors = parse_stream_json(blob)
     assert tokens["output"] is None
@@ -442,13 +434,9 @@ def test_parse_stream_json_result_usage_wins_over_accumulated() -> None:
     """When the terminal ``result`` carries usage it is authoritative — the
     accumulated per-turn usage is not added on top."""
     blob = _stream(
-        {
-            "type": "assistant",
-            "message": {
-                "content": [{"type": "text", "text": "x"}],
-                "usage": {"input_tokens": 999, "output_tokens": 999},
-            },
-        },
+        _assistant(
+            {"type": "text", "text": "x"}, usage={"input_tokens": 999, "output_tokens": 999}
+        ),
         {
             "type": "result",
             "subtype": "success",
@@ -465,13 +453,7 @@ def test_parse_stream_json_falls_back_when_result_usage_degenerate() -> None:
     not shadow the accumulated per-turn usage — the all-None result is treated
     as absent so the summed per-turn counts survive."""
     blob = _stream(
-        {
-            "type": "assistant",
-            "message": {
-                "content": [{"type": "text", "text": "x"}],
-                "usage": {"input_tokens": 15, "output_tokens": 4},
-            },
-        },
+        _assistant({"type": "text", "text": "x"}, usage={"input_tokens": 15, "output_tokens": 4}),
         {"type": "result", "subtype": "success", "result": "x", "usage": {}},
     )
     _output, _trajectory, tokens, _errors = parse_stream_json(blob)
@@ -495,22 +477,13 @@ def test_parse_stream_json_dedupes_accumulated_usage_by_message_id() -> None:
     message's usage once, not once per block."""
     usage = {"input_tokens": 100, "output_tokens": 40, "cache_read_input_tokens": 8}
     blob = _stream(
-        {
-            "type": "assistant",
-            "message": {"id": "msg_1", "content": [{"type": "thinking"}], "usage": usage},
-        },
-        {
-            "type": "assistant",
-            "message": {"id": "msg_1", "content": [{"type": "text", "text": "hi"}], "usage": usage},
-        },
-        {
-            "type": "assistant",
-            "message": {
-                "id": "msg_1",
-                "content": [{"type": "tool_use", "id": "t", "name": "Bash", "input": {}}],
-                "usage": usage,
-            },
-        },
+        _assistant({"type": "thinking"}, msg_id="msg_1", usage=usage),
+        _assistant({"type": "text", "text": "hi"}, msg_id="msg_1", usage=usage),
+        _assistant(
+            {"type": "tool_use", "id": "t", "name": "Bash", "input": {}},
+            msg_id="msg_1",
+            usage=usage,
+        ),
     )
     _output, _trajectory, tokens, _errors = parse_stream_json(blob)
     assert tokens == _tok(input=100, cached=8, total=108)
@@ -532,10 +505,7 @@ def test_parse_stream_json_all_zero_result_usage_is_authoritative() -> None:
     """A terminal ``result`` reporting genuine zeros is trusted — it is not
     conflated with 'no usage reported' and replaced by the accumulator."""
     blob = _stream(
-        {
-            "type": "assistant",
-            "message": {"content": [{"type": "text", "text": "x"}], "usage": {"input_tokens": 50}},
-        },
+        _assistant({"type": "text", "text": "x"}, usage={"input_tokens": 50}),
         {
             "type": "result",
             "subtype": "success",
@@ -567,9 +537,7 @@ def test_parse_stream_json_degenerate_second_result_does_not_clobber() -> None:
 def test_parse_stream_json_recovers_concatenated_objects_on_one_line() -> None:
     """A rebuffered stream that concatenates objects onto one physical line must
     not lose the whole run to a single 'Extra data' error."""
-    line = json.dumps(
-        {"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}}
-    ) + json.dumps(
+    line = json.dumps(_assistant({"type": "text", "text": "hi"})) + json.dumps(
         {
             "type": "result",
             "subtype": "success",
@@ -593,10 +561,7 @@ def test_parse_stream_json_survives_unescaped_unicode_line_breaks() -> None:
     body = "line\u0085next"
     events = (
         _assistant({"type": "tool_use", "id": "t1", "name": "Bash", "input": {"cmd": "cat log"}}),
-        {
-            "type": "user",
-            "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": body}]},
-        },
+        _user({"type": "tool_result", "tool_use_id": "t1", "content": body}),
         {"type": "result", "subtype": "success", "result": "done"},
     )
     # ensure_ascii=False mirrors Node's JSON.stringify, which leaves U+0085 raw.
@@ -618,12 +583,7 @@ def test_parse_stream_json_clips_oversized_tool_results() -> None:
     payload = "A" * 20_000 + "TAIL"
     blob = _stream(
         _assistant({"type": "tool_use", "id": "t1", "name": "Read", "input": {}}),
-        {
-            "type": "user",
-            "message": {
-                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": payload}]
-            },
-        },
+        _user({"type": "tool_result", "tool_use_id": "t1", "content": payload}),
     )
     _output, trajectory, _tokens, errors = parse_stream_json(blob)
     result = trajectory[0]["result"]
@@ -639,12 +599,7 @@ def test_parse_stream_json_keeps_tool_results_under_the_cap_verbatim() -> None:
     payload = "B" * 500
     blob = _stream(
         _assistant({"type": "tool_use", "id": "t1", "name": "Read", "input": {}}),
-        {
-            "type": "user",
-            "message": {
-                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": payload}]
-            },
-        },
+        _user({"type": "tool_result", "tool_use_id": "t1", "content": payload}),
     )
     _output, trajectory, _tokens, _errors = parse_stream_json(blob)
     assert trajectory[0]["result"] == payload
@@ -1024,8 +979,6 @@ def test_execute_writes_claude_md_with_rules_text_before_subprocess(
     captured: dict = {}
 
     def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
-        from pathlib import Path
-
         cwd = kwargs.get("cwd")
         captured["cwd"] = cwd
         claude_md = Path(cwd) / "CLAUDE.md" if cwd else None

@@ -166,3 +166,24 @@ def test_entry_point_agent_resolves_with_no_harness_edit(
     mock_eps.assert_called_once_with(group="devops_bench.agents")
     # The harness threaded its built config into the entry-point-loaded agent.
     assert isinstance(_DummyAgent.last_config, AgentConfig)
+
+
+def test_manifest_records_the_canonical_harness_key(tmp_path, mocker: MockerFixture) -> None:
+    """An arm selected via an alias records the canonical key, not the alias.
+
+    ``harness`` is contractually the canonical key (``ResultRow.harness``), and
+    ``setup_id`` is derived from it, so recording the alias would split one arm
+    into two dashboard setups. Nothing else asserts what ``_write_run_artifacts``
+    writes.
+    """
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c")
+    harness.agent_type = "claude-code"
+    harness._agent_config.model = "claude-opus-4-8"  # noqa: SLF001 - arm identity under test
+    write_manifest = mocker.patch.object(harness.reporter, "write_manifest")
+    mocker.patch.object(harness.reporter, "write_rows")
+
+    harness._write_run_artifacts(tmp_path, [])  # noqa: SLF001 - the unit under test
+
+    manifest = write_manifest.call_args.args[1]
+    assert manifest["harness"] == "claude"
+    assert manifest["setupId"].startswith("claude-opus-4-8-claude")
