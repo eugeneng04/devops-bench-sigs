@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 
 from devops_bench.agents.shared.skills import iter_skills
 from devops_bench.core import get_logger
+from devops_bench.core.run_env import CHILD_SCOPED_ENVS
 
 if TYPE_CHECKING:
     from devops_bench.agents.capabilities import McpBinding
@@ -46,12 +47,6 @@ __all__ = [
 _log = get_logger("agents.shared.cli_capabilities")
 
 _SKILL_FILE = "SKILL.md"
-
-# The run-isolation vars forwarded into every CLI-spawned MCP server. Deliberately
-# the whole list and nothing more: each one *narrows* what the child can reach —
-# omitting it does not withhold access, it falls the child back to the operator's
-# ambient cluster and gcloud config, which is strictly broader than the run's.
-_MCP_ISOLATION_ENVS: tuple[str, ...] = ("KUBECONFIG", "CLOUDSDK_CONFIG")
 
 
 @contextlib.contextmanager
@@ -124,14 +119,14 @@ def mcp_isolation_env(extra_env: Mapping[str, str]) -> dict[str, str]:
 
     A CLI spawns its MCP servers itself, so they inherit the CLI's environment
     rather than the harness's — and both hermes and openclaw filter that child
-    env down to an allowlist plus whatever the server config names. A per-run
-    ``KUBECONFIG`` / ``CLOUDSDK_CONFIG`` therefore has to be written into the
-    server entry explicitly, or the server reads the developer's ambient cluster
-    and cloud config instead of the run's.
+    env down to an allowlist plus whatever the server config names. Each var in
+    :data:`~devops_bench.core.run_env.CHILD_SCOPED_ENVS` therefore has to be
+    written into the server entry explicitly, or the server falls back to the
+    operator's ambient config instead of the run's.
 
-    The set is :data:`_MCP_ISOLATION_ENVS` for every CLI rather than a per-agent
-    list: the vars are identical wherever they apply, and a shorter list is not
-    a tighter sandbox but a looser one.
+    The same set applies to every CLI rather than a per-agent list: forwarding
+    one of these *narrows* what the child can reach, so a shorter list is not a
+    tighter sandbox but a looser one.
 
     ``run_env`` publishes the per-run values on ``os.environ`` while
     ``extra_env`` is the operator's override, which wins — the same precedence
@@ -148,7 +143,7 @@ def mcp_isolation_env(extra_env: Mapping[str, str]) -> dict[str, str]:
         to empty or was set nowhere.
     """
     resolved: dict[str, str] = {}
-    for key in _MCP_ISOLATION_ENVS:
+    for key in CHILD_SCOPED_ENVS:
         value = extra_env[key] if key in extra_env else os.environ.get(key)
         if value:
             resolved[key] = value

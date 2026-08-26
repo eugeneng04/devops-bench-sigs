@@ -46,8 +46,8 @@ class ProviderSpec(BaseModel):
             ``MODELS.get`` (e.g. ``gemini`` / ``claude`` / ``ollama``).
         oc_provider: openclaw wire-provider id used in ``provider/model`` and the
             per-run ``_PROVIDER_TRANSPORT`` lookup.
-        hermes_provider: Name ``hermes chat --provider`` accepts, or ``None``
-            when hermes cannot serve this provider at all. Not derivable from
+        hermes_provider: Name ``hermes chat --provider`` accepts, defaulting to
+            ``None`` — hermes cannot serve this provider at all. Not derivable from
             ``adapter_family``: hermes's ``vertex`` is Google-Vertex-Gemini only
             (so ``anthropic-vertex`` has no equivalent and must fail loudly
             rather than answer from a Gemini model) and its OpenAI transport is
@@ -67,7 +67,7 @@ class ProviderSpec(BaseModel):
     canonical: str
     adapter_family: str
     oc_provider: str
-    hermes_provider: str | None
+    hermes_provider: str | None = None
     api_key_envs: tuple[str, ...]
     keyless_ok: bool
     backend: str | None = None

@@ -215,7 +215,8 @@ class HermesAgent(AgentHarness):
         rather than merged into whatever was already there.
 
         Also lays down the opt-out marker for hermes's bundled skill catalog, so
-        the only skills the agent sees are the ones the run actually granted.
+        the granted skills are the only ones the agent is offered beyond hermes's
+        own essential ``hermes-agent`` skill, which the marker cannot remove.
         """
         (run_dir / _NO_BUNDLED_SKILLS_MARKER).touch()
 
