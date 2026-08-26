@@ -238,17 +238,40 @@ def test_from_env_blank_mcp_config_falls_back_to_the_shorthand() -> None:
         ('{"servers": {}}', "no 'mcpServers' key"),
         ('{"mcpServers": []}', "must be a JSON object"),
         ('{"mcpServers": {"a": "uvx"}}', "must be a JSON object"),
-        ('{"mcpServers": {"a": {}}}', "non-empty 'command'"),
-        ('{"mcpServers": {"a": {"command": "uvx", "args": "x"}}}', "list of strings"),
-        ('{"mcpServers": {"a": {"command": "uvx", "env": {"K": 1}}}}', "string mapping"),
-        ('{"mcpServers": {"a": {"command": "uvx", "tools": "x"}}}', "list of strings"),
-        ('{"mcpServers": {"a": {"command": "uvx", "cwd": ["/tmp"]}}}', "'cwd' must be a string"),
-        # A falsy wrong type must raise rather than fall back to the default:
-        # dropping a declared env or argv leaves the server launching without
-        # its credential, and the probe then reports the wrong cause.
-        ('{"mcpServers": {"a": {"command": "uvx", "args": 0}}}', "list of strings"),
-        ('{"mcpServers": {"a": {"command": "uvx", "env": 0}}}', "string mapping"),
-        ('{"mcpServers": {"a": {"command": "uvx", "cwd": 0}}}', "'cwd' must be a string"),
+        ('{"mcpServers": {"a": {}}}', "command: Field required"),
+        ('{"mcpServers": {"a": {"command": ""}}}', "command: String should have at least 1"),
+        (
+            '{"mcpServers": {"a": {"command": "uvx", "args": "x"}}}',
+            "args: Input should be a valid list",
+        ),
+        (
+            '{"mcpServers": {"a": {"command": "uvx", "env": {"K": 1}}}}',
+            "env.K: Input should be a valid string",
+        ),
+        (
+            '{"mcpServers": {"a": {"command": "uvx", "tools": "x"}}}',
+            "tools: Input should be a valid list",
+        ),
+        (
+            '{"mcpServers": {"a": {"command": "uvx", "cwd": ["/tmp"]}}}',
+            "cwd: Input should be a valid string",
+        ),
+        # A falsy wrong type must raise rather than be coerced or fall back to
+        # the default: dropping a declared env or argv leaves the server
+        # launching without its credential, and the probe then reports the wrong
+        # cause. Strict mode is what makes ``0`` an error instead of ``"0"``.
+        (
+            '{"mcpServers": {"a": {"command": "uvx", "args": 0}}}',
+            "args: Input should be a valid list",
+        ),
+        (
+            '{"mcpServers": {"a": {"command": "uvx", "env": 0}}}',
+            "env: Input should be a valid dict",
+        ),
+        (
+            '{"mcpServers": {"a": {"command": "uvx", "cwd": 0}}}',
+            "cwd: Input should be a valid string",
+        ),
         ('{"mcpServers": {}}', "is empty"),
         ("/nonexistent/bench-mcp.json", "unreadable"),
     ],
@@ -268,6 +291,45 @@ def test_from_env_mcp_config_file_must_hold_a_json_object(tmp_path: Path) -> Non
 
     with pytest.raises(ConfigError, match="must be a JSON object"):
         AgentConfig.from_env({"AGENT_MCP_CONFIG": str(config)})
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["GITHUB_TOKEN", "API_KEY", "CLIENT_SECRET", "DB_PASSWORD", "GCP_CREDENTIALS"],
+)
+def test_from_env_rejects_a_literal_in_a_secret_named_mcp_env_value(key: str) -> None:
+    """A pasted credential must fail the config, not ride into the artifacts.
+
+    The declared env is written into the agent's workspace config and the
+    harness collects that workspace wholesale into the run's results, so a
+    literal secret is persisted. A ``${VAR}`` reference is resolved only for the
+    server's own process.
+    """
+    raw = json.dumps({"mcpServers": {"gh": {"command": "uvx", "env": {key: "ghp_literal"}}}})
+
+    with pytest.raises(ConfigError, match="looks like a credential"):
+        AgentConfig.from_env({"AGENT_MCP_CONFIG": raw})
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("GITHUB_TOKEN", "${GITHUB_TOKEN}"),
+        ("AUTH_HEADER_KEY", "Bearer ${GH_PAT}"),
+        # Not credential-shaped: rejecting every literal would break ordinary
+        # configuration, which is the common case.
+        ("NODE_ENV", "production"),
+        # An empty value carries nothing to leak.
+        ("API_KEY", ""),
+    ],
+)
+def test_from_env_accepts_references_and_non_secret_literals(key: str, value: str) -> None:
+    """The guard fires on secret-named keys holding a literal, and nothing else."""
+    raw = json.dumps({"mcpServers": {"gh": {"command": "uvx", "env": {key: value}}}})
+
+    cfg = AgentConfig.from_env({"AGENT_MCP_CONFIG": raw})
+
+    assert cfg.capabilities.mcp_servers[0].env == ((key, value),)
 
 
 def test_from_env_undecodable_mcp_config_file_raises_config_error(tmp_path: Path) -> None:

@@ -18,10 +18,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from devops_bench.agents.capabilities import (
     AgentRules,
@@ -32,6 +36,76 @@ from devops_bench.agents.capabilities import (
 from devops_bench.core import ConfigError, get_env, get_int
 
 __all__ = ["AgentConfig"]
+
+
+# ``${VAR}`` reference in a declared MCP env value — the same form
+# :func:`~devops_bench.agents.shared.mcp_probe.expand_env` resolves for the probe
+# and every supported CLI resolves for the server it launches.
+_ENV_REF = re.compile(r"\$\{\w+\}")
+
+# Env keys whose value must be a reference, never a literal. A binding's ``env``
+# is written verbatim into the CLI's config file inside the agent's workspace,
+# and the harness collects that workspace wholesale into the run's artifacts, so
+# a pasted credential would be persisted with the results.
+_SECRET_KEY_HINTS: tuple[str, ...] = ("TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL")
+
+
+def _reject_literal_secrets(name: str, env: dict[str, str]) -> None:
+    """Fail when a secret-named env value carries a literal instead of ``${VAR}``.
+
+    Args:
+        name: The server name, for the error message.
+        env: The server's declared ``env`` mapping.
+
+    Raises:
+        ConfigError: If a secret-named key holds a value with no ``${VAR}``
+            reference in it.
+    """
+    for key, value in env.items():
+        if not value or _ENV_REF.search(value):
+            continue
+        if any(hint in key.upper() for hint in _SECRET_KEY_HINTS):
+            raise ConfigError(
+                f"AGENT_MCP_CONFIG server {name!r} env {key!r} looks like a credential but "
+                f"holds a literal; use a '${{{key}}}' reference so the value stays out of "
+                "the run's artifacts"
+            )
+
+
+class _McpServerSpec(BaseModel):
+    """One entry of the standard ``mcpServers`` document.
+
+    Strict so a wrong JSON type fails the grant instead of being coerced: an
+    ``args`` of ``0`` silently becoming ``["0"]`` would launch the server with a
+    junk argument and report the resulting failure as unreachability.
+
+    Attributes:
+        command: The server binary. Required and non-empty — a binding with no
+            command is "no MCP", which is a grant that scores as an MCP arm.
+        args: Arguments appended to ``command``.
+        env: Declared child env; secret-named values must be ``${VAR}``
+            references, enforced by :func:`_reject_literal_secrets`.
+        cwd: Working directory the server is launched in; ``""`` for inherit.
+        tools: Tools to pre-approve, or ``None`` to inherit
+            ``AGENT_ALLOWED_TOOLS``. The distinction matters: an explicit ``[]``
+            grants none.
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    command: str = Field(min_length=1)
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    cwd: str = ""
+    tools: list[str] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_nulls(cls, data: Any) -> Any:
+        """Treat an explicit ``null`` as absent so the field default applies."""
+        if isinstance(data, dict):
+            return {key: value for key, value in data.items() if value is not None}
+        return data
 
 
 def _parse_csv(raw: str | None) -> tuple[str, ...]:
@@ -99,8 +173,12 @@ def _parse_mcp_config(raw: str, default_tools: tuple[str, ...]) -> tuple[McpBind
     Returns:
         One binding per entry, in document order.
 
+    A secret-named ``env`` value must be a ``${VAR}`` reference, not a literal —
+    see :func:`_reject_literal_secrets`.
+
     Raises:
-        ConfigError: If the document is malformed or an entry has no ``command``.
+        ConfigError: If the document is malformed, an entry has no ``command``,
+            or a secret-named ``env`` value holds a literal.
     """
     servers = _load_mcp_config(raw).get("mcpServers")
     if servers is None:
@@ -117,35 +195,22 @@ def _parse_mcp_config(raw: str, default_tools: tuple[str, ...]) -> tuple[McpBind
     for name, entry in servers.items():
         if not isinstance(entry, dict):
             raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} must be a JSON object")
-        command = entry.get("command")
-        if not isinstance(command, str) or not command:
-            raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} needs a non-empty 'command'")
-        args = entry.get("args")
-        args = [] if args is None else args
-        if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
-            raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} 'args' must be a list of strings")
-        env = entry.get("env")
-        env = {} if env is None else env
-        if not isinstance(env, dict) or not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in env.items()
-        ):
-            raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} 'env' must be a string mapping")
-        tools = entry.get("tools")
-        if tools is not None and (
-            not isinstance(tools, list) or not all(isinstance(t, str) for t in tools)
-        ):
-            raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} 'tools' must be a list of strings")
-        cwd = entry.get("cwd")
-        cwd = "" if cwd is None else cwd
-        if not isinstance(cwd, str):
-            raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} 'cwd' must be a string")
+        try:
+            spec = _McpServerSpec.model_validate(entry)
+        except ValidationError as exc:
+            detail = "; ".join(
+                f"{'.'.join(str(part) for part in err['loc'])}: {err['msg']}"
+                for err in exc.errors()
+            )
+            raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} is invalid: {detail}") from exc
+        _reject_literal_secrets(name, spec.env)
         bindings.append(
             McpBinding(
                 name=name,
-                command=(command, *args),
-                env=tuple(env.items()),
-                cwd=cwd,
-                tools=tuple(tools) if tools is not None else default_tools,
+                command=(spec.command, *spec.args),
+                env=tuple(spec.env.items()),
+                cwd=spec.cwd,
+                tools=tuple(spec.tools) if spec.tools is not None else default_tools,
             )
         )
     return tuple(bindings)

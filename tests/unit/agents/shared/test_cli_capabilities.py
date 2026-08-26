@@ -278,3 +278,44 @@ def test_materialize_skills_survives_a_dangling_link(tmp_path: Path) -> None:
     written = materialize_skills(tmp_path / "dest", (str(tmp_path / "src"),))
 
     assert written == ["broken"]
+
+
+def test_materialize_skills_skips_a_skill_md_at_the_discovery_root(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A ``SKILL.md`` at the top of a granted path has the whole tree as its
+    bundle, so copying it would nest every sibling skill inside it — and each
+    sibling is materialized again in its own right. It is skipped and warned."""
+    src = tmp_path / "src"
+    (src / "rotate").mkdir(parents=True)
+    (src / "rotate" / "SKILL.md").write_text(
+        "---\nname: rotate\ndescription: d\n---\nbody\n", encoding="utf-8"
+    )
+    (src / "SKILL.md").write_text(
+        "---\nname: at-root\ndescription: d\n---\nbody\n", encoding="utf-8"
+    )
+    dest = tmp_path / "dest"
+
+    with caplog.at_level("WARNING", logger="devops_bench.agents.shared.cli_capabilities"):
+        written = materialize_skills(dest, (str(src),))
+
+    assert written == ["rotate"]
+    assert not (dest / "at-root").exists()
+    assert not (dest / "rotate" / "rotate").exists()
+    assert any("discovery root" in r.message for r in caplog.records)
+
+
+def test_materialize_skills_skips_a_root_skill_reached_through_a_symlinked_path(
+    tmp_path: Path,
+) -> None:
+    """The root comparison resolves both sides, so granting a path by way of a
+    symlink does not slip a root-level bundle past the guard."""
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "SKILL.md").write_text(
+        "---\nname: at-root\ndescription: d\n---\nbody\n", encoding="utf-8"
+    )
+    link = tmp_path / "link"
+    link.symlink_to(real)
+
+    assert materialize_skills(tmp_path / "dest", (str(link),)) == []

@@ -158,7 +158,9 @@ def materialize_skills(skills_root: Path, paths: tuple[str, ...]) -> list[str]:
     copying ``SKILL.md`` alone leaves those instructions pointing at nothing.
 
     Symlinks are recreated rather than dereferenced, and any resolving outside
-    the bundle are dropped — see :func:`_ignore_escaping_links`.
+    the bundle are dropped — see :func:`_ignore_escaping_links`. A ``SKILL.md``
+    sitting directly in a discovery root is skipped with a warning: its bundle
+    would be the entire tree, nesting every sibling skill inside it.
 
     Args:
         skills_root: The destination skills directory to populate.
@@ -170,11 +172,24 @@ def materialize_skills(skills_root: Path, paths: tuple[str, ...]) -> list[str]:
     Returns:
         The names of the skills materialized, in discovery order.
     """
+    roots = {Path(os.path.expanduser(path)).resolve() for path in paths if path}
     written: list[str] = []
     for skill in iter_skills(paths):
+        bundle = Path(skill.path).parent
+        if bundle.resolve() in roots:
+            # A ``SKILL.md`` at the top of a discovery path makes its "bundle"
+            # the whole tree, so copying it would nest every sibling skill
+            # inside this one — and each sibling is materialized again in its
+            # own right. Skills live one directory down; say so and skip.
+            _log.warning(
+                "Skipping skill %r: its SKILL.md sits at the discovery root %s, so its "
+                "bundle would be every other skill in that tree",
+                skill.name,
+                bundle,
+            )
+            continue
         dest_dir = skills_root / skill.name
         dest_dir.parent.mkdir(parents=True, exist_ok=True)
-        bundle = Path(skill.path).parent
         shutil.copytree(
             bundle,
             dest_dir,

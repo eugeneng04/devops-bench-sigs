@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 
 _PREFLIGHT_MODULES = (
+    "devops_bench.agents.cli.antigravity.agent",
     "devops_bench.agents.cli.gemini_cli.agent",
     "devops_bench.agents.cli.openclaw.agent",
 )

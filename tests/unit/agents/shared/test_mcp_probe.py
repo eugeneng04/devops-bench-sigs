@@ -389,3 +389,22 @@ def test_preflight_names_the_first_failure_in_binding_order(tmp_path: Path) -> N
 
     with pytest.raises(McpUnreachableError, match="'alpha'"):
         preflight_mcp(bindings, base_env=dict(os.environ), timeout=10.0)
+
+
+def test_probe_survives_a_stdout_burst_larger_than_the_line_cap(tmp_path: Path) -> None:
+    """A server logging far more than ``_MAX_STDOUT_LINES`` before its reply must
+    still hand that reply to the probe.
+
+    The reader thread holds a bounded queue so a chatty server cannot exhaust
+    memory, but the cap is a backlog limit, not a total: the consumer drains
+    concurrently. If the reader ever blocked on a full queue instead of dropping,
+    the server would stall behind its own pipe and the probe would report a
+    healthy server as unreachable.
+    """
+    burst = _FAKE_SERVER.replace(
+        "for line in sys.stdin:",
+        'for _i in range(5000):\n    print("log line", _i, flush=True)\n\nfor line in sys.stdin:',
+    )
+    binding = McpBinding(name="chatty", command=_server(tmp_path, burst))
+
+    assert probe_stdio_server(binding, timeout=30) == ("alpha", "beta")

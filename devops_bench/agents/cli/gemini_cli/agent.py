@@ -118,7 +118,7 @@ def _status_rows(listing: str, name: str) -> list[str]:
     return [match.group(1) for match in row.finditer(listing)]
 
 
-def _verify_cli_sees_mcp(
+def _mcp_gate_failure(
     target: str,
     workdir: Path,
     expected: tuple[str, ...],
@@ -228,7 +228,7 @@ def _build_argv(
     gate (verified on 0.56: the run gets no MCP tools and no warning), so the
     host must trust the workspace — via a ``~/.gemini/trustedFolders.json``
     entry, or the user-level ``security.folderTrust.enabled = false`` where that
-    still works. :func:`_verify_cli_sees_mcp` fails the run when it does not.
+    still works. :func:`_mcp_gate_failure` fails the run when it does not.
 
     Args:
         target: Path to the ``gemini`` binary (already user-expanded).
@@ -365,7 +365,7 @@ class GeminiCliAgent(AgentHarness):
 
             expected = tuple(build_mcp_servers(caps.mcp_servers))
             if expected:
-                reason = _verify_cli_sees_mcp(target, workdir, expected, env_overlay=env_overlay)
+                reason = _mcp_gate_failure(target, workdir, expected, env_overlay=env_overlay)
                 if reason:
                     detail = _probe_failure_detail(
                         caps.mcp_servers, env_overlay=env_overlay, workdir=workdir

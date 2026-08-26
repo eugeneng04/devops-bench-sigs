@@ -22,8 +22,11 @@ speaking the MCP stdio handshake directly — ``initialize`` /
 before the agent is invoked, so an unreachable server fails the run instead of
 scoring one.
 
-The handshake is implemented here rather than through the ``mcp`` SDK to keep
-the probe dependency-free; it is ~3 messages and the transport is line-based.
+The handshake is hand-rolled rather than driven through the ``mcp`` SDK (which
+the project already depends on) because the SDK's client is async and manages
+the child process for you, while this probe needs synchronous control of the
+launch: its own process group, a hard wall-clock deadline, and the child's
+stderr tail to report on failure. It is ~3 messages over a line-based transport.
 """
 
 from __future__ import annotations
@@ -47,7 +50,13 @@ from devops_bench.core import DevOpsBenchError, get_logger
 if TYPE_CHECKING:  # pragma: no cover - typing-only import
     from devops_bench.agents.capabilities import McpBinding
 
-__all__ = ["McpUnreachableError", "expand_env", "preflight_mcp", "probe_stdio_server"]
+__all__ = [
+    "McpUnreachableError",
+    "child_env",
+    "expand_env",
+    "preflight_mcp",
+    "probe_stdio_server",
+]
 
 _log = get_logger("agents.shared.mcp_probe")
 
@@ -122,14 +131,29 @@ def expand_env(
     return _ENV_REF.sub(_sub, value)
 
 
-def _child_env(binding: McpBinding, base_env: Mapping[str, str]) -> dict[str, str]:
+def child_env(binding: McpBinding, base_env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Build the child environment for ``binding``, resolving secret references.
+
+    The runner env is the base rather than the declared vars alone: a stdio
+    server is a subprocess that still needs ``PATH``, ``HOME``, and the run's
+    isolation vars to start at all.
+
+    Args:
+        binding: The server whose declared ``env`` is resolved.
+        base_env: Mapping references resolve against; defaults to ``os.environ``.
+            The API agent routes through here precisely so it holds no
+            ``os.environ`` read of its own.
+
+    Returns:
+        The full environment the server subprocess should be launched with.
 
     Raises:
         McpUnreachableError: If a declared reference is absent from ``base_env``.
             Fail here rather than launch the server with an empty credential and
             report the resulting auth error as "unreachable".
     """
+    if base_env is None:
+        base_env = os.environ
     env = dict(base_env)
     missing: list[str] = []
     for key, raw in binding.env:
@@ -139,16 +163,32 @@ def _child_env(binding: McpBinding, base_env: Mapping[str, str]) -> dict[str, st
     return env
 
 
-def _secret_values(binding: McpBinding, resolved: Mapping[str, str]) -> tuple[str, ...]:
+def _secret_values(binding: McpBinding, source: Mapping[str, str]) -> tuple[str, ...]:
     """Return the values ``${VAR}`` expansion injected, for redaction.
 
     Only values that came from a reference are returned: a literal declared in
     the config is already visible to anyone reading the config, whereas an
     expanded reference is a credential this process resolved and must not echo
     back into a run artifact.
+
+    Each *substituted value* is collected, not the declared value it was spliced
+    into. A binding declaring ``AUTH="Bearer ${TOKEN}"`` must redact ``ghp_...``
+    on its own, because a server rejecting the credential echoes the bare token
+    far more often than the whole header.
+
+    Args:
+        binding: The binding whose declared ``env`` is scanned for references.
+        source: Mapping the references resolve against (the runner env).
+
+    Returns:
+        The distinct substituted values, longest first so a secret that contains
+        another is replaced before its substring.
     """
     secrets = {
-        resolved[key] for key, raw in binding.env if _ENV_REF.search(raw) and resolved.get(key)
+        source[name]
+        for _key, raw in binding.env
+        for name in _ENV_REF.findall(raw)
+        if source.get(name)
     }
     return tuple(sorted(secrets, key=len, reverse=True))
 
@@ -169,19 +209,47 @@ def _redact(text: str, secrets: tuple[str, ...]) -> str:
 def _pump(stream: IO[str], sink: queue.Queue[str | None]) -> None:
     """Forward each line of ``stream`` onto ``sink``, then a ``None`` sentinel.
 
-    Drops the oldest line when the queue is full: a server that chatters for its
-    whole timeout budget must not grow this process without bound.
+    Never blocks on a full queue: this thread outlives the probe's own deadline,
+    so a wait here would strand it after teardown. Instead the *oldest* queued
+    line is evicted to make room. That direction matters — the probe reads a
+    reply only after it has sent the request, so everything the server logged
+    beforehand is noise and the awaited reply is always the newest line. Dropping
+    the newest would discard the reply itself and report a merely chatty server
+    as unreachable.
+
+    Bounding the queue keeps a server that chatters for its whole timeout budget
+    from growing this process without bound.
     """
+    dropped = 0
     try:
         for line in stream:
-            try:
-                sink.put_nowait(line)
-            except queue.Full:
-                with contextlib.suppress(queue.Empty):  # pragma: no cover - racing consumer
-                    sink.get_nowait()
-                sink.put_nowait(line)
+            if _put_evicting_oldest(sink, line):
+                dropped += 1
     finally:
-        sink.put(None)
+        if dropped:
+            _log.warning(
+                "MCP probe discarded %d stdout line(s) past the %d-line cap",
+                dropped,
+                _MAX_STDOUT_LINES,
+            )
+        _put_evicting_oldest(sink, None)
+
+
+def _put_evicting_oldest(sink: queue.Queue[str | None], item: str | None) -> bool:
+    """Enqueue ``item`` without blocking, discarding the head if the queue is full.
+
+    Returns:
+        ``True`` if a queued item had to be discarded to make room.
+    """
+    try:
+        sink.put_nowait(item)
+        return False
+    except queue.Full:
+        with contextlib.suppress(queue.Empty):
+            sink.get_nowait()
+        with contextlib.suppress(queue.Full):
+            sink.put_nowait(item)
+        return True
 
 
 def _drain_stderr(stream: IO[str], sink: collections.deque[str]) -> None:
@@ -264,8 +332,9 @@ def probe_stdio_server(
             the handshake within ``timeout``, or answers with a JSON-RPC error,
             or completes the handshake advertising no tools.
     """
-    env = _child_env(binding, os.environ if base_env is None else base_env)
-    secrets = _secret_values(binding, env)
+    source = os.environ if base_env is None else base_env
+    env = child_env(binding, source)
+    secrets = _secret_values(binding, source)
     deadline = time.monotonic() + timeout
     try:
         proc = subprocess.Popen(  # noqa: S603 - argv list, never a shell string

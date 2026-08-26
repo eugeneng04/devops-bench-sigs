@@ -443,6 +443,7 @@ class OpenClawAgent(AgentHarness):
         with agent_workdir(workspace_path, prefix="oc-run-") as workdir:
             state_dir = workdir / _OPENCLAW_STATE_DIRNAME
             state_dir.mkdir(parents=True, exist_ok=True)
+            env_overlay = _build_env(self.config)
 
             try:
                 # Inside the workdir so the probe launches each server exactly as
@@ -451,7 +452,7 @@ class OpenClawAgent(AgentHarness):
                 # openclaw has no `mcp list` equivalent, so this is the only gate.
                 preflight_mcp(
                     caps.mcp_servers,
-                    base_env={**os.environ, **_build_env(self.config)},
+                    base_env={**os.environ, **env_overlay},
                     cwd=workdir,
                 )
             except McpUnreachableError as exc:
@@ -461,7 +462,6 @@ class OpenClawAgent(AgentHarness):
 
             materialize_skills(state_dir / _OPENCLAW_SKILLS_DIRNAME, caps.skills.paths)
 
-            env_overlay = _build_env(self.config)
             env_overlay["OPENCLAW_STATE_DIR"] = str(state_dir)
 
             config_payload = _build_openclaw_config(self.config, caps.mcp_servers)

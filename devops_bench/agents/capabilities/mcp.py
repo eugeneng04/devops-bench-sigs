@@ -40,10 +40,24 @@ class McpBinding:
         env: Environment pairs the server is launched with, as a tuple of
             ``(name, value)`` so the binding stays hashable. A value may carry
             ``${VAR}`` references (braces required — a bare ``$VAR`` stays
-            literal) resolved from the runner's environment; references are
-            written through to the CLI's config
-            file **unexpanded** so a credential never lands in the agent's
-            workspace, which is collected wholesale into the run's artifacts.
+            literal) resolved from the runner's environment.
+
+            Two things expand those references, and which one runs depends on
+            who launches the server:
+
+            * The harness, via
+              :func:`~devops_bench.agents.shared.mcp_probe.expand_env`, when it
+              spawns the server itself — the preflight probe and the API agent.
+              The resolved value exists only in that child process.
+            * The CLI, for a server the binary spawns. The reference is written
+              into the CLI's config file **unexpanded** and the CLI resolves it
+              from its own environment, so a credential never lands in the
+              agent's workspace — which is collected wholesale into the run's
+              artifacts.
+
+            Both read the same runner env, so the two paths agree on the value;
+            only the expansion point differs. A secret-named value must be a
+            reference rather than a literal, enforced when the grant is parsed.
         cwd: Working directory the server is launched in. Empty inherits the
             agent's working directory (the per-run workspace).
         tools: Tool names this server exposes to the agent. The Gemini CLI
