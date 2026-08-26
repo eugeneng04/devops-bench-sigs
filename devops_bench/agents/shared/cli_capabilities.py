@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from devops_bench.agents.shared.skills import iter_skills
-from devops_bench.core import get_logger
+from devops_bench.core import ConfigError, get_logger
 
 if TYPE_CHECKING:
     from devops_bench.agents.capabilities import McpBinding
@@ -90,12 +90,17 @@ def build_mcp_servers(mcp_servers: tuple[McpBinding, ...]) -> dict[str, dict]:
         mapping suitable for the agent's MCP-servers config section, carrying
         only the keys a binding populates. Empty when no binding carries a
         command.
+
+    Raises:
+        ConfigError: If two bindings resolve to the same name.
     """
     servers: dict[str, dict] = {}
     for index, binding in enumerate(mcp_servers):
         if not binding.command:
             continue
         name = binding.name or f"mcp{index}"
+        if name in servers:
+            raise ConfigError(f"two granted MCP servers resolve to the name {name!r}")
         cmd = binding.command[0]
         if os.sep in cmd:
             if os.path.exists(cmd):

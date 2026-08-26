@@ -26,6 +26,7 @@ from devops_bench.agents.shared.cli_capabilities import (
     build_mcp_servers,
     materialize_skills,
 )
+from devops_bench.core import ConfigError
 
 
 def test_build_mcp_servers_maps_command_to_command_and_args() -> None:
@@ -52,6 +53,28 @@ def test_build_mcp_servers_names_unnamed_bindings_by_index() -> None:
     """A binding with no name falls back to a positional ``mcp<index>`` key."""
     servers = build_mcp_servers((McpBinding(name="", command=("srv",)),))
     assert servers == {"mcp0": {"command": "srv"}}
+
+
+def test_build_mcp_servers_rejects_bindings_that_resolve_to_one_name() -> None:
+    """A colliding name would drop a granted server from the launch map."""
+    with pytest.raises(ConfigError, match="resolve to the name 'gke'"):
+        build_mcp_servers(
+            (
+                McpBinding(name="gke", command=("a",)),
+                McpBinding(name="gke", command=("b",)),
+            )
+        )
+
+
+def test_build_mcp_servers_rejects_a_name_colliding_with_the_index_fallback() -> None:
+    """An explicit name can collide with an unnamed binding's ``mcp<index>`` key."""
+    with pytest.raises(ConfigError, match="resolve to the name 'mcp1'"):
+        build_mcp_servers(
+            (
+                McpBinding(name="mcp1", command=("a",)),
+                McpBinding(name="", command=("b",)),
+            )
+        )
 
 
 def test_materialize_skills_writes_named_skill_files(tmp_path: Path) -> None:
