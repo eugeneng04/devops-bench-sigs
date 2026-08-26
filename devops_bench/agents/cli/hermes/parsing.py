@@ -118,11 +118,14 @@ def _parse_arguments(raw: object) -> dict:
 def extract_trajectory_from_db(db_path: Path) -> tuple[list[dict], list[str]]:
     """Extract the canonical trajectory from a Hermes ``state.db``.
 
-    Reads the newest session's ``messages`` rows: an ``assistant`` row's
-    ``tool_calls`` JSON opens a :class:`~devops_bench.agents.result.ToolCall`,
-    and the matching ``tool`` row (keyed on ``tool_call_id``) folds the result
-    in. Extraction misses are reported on the returned error list rather than
-    yielding a silent-empty trajectory.
+    Reads the ``messages`` rows of every session in the run-scoped DB: an
+    ``assistant`` row's ``tool_calls`` JSON opens a
+    :class:`~devops_bench.agents.result.ToolCall`, and the matching ``tool`` row
+    (keyed on ``tool_call_id``) folds the result in. All sessions are read, not
+    just the newest, so the trajectory covers the same rows
+    :func:`extract_tokens_from_db` sums its usage over. Extraction misses are
+    reported on the returned error list rather than yielding a silent-empty
+    trajectory.
 
     Args:
         db_path: Path to the run's ``state.db``.
@@ -142,20 +145,18 @@ def extract_trajectory_from_db(db_path: Path) -> tuple[list[dict], list[str]]:
         conn = _connect_ro(db_path)
         try:
             cursor = conn.cursor()
-            # Ordered by rowid, not by ``id``: hermes session ids are UUIDs, so
-            # lexical ordering picks an arbitrary session. rowid is insertion
-            # order and exists on every rowid table, whatever the schema version.
-            cursor.execute("SELECT id FROM sessions ORDER BY rowid DESC LIMIT 1")
-            row = cursor.fetchone()
-            if not row:
+            if not cursor.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]:
                 errors.append("No session found in state database")
                 return [], errors
-            session_id = row[0]
 
+            # Ordered by ``sessions.rowid``, not by ``id``: hermes session ids
+            # are UUIDs, so lexical ordering interleaves sessions arbitrarily.
+            # rowid is insertion order and exists on every rowid table, whatever
+            # the schema version.
             cursor.execute(
-                "SELECT role, content, tool_calls, tool_call_id, tool_name"
-                " FROM messages WHERE session_id = ? ORDER BY id",
-                (session_id,),
+                "SELECT m.role, m.content, m.tool_calls, m.tool_call_id, m.tool_name"
+                " FROM messages m JOIN sessions s ON m.session_id = s.id"
+                " ORDER BY s.rowid, m.id"
             )
             messages = cursor.fetchall()
         finally:

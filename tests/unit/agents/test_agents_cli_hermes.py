@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -29,7 +30,7 @@ from ruamel.yaml import YAML
 from devops_bench.agents.base import AGENTS
 from devops_bench.agents.capabilities import AllCapabilities, McpBinding, SkillBinding
 from devops_bench.agents.cli.hermes import agent as agent_mod
-from devops_bench.agents.cli.hermes.agent import HermesAgent, _build_env, _prepend_rules
+from devops_bench.agents.cli.hermes.agent import HermesAgent, _build_env
 from devops_bench.agents.cli.hermes.parsing import (
     extract_tokens_from_db,
     extract_trajectory_from_db,
@@ -128,11 +129,6 @@ def test_build_env_omits_key_vars_when_no_key_is_configured() -> None:
     assert _build_env(AgentConfig(provider="google-vertex")) == {}
 
 
-def test_prepend_rules_is_a_noop_for_blank_rules() -> None:
-    assert _prepend_rules("   \n", "do the thing") == "do the thing"
-    assert _prepend_rules("be careful\n", "do the thing") == "be careful\n\ndo the thing"
-
-
 def test_resolve_hermes_bin_prefers_the_configured_target() -> None:
     agent = HermesAgent(AgentConfig(target="/custom/bin/hermes"))
     assert agent._resolve_hermes_bin() == "/custom/bin/hermes"
@@ -221,19 +217,6 @@ def test_prepare_config_opts_out_of_the_skills_the_run_never_granted(tmp_path: P
     assert data["skills"]["project_discovery"] is False
 
 
-def test_prepare_config_keeps_seeded_skill_settings_while_forcing_discovery_off(
-    tmp_path: Path,
-) -> None:
-    (tmp_path / "config.yaml").write_text(
-        "skills:\n  external_dirs: ['/team']\n  project_discovery: true\n", encoding="utf-8"
-    )
-
-    HermesAgent(AgentConfig())._prepare_config(tmp_path, ())
-
-    data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
-    assert data["skills"] == {"external_dirs": ["/team"], "project_discovery": False}
-
-
 def test_prune_install_artifacts_keeps_the_run_evidence(tmp_path: Path) -> None:
     (tmp_path / "bin").mkdir()
     (tmp_path / "bin" / "tirith").write_bytes(b"\x00")
@@ -268,55 +251,6 @@ def test_prepare_config_forwards_the_run_isolation_env_to_mcp_servers(tmp_path: 
     }
 
 
-def test_prepare_config_merges_over_a_null_mcp_servers_key(tmp_path: Path) -> None:
-    """A seeded config with an explicit ``mcp_servers: null`` must not crash."""
-    (tmp_path / "config.yaml").write_text("mcp_servers: null\n", encoding="utf-8")
-    agent = HermesAgent(AgentConfig())
-
-    agent._prepare_config(tmp_path, (McpBinding(name="k8s", command=("k8s-mcp",)),))
-
-    data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
-    assert data["mcp_servers"]["k8s"]["command"] == "k8s-mcp"
-
-
-def test_prepare_config_keeps_unrelated_keys_from_a_seeded_config(tmp_path: Path) -> None:
-    (tmp_path / "config.yaml").write_text("model: local-model\n", encoding="utf-8")
-    agent = HermesAgent(AgentConfig())
-
-    agent._prepare_config(tmp_path, (McpBinding(name="k8s", command=("k8s-mcp",)),))
-
-    data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
-    assert data["model"] == "local-model"
-    assert "k8s" in data["mcp_servers"]
-
-
-def test_prepare_config_ignores_a_seeded_config_that_is_not_a_mapping(tmp_path: Path) -> None:
-    """Valid YAML of the wrong shape must not abort the run on the merge."""
-    (tmp_path / "config.yaml").write_text("- a\n- b\n", encoding="utf-8")
-    agent = HermesAgent(AgentConfig())
-
-    agent._prepare_config(tmp_path, (McpBinding(name="k8s", command=("k8s-mcp",)),))
-
-    data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
-    assert data == {
-        "mcp_servers": {"k8s": {"command": "k8s-mcp"}},
-        "skills": {"project_discovery": False},
-    }
-
-
-def test_prepare_config_ignores_a_seeded_mcp_servers_that_is_not_a_mapping(
-    tmp_path: Path,
-) -> None:
-    """``mcp_servers: disabled`` must not abort the run on the merge."""
-    (tmp_path / "config.yaml").write_text("mcp_servers: disabled\n", encoding="utf-8")
-    agent = HermesAgent(AgentConfig())
-
-    agent._prepare_config(tmp_path, (McpBinding(name="k8s", command=("k8s-mcp",)),))
-
-    data = _yaml.load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
-    assert data["mcp_servers"] == {"k8s": {"command": "k8s-mcp"}}
-
-
 def test_prepare_config_prefers_the_configured_isolation_override(tmp_path: Path) -> None:
     """``extra_env`` wins over the ambient value, as it does in ``_build_env``."""
     agent = HermesAgent(AgentConfig(extra_env={"KUBECONFIG": "/override/kubeconfig"}))
@@ -339,15 +273,6 @@ def test_prepare_config_omits_the_env_block_without_isolation(tmp_path: Path) ->
     assert "env" not in data["mcp_servers"]["k8s"]
 
 
-def test_prepare_config_survives_an_unparseable_seeded_config(tmp_path: Path) -> None:
-    (tmp_path / "config.yaml").write_text("::: not yaml :::\n", encoding="utf-8")
-    agent = HermesAgent(AgentConfig())
-
-    agent._prepare_config(tmp_path, ())
-
-    assert (tmp_path / "config.yaml").exists()
-
-
 def test_prepare_config_does_not_read_user_state_by_default(tmp_path: Path) -> None:
     """A benchmark run is reproducible: ``~/.hermes`` is not inherited."""
     home = tmp_path / "home"
@@ -362,41 +287,53 @@ def test_prepare_config_does_not_read_user_state_by_default(tmp_path: Path) -> N
     assert not (run_dir / "SOUL.md").exists()
 
 
-def test_prepare_config_inherits_user_state_when_asked(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    (home / ".hermes").mkdir(parents=True)
-    (home / ".hermes" / "SOUL.md").write_text("ambient", encoding="utf-8")
-    (home / ".hermes" / ".env").write_text("ANTHROPIC_API_KEY=secret", encoding="utf-8")
-    run_dir = tmp_path / "run"
-    run_dir.mkdir()
-
-    with patch.dict(os.environ, {"HOME": str(home)}):
-        HermesAgent(AgentConfig(), inherit_user_config=True)._prepare_config(run_dir, ())
-
-    assert (run_dir / "SOUL.md").read_text(encoding="utf-8") == "ambient"
-    # ``.env`` holds the user's credentials and the run home lands in the run
-    # artifacts, so it is never inherited.
-    assert not (run_dir / ".env").exists()
+_DEFAULT_COUNTS: tuple[int, ...] = (2748, 11267, 152, 334987, 12000)
 
 
-# --- _execute wiring ---------------------------------------------------------
-
-
-def _seed_state_db(
-    home: Path, *, counts: tuple[int, ...] = (2748, 11267, 152, 334987, 12000)
-) -> None:
+def _seed_state_db(home: Path, *, counts: tuple[int, ...] = _DEFAULT_COUNTS) -> None:
     _init_schema(home / "state.db")
     _insert_session(home / "state.db", "s1", *counts)
+
+
+def _fake_run(
+    *,
+    returncode: int = 0,
+    stdout: str = "ok",
+    stderr: str = "",
+    counts: tuple[int, ...] = _DEFAULT_COUNTS,
+    seed: Callable[[Path], None] | None = None,
+    seen: dict | None = None,
+) -> Callable[..., SimpleNamespace]:
+    """Build a ``core.subprocess.run`` stand-in that seeds the run's ``state.db``.
+
+    Tolerant of extra keywords on purpose: pinning ``run``'s exact signature in
+    every test means one new keyword there breaks all of them at once.
+
+    Args:
+        returncode: Exit status the fake reports.
+        stdout: Captured stdout the fake reports.
+        stderr: Captured stderr the fake reports.
+        counts: Session token counts to seed, in ``_TOKEN_COLUMNS`` order.
+        seed: Optional extra seeding (e.g. messages), called with the run home.
+        seen: Optional dict the call's ``cmd`` / ``cwd`` / ``home`` are recorded in.
+    """
+
+    def fake_run(cmd: list[str], **kwargs) -> SimpleNamespace:
+        home = Path(kwargs["extra_env"]["HERMES_HOME"])
+        _seed_state_db(home, counts=counts)
+        if seed is not None:
+            seed(home)
+        if seen is not None:
+            seen.update(cmd=cmd, cwd=kwargs["cwd"], home=str(home))
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    return fake_run
 
 
 def test_execute_reports_trajectory_and_tokens_from_the_state_db() -> None:
     """End-to-end wiring: the run-scoped DB reaches ``AgentResult``."""
 
-    def fake_run(
-        cmd: list[str], check: bool, cwd: str, timeout: float | None, extra_env: dict[str, str]
-    ) -> SimpleNamespace:
-        home = Path(extra_env["HERMES_HOME"])
-        _seed_state_db(home)
+    def seed(home: Path) -> None:
         _insert_message(
             home / "state.db",
             "s1",
@@ -404,9 +341,8 @@ def test_execute_reports_trajectory_and_tokens_from_the_state_db() -> None:
             tool_calls=_tool_calls_json("call_1", "kubectl_apply", {"manifest": "nginx.yaml"}),
         )
         _insert_message(home / "state.db", "s1", "tool", content="applied", tool_call_id="call_1")
-        return SimpleNamespace(returncode=0, stdout="done", stderr="")
 
-    with patch.object(agent_mod, "run", side_effect=fake_run):
+    with patch.object(agent_mod, "run", side_effect=_fake_run(stdout="done", seed=seed)):
         result = HermesAgent(AgentConfig(target="/bin/hermes")).run("hello")
 
     assert result.output == "done"
@@ -433,15 +369,7 @@ def test_execute_runs_in_the_harness_workspace_when_given_one(tmp_path: Path) ->
     """hermes runs *in* the workspace but keeps its own state out of it."""
     seen: dict = {}
 
-    def fake_run(
-        cmd: list[str], check: bool, cwd: str, timeout: float | None, extra_env: dict[str, str]
-    ) -> SimpleNamespace:
-        seen["cwd"] = cwd
-        seen["home"] = extra_env["HERMES_HOME"]
-        _seed_state_db(Path(extra_env["HERMES_HOME"]))
-        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
-
-    with patch.object(agent_mod, "run", side_effect=fake_run):
+    with patch.object(agent_mod, "run", side_effect=_fake_run(seen=seen)):
         HermesAgent(AgentConfig(target="/bin/hermes")).run("hello", tmp_path)
 
     assert seen["cwd"] == str(tmp_path)
@@ -459,29 +387,18 @@ def test_execute_materializes_granted_skills_under_the_state_home(tmp_path: Path
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
-    def fake_run(
-        cmd: list[str], check: bool, cwd: str, timeout: float | None, extra_env: dict[str, str]
-    ) -> SimpleNamespace:
-        _seed_state_db(Path(extra_env["HERMES_HOME"]))
-        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
-
     config = AgentConfig(
         target="/bin/hermes",
         capabilities=AllCapabilities(skills=SkillBinding(paths=(str(tmp_path / "src"),))),
     )
-    with patch.object(agent_mod, "run", side_effect=fake_run):
+    with patch.object(agent_mod, "run", side_effect=_fake_run()):
         HermesAgent(config).run("hello", workspace)
 
     assert (workspace / ".hermes" / "skills" / "deploy" / "SKILL.md").exists()
 
 
 def test_execute_records_a_nonzero_exit_without_losing_the_trajectory() -> None:
-    def fake_run(
-        cmd: list[str], check: bool, cwd: str, timeout: float | None, extra_env: dict[str, str]
-    ) -> SimpleNamespace:
-        _seed_state_db(Path(extra_env["HERMES_HOME"]))
-        return SimpleNamespace(returncode=3, stdout="partial", stderr="boom")
-
+    fake_run = _fake_run(returncode=3, stdout="partial", stderr="boom")
     with patch.object(agent_mod, "run", side_effect=fake_run):
         result = HermesAgent(AgentConfig(target="/bin/hermes")).run("hello")
 
@@ -494,12 +411,7 @@ def test_execute_flags_a_zero_exit_that_never_reached_the_model() -> None:
     """hermes exits 0 on a rejected key or exhausted retries; an unflagged run
     would be scored as a bad answer instead of an infrastructure failure."""
 
-    def fake_run(
-        cmd: list[str], check: bool, cwd: str, timeout: float | None, extra_env: dict[str, str]
-    ) -> SimpleNamespace:
-        _seed_state_db(Path(extra_env["HERMES_HOME"]), counts=(0, 0, 0, 0, 0))
-        return SimpleNamespace(returncode=0, stdout="", stderr="API key not valid")
-
+    fake_run = _fake_run(stdout="", stderr="API key not valid", counts=(0, 0, 0, 0, 0))
     with patch.object(agent_mod, "run", side_effect=fake_run):
         result = HermesAgent(AgentConfig(target="/bin/hermes")).run("hello")
 
@@ -508,10 +420,8 @@ def test_execute_flags_a_zero_exit_that_never_reached_the_model() -> None:
 
 
 def test_execute_on_timeout_reports_what_the_killed_run_flushed() -> None:
-    def fake_run(
-        cmd: list[str], check: bool, cwd: str, timeout: float | None, extra_env: dict[str, str]
-    ) -> SimpleNamespace:
-        home = Path(extra_env["HERMES_HOME"])
+    def fake_run(cmd: list[str], **kwargs) -> SimpleNamespace:
+        home = Path(kwargs["extra_env"]["HERMES_HOME"])
         _seed_state_db(home)
         _insert_message(
             home / "state.db",
@@ -577,22 +487,26 @@ def test_trajectory_no_sessions_is_reported(db_path: Path) -> None:
     assert "No session found in state database" in errors[0]
 
 
-def test_trajectory_reads_only_the_newest_session(db_path: Path) -> None:
-    """Session ids are UUIDs, so "newest" is insertion order, not id order."""
+def test_trajectory_reads_every_session_in_insertion_order(db_path: Path) -> None:
+    """All sessions are read, matching what the token sum already covers.
+
+    Session ids are UUIDs, so ordering is insertion order, not id order — here
+    the first-inserted session sorts *after* the second lexically.
+    """
     _init_schema(db_path)
     _insert_session(db_path, "f3a9-uuid", *[0] * len(_TOKEN_COLUMNS))
     _insert_session(db_path, "0b21-uuid", *[0] * len(_TOKEN_COLUMNS))
     _insert_message(
-        db_path, "f3a9-uuid", "assistant", tool_calls=_tool_calls_json("a", "old_call", {})
+        db_path, "f3a9-uuid", "assistant", tool_calls=_tool_calls_json("a", "first_call", {})
     )
     _insert_message(
-        db_path, "0b21-uuid", "assistant", tool_calls=_tool_calls_json("b", "new_call", {})
+        db_path, "0b21-uuid", "assistant", tool_calls=_tool_calls_json("b", "second_call", {})
     )
 
     trajectory, errors = extract_trajectory_from_db(db_path)
 
     assert errors == []
-    assert [call["name"] for call in trajectory] == ["new_call"]
+    assert [call["name"] for call in trajectory] == ["first_call", "second_call"]
 
 
 def test_trajectory_pairs_calls_with_their_results(db_path: Path) -> None:

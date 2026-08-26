@@ -25,9 +25,10 @@ the run-scoped home directory ``$HERMES_HOME``:
 * **MCP servers** — command-bearing bindings become ``mcp_servers`` entries in
   ``$HERMES_HOME/config.yaml``.
 * **Skills** — ``config.capabilities.skills.paths`` are materialized under
-  ``$HERMES_HOME/skills/<name>/SKILL.md``. Hermes's own bundled skill catalog
-  and its repo-local skill discovery are both switched off, so the granted
-  skills are the only ones the agent is offered.
+  ``$HERMES_HOME/skills/<name>/SKILL.md``. Hermes's repo-local skill discovery
+  is switched off and its bundled catalog is cut down to hermes's own essential
+  ``hermes-agent`` skill, which always survives; beyond that one, the granted
+  skills are all the agent is offered.
 * **Rules** — ``config.capabilities.rules.text`` is prepended to the prompt
   (``hermes chat`` has no dedicated system-prompt flag).
 * **Model auth** — ``config.api_key`` is threaded into the provider env vars
@@ -49,7 +50,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ruamel.yaml import YAML, YAMLError
+from ruamel.yaml import YAML
 
 from devops_bench.agents.base import AGENTS, AgentHarness
 from devops_bench.agents.cli.hermes.parsing import (
@@ -62,9 +63,11 @@ from devops_bench.agents.shared.cli_capabilities import (
     agent_workdir,
     build_mcp_servers,
     materialize_skills,
+    mcp_isolation_env,
+    prepend_rules,
 )
 from devops_bench.core import ConfigError, SubprocessError, get_logger
-from devops_bench.core.model_providers import resolve_provider
+from devops_bench.core.model_providers import known_providers, resolve_provider
 from devops_bench.core.subprocess import run
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only import
@@ -77,7 +80,6 @@ _log = get_logger("agents.cli.hermes.agent")
 _HERMES_HOME_DIRNAME = ".hermes"
 _CONFIG_FILE = "config.yaml"
 _STATE_DB = "state.db"
-_SOUL_FILE = "SOUL.md"
 _SKILLS_DIRNAME = "skills"
 
 # Marker file hermes checks on startup: with it present the bundled skill sync
@@ -98,31 +100,23 @@ _HOME_INSTALL_ARTIFACTS: tuple[str, ...] = (
     "models_dev_cache.etag",
 )
 
-# ruamel's safe round-trip: block style keeps the generated config readable if a
-# run is inspected after the fact.
+# ruamel's safe (non-round-trip) loader: block style keeps the generated config
+# readable if a run is inspected after the fact.
 _yaml = YAML(typ="safe")
 _yaml.default_flow_style = False
 
 
-# Canonical bench provider -> the name hermes's ``--provider`` accepts. Not
-# derivable from ``ProviderSpec``: hermes's ``vertex`` is Google-Vertex-Gemini
-# only, and its OpenAI transport is spelled ``openai-api``, so mapping through
-# ``adapter_family`` silently misroutes Claude-on-Vertex and hard-fails OpenAI.
-_HERMES_PROVIDERS: dict[str, str] = {
-    "google": "gemini",
-    "google-vertex": "vertex",
-    "anthropic": "anthropic",
-    "anthropic-bedrock": "bedrock",
-    "openai": "openai-api",
-    "ollama": "ollama",
-}
-
-# Run-isolation env vars forwarded into every MCP server's ``env`` block. Hermes
-# filters an MCP subprocess's environment down to an allowlist (PATH/HOME/... )
-# plus whatever the server config names, so a per-run KUBECONFIG/CLOUDSDK_CONFIG
-# would otherwise be dropped and the server would read the developer's ambient
-# cluster and cloud config instead of the run's.
-_MCP_ISOLATION_ENVS: tuple[str, ...] = ("KUBECONFIG", "CLOUDSDK_CONFIG")
+# Canonical providers hermes can serve — the ones carrying a ``hermes_provider``
+# on their :class:`ProviderSpec`. Only used to spell out the error below.
+_HERMES_SUPPORTED: tuple[str, ...] = tuple(
+    sorted(
+        {
+            spec.canonical
+            for alias in known_providers()
+            if (spec := resolve_provider(alias)).hermes_provider
+        }
+    )
+)
 
 
 def _hermes_provider(provider: str) -> str:
@@ -137,17 +131,16 @@ def _hermes_provider(provider: str) -> str:
     Raises:
         ConfigError: If hermes has no equivalent for the resolved provider.
     """
-    canonical = resolve_provider(provider).canonical
-    name = _HERMES_PROVIDERS.get(canonical)
-    if name is None:
+    spec = resolve_provider(provider)
+    if spec.hermes_provider is None:
         # anthropic-vertex today: hermes's "vertex" serves Gemini only, so there
         # is no way to ask it for Claude on Vertex. Fail loudly rather than let
-        # the run silently answer with a Gemini model.
+        # the run answer with a Gemini model instead.
         raise ConfigError(
-            f"provider {canonical!r} has no hermes equivalent; "
-            f"supported: {', '.join(sorted(_HERMES_PROVIDERS))}"
+            f"provider {spec.canonical!r} has no hermes equivalent; "
+            f"supported: {', '.join(_HERMES_SUPPORTED)}"
         )
-    return name
+    return spec.hermes_provider
 
 
 def _prune_install_artifacts(home: Path) -> None:
@@ -168,19 +161,20 @@ def _prune_install_artifacts(home: Path) -> None:
             _log.warning("Failed to prune %s from the hermes run home: %s", name, exc)
 
 
-def _prepend_rules(rules_text: str, prompt: str) -> str:
-    """Return ``prompt`` with the granted rules prepended as a system brief."""
-    if not rules_text.strip():
-        return prompt
-    return f"{rules_text.rstrip()}\n\n{prompt}"
-
-
 def _build_env(config: AgentConfig) -> dict[str, str]:
-    """Build the subprocess env overlay carrying provider credentials."""
+    """Build the subprocess env overlay carrying provider credentials.
+
+    Raises:
+        ConfigError: If ``config.provider`` names no known provider. Validation
+            is unconditional so a typo fails here rather than on a keyless run
+            that would otherwise reach hermes and answer from the wrong model.
+    """
     overlay: dict[str, str] = {}
-    if config.provider and config.api_key:
-        for var in resolve_provider(config.provider).api_key_envs:
-            overlay[var] = config.api_key
+    if config.provider:
+        spec = resolve_provider(config.provider)
+        if config.api_key:
+            for var in spec.api_key_envs:
+                overlay[var] = config.api_key
     overlay.update(config.extra_env)
     return overlay
 
@@ -189,21 +183,17 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
 class HermesAgent(AgentHarness):
     """Hermes CLI agent harness driving the local ``hermes`` binary.
 
+    The run-scoped home is never seeded from the user's ``~/.hermes``, so a
+    benchmark run is reproducible and never picks up ambient developer state
+    (nor the credentials in the user's ``.env``, which the run home would carry
+    into the run's artifacts).
+
     Args:
         config: Agent configuration; ``target`` overrides the binary path.
-        inherit_user_config: When ``True``, seed the run-scoped home from the
-            user's ``~/.hermes`` (``config.yaml`` / ``SOUL.md``). Off by default
-            so a benchmark run is reproducible and never picks up ambient
-            developer state. ``.env`` is deliberately never inherited: it holds
-            the user's provider credentials and the run home is copied into the
-            run's artifacts.
     """
 
-    def __init__(
-        self, config: AgentConfig | None = None, *, inherit_user_config: bool = False
-    ) -> None:
+    def __init__(self, config: AgentConfig | None = None) -> None:
         AgentHarness.__init__(self, config)
-        self.inherit_user_config = inherit_user_config
         caps = self.config.capabilities
         self.rules = caps.rules
         self.mcp_servers = caps.mcp_servers
@@ -216,88 +206,37 @@ class HermesAgent(AgentHarness):
         candidate = os.path.expanduser("~/.local/bin/hermes")
         return candidate if os.path.exists(candidate) else "hermes"
 
-    def _mcp_isolation_env(self) -> dict[str, str]:
-        """Resolve the isolation vars an MCP server needs, in the CLI's own order.
-
-        ``run_env`` publishes the per-run ``KUBECONFIG`` / ``CLOUDSDK_CONFIG`` on
-        ``os.environ``, while ``config.extra_env`` is the operator's override and
-        wins in :func:`_build_env`. Reading only one of the two would hand the
-        MCP servers a different cluster (or gcloud config) than hermes itself
-        got, so both are consulted in the same precedence.
-        """
-        resolved: dict[str, str] = {}
-        for key in _MCP_ISOLATION_ENVS:
-            value = self.config.extra_env.get(key) or os.environ.get(key)
-            if value:
-                resolved[key] = value
-        return resolved
-
     def _prepare_config(self, run_dir: Path, mcp_servers: tuple[McpBinding, ...]) -> None:
-        """Write the run-scoped ``config.yaml``, merging in the MCP servers.
+        """Write the run-scoped ``config.yaml`` granting the run's MCP servers.
+
+        The run home is created fresh per run and is never seeded from the
+        user's ``~/.hermes`` — a benchmark run has to be reproducible and must
+        not pick up ambient developer state — so the document is built outright
+        rather than merged into whatever was already there.
 
         Also lays down the opt-out marker for hermes's bundled skill catalog, so
         the only skills the agent sees are the ones the run actually granted.
         """
         (run_dir / _NO_BUNDLED_SKILLS_MARKER).touch()
 
-        if self.inherit_user_config:
-            user_dir = Path(os.path.expanduser("~/.hermes"))
-            for name in (_CONFIG_FILE, _SOUL_FILE):
-                if (user_dir / name).exists():
-                    shutil.copy(user_dir / name, run_dir / name)
-
-        config_path = run_dir / _CONFIG_FILE
-        config_data: dict = {}
-        if config_path.exists():
-            try:
-                loaded = _yaml.load(config_path.read_text(encoding="utf-8"))
-            except (OSError, YAMLError) as exc:
-                _log.warning("Failed to load existing %s: %s", _CONFIG_FILE, exc)
-            else:
-                # A seeded config holding a list or scalar parses fine but would
-                # blow up the merge below; hermes would reject it anyway.
-                if isinstance(loaded, dict):
-                    config_data = loaded
-                elif loaded is not None:
-                    _log.warning(
-                        "Ignoring existing %s: expected a mapping, got %s",
-                        _CONFIG_FILE,
-                        type(loaded).__name__,
-                    )
+        # Hermes otherwise sources ``<git root>/.hermes/skills`` and
+        # ``<git root>/.agents/skills`` when the session starts inside a
+        # checkout, which would hand the agent skills the run never granted.
+        config_data: dict = {"skills": {"project_discovery": False}}
 
         servers = build_mcp_servers(mcp_servers)
         if servers:
             # MCP servers are spawned by hermes, so they inherit its env rather
             # than the harness's; pass the run's isolation vars through
             # explicitly or the servers fall back to the ambient ones.
-            for key, value in self._mcp_isolation_env().items():
+            for key, value in mcp_isolation_env(self.config.extra_env).items():
                 for entry in servers.values():
                     entry.setdefault("env", {})[key] = value
-            seeded = config_data.get("mcp_servers")
-            if seeded is not None and not isinstance(seeded, dict):
-                # A seeded ``mcp_servers: disabled`` (or a list) parses fine but
-                # would raise TypeError on the merge below, aborting the run
-                # before hermes ever starts.
-                _log.warning(
-                    "Ignoring existing mcp_servers in %s: expected a mapping, got %s",
-                    _CONFIG_FILE,
-                    type(seeded).__name__,
-                )
-                seeded = None
-            config_data["mcp_servers"] = {**(seeded or {}), **servers}
-
-        # Hermes otherwise sources ``<git root>/.hermes/skills`` and
-        # ``<git root>/.agents/skills`` when the session starts inside a
-        # checkout, which would hand the agent skills the run never granted.
-        skills_config = config_data.get("skills")
-        config_data["skills"] = {
-            **(skills_config if isinstance(skills_config, dict) else {}),
-            "project_discovery": False,
-        }
+            config_data["mcp_servers"] = servers
 
         buffer = io.StringIO()
         _yaml.dump(config_data, buffer)
-        config_path.write_text(buffer.getvalue(), encoding="utf-8")
+        (run_dir / _CONFIG_FILE).write_text(buffer.getvalue(), encoding="utf-8")
 
     def _build_command(self, prompt: str) -> list[str]:
         """Build the ``hermes chat`` argv for this run.
@@ -331,7 +270,7 @@ class HermesAgent(AgentHarness):
 
             try:
                 completed = run(
-                    self._build_command(_prepend_rules(caps.rules.text, prompt)),
+                    self._build_command(prepend_rules(caps.rules.text, prompt)),
                     check=False,
                     cwd=str(workdir),
                     timeout=self.config.timeout_sec,
