@@ -78,6 +78,9 @@ _MCP_NOT_LISTED = "<not listed>"
 # Seconds for ``gemini mcp list``. It starts the binary and dials each server
 # but makes no model call, so it is fast relative to a run.
 _MCP_LIST_TIMEOUT_SEC = 120.0
+# Cap on the CLI output quoted back when ``gemini mcp list`` itself fails, so a
+# stack trace does not become the whole run's error message.
+_LISTING_TAIL_CHARS = 800
 
 
 def _build_settings(mcp_servers: tuple[McpBinding, ...], *, skills_enabled: bool) -> dict:
@@ -165,6 +168,14 @@ def _mcp_gate_failure(
     # 0.56 prints the whole listing on stderr, not stdout; read both so the gate
     # does not depend on which stream the CLI happens to use.
     listing = _ANSI_SGR.sub("", f"{completed.stdout or ''}\n{completed.stderr or ''}")
+
+    # A non-zero exit means the CLI never got as far as dialling the servers —
+    # malformed settings.json, an unknown flag, a bad auth config. The listing is
+    # then an error message, and parsing it for status rows would report the
+    # generic "not listed" instead of the cause the CLI already printed.
+    if completed.returncode != 0:
+        detail = listing.strip()[-_LISTING_TAIL_CHARS:]
+        return f"'gemini mcp list' exited {completed.returncode}: {detail or '<no output>'}"
 
     broken: dict[str, str] = {}
     for name in expected:

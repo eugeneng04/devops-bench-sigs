@@ -971,3 +971,40 @@ def test_agy_cli_agent_probes_with_the_run_env_and_workdir(
     assert seen["base_env"]["GEMINI_API_KEY"] == "secret-key"
     assert seen["base_env"]["PATH"] == os.environ["PATH"]
     assert seen["cwd_exists"]
+
+
+@mock.patch.object(pathlib.Path, "home")
+@mock.patch.object(devops_subprocess, "run")
+def test_agy_cli_agent_probes_every_granted_binding(mock_run, mock_home, tmp_path, monkeypatch):
+    """Every granted binding is handed to the probe verbatim. Passing a subset —
+    or a rebuilt binding that drops ``env``/``cwd`` — would gate on a server the
+    run does not launch, and the dead one it does launch would score as an MCP
+    arm."""
+    seen: dict = {}
+    mock_home.return_value = tmp_path
+    mock_run.return_value = SimpleNamespace(args=["agy"], returncode=0, stdout="ok", stderr="")
+
+    def record(bindings, **kw):
+        seen["bindings"] = bindings
+        seen["kwargs"] = kw
+
+    monkeypatch.setattr(agy_mod, "preflight_mcp", record)
+    bindings = (
+        capabilities.McpBinding(name="gke", command=("gke-mcp",)),
+        capabilities.McpBinding(
+            name="facts",
+            command=("uvx", "facts-server"),
+            env=(("FACTS_TOKEN", "${FACTS_TOKEN}"),),
+            cwd="/srv/facts",
+        ),
+    )
+    config = agents_config.AgentConfig(
+        target="/bin/agy",
+        model="gemini-3.5-flash",
+        capabilities=capabilities.AllCapabilities(mcp_servers=bindings),
+    )
+
+    agy_mod.AgyCliAgent(config)._execute("run task")
+
+    assert seen["bindings"] == bindings
+    assert set(seen["kwargs"]) == {"base_env", "cwd"}

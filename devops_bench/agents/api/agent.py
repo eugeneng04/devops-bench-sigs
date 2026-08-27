@@ -51,11 +51,12 @@ _log = get_logger("agents.api.agent")
 
 
 class ToolNameConflictError(RuntimeError):
-    """Two granted MCP servers advertise the same tool name.
+    """One tool name is claimed twice — by two granted MCP servers, or by a
+    discovered skill and a granted server.
 
     Raised once the servers are up, since the advertised names are only known
-    then. Fatal for the run: routing the call to whichever server happened to
-    be listed first would score the arm against a toolset nobody chose.
+    then. Fatal for the run: serving whichever source happened to be resolved
+    first would score the arm against a toolset nobody chose.
     """
 
 
@@ -393,7 +394,8 @@ async def _run_async(
         per-tool dispatch failures recorded by the dispatcher.
 
     Raises:
-        ToolNameConflictError: If two granted servers advertise the same tool.
+        ToolNameConflictError: If two granted servers advertise the same tool,
+            or a discovered skill tool carries a granted server's tool name.
     """
     errors: list[str] = []
     skill_tools, skill_resources, skill_names = await asyncio.to_thread(
@@ -408,6 +410,17 @@ async def _run_async(
             for binding in mcp_bindings
         ]
         mcp_tools, routes = await _route_tools(sessions)
+        # Skill names are checked against the routed MCP names for the same
+        # reason two servers are checked against each other: the model would be
+        # handed one name twice, and the dispatcher's skill-first rule would
+        # serve the skill while the MCP tool it shadows never runs.
+        clash = sorted(routes.keys() & skill_resources.keys())
+        if clash:
+            raise ToolNameConflictError(
+                f"skill tools {clash} collide with tools advertised by a granted MCP "
+                "server; the grant is rejected rather than serving the skill and "
+                "leaving the server's tool unreachable"
+            )
         loop_result = await run_tool_loop(
             client=client,
             goal=prompt,

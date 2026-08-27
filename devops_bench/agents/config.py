@@ -80,8 +80,10 @@ class _McpServerSpec(BaseModel):
     junk argument and report the resulting failure as unreachability.
 
     Attributes:
-        command: The server binary. Required and non-empty — a binding with no
-            command is "no MCP", which is a grant that scores as an MCP arm.
+        command: The server binary. Required, and must hold a non-whitespace
+            character — a binding with no command is "no MCP", which is a grant
+            that scores as an MCP arm, and an all-whitespace one splits to the
+            same nothing.
         args: Arguments appended to ``command``.
         env: Declared child env; secret-named values must be ``${VAR}``
             references, enforced by :func:`_reject_literal_secrets`.
@@ -93,7 +95,7 @@ class _McpServerSpec(BaseModel):
 
     model_config = ConfigDict(strict=True)
 
-    command: str = Field(min_length=1)
+    command: str = Field(min_length=1, pattern=r"\S")
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     cwd: str = ""

@@ -298,8 +298,9 @@ def _read_result(lines: queue.Queue[str | None], request_id: int, deadline: floa
             continue
         if "method" in message or ("result" not in message and "error" not in message):
             continue
-        if "error" in message:
-            raise McpUnreachableError(f"server returned an error: {message['error']}")
+        error = message.get("error")
+        if error is not None:
+            raise McpUnreachableError(f"server returned an error: {error}")
         result = message.get("result")
         return result if isinstance(result, dict) else {}
 
@@ -414,12 +415,15 @@ def _send(proc: subprocess.Popen, message: dict) -> None:
 
     Raises:
         McpUnreachableError: If the server's stdin is already closed — i.e. the
-            process died on launch.
+            process died on launch. ``OSError`` covers the whole family the pipe
+            can fail with (``BrokenPipeError`` when the reader is gone,
+            ``ConnectionResetError`` when it is torn down mid-write); ``ValueError``
+            is what a closed file object raises.
     """
     try:
         proc.stdin.write(json.dumps(message) + "\n")
         proc.stdin.flush()
-    except (BrokenPipeError, ValueError) as exc:
+    except (OSError, ValueError) as exc:
         raise McpUnreachableError(f"server exited before the handshake completed: {exc}") from exc
 
 

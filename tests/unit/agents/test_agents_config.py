@@ -240,6 +240,13 @@ def test_from_env_blank_mcp_config_falls_back_to_the_shorthand() -> None:
         ('{"mcpServers": {"a": "uvx"}}', "must be a JSON object"),
         ('{"mcpServers": {"a": {}}}', "command: Field required"),
         ('{"mcpServers": {"a": {"command": ""}}}', "command: String should have at least 1"),
+        # An all-whitespace command clears min_length but splits to no argv at
+        # all, which is the same "MCP arm with no MCP server" the empty case is
+        # rejected for.
+        (
+            '{"mcpServers": {"a": {"command": "   "}}}',
+            "command: String should match pattern",
+        ),
         (
             '{"mcpServers": {"a": {"command": "uvx", "args": "x"}}}',
             "args: Input should be a valid list",

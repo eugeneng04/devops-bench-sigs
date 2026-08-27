@@ -952,6 +952,38 @@ def test_execute_fails_when_two_servers_advertise_the_same_tool(
     assert fake.calls == []
 
 
+def test_execute_fails_when_a_skill_and_a_server_share_a_tool_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A skill name colliding with a granted server's tool fails the run.
+
+    The model would be handed the same name twice, and the dispatcher's
+    skill-first rule would serve the skill while the server's tool never runs —
+    an MCP arm scored without the tool it granted.
+    """
+    skill_dir = tmp_path / "skills"
+    (skill_dir / "demo").mkdir(parents=True)
+    (skill_dir / "demo" / "SKILL.md").write_text('---\nname: "demo"\ndescription: x\n---\nbody\n')
+
+    fake = _FakeLLMClient([_Turn(text="ok")])
+    mcp = _FakeMCPClient(tools=[SimpleNamespace(name="skill_demo")])
+    monkeypatch.setattr(agent_mod, "get_model", lambda *a, **kw: fake)
+    monkeypatch.setattr(agent_mod, "MCPClient", lambda _path, **_kw: mcp)
+
+    caps = AllCapabilities(
+        mcp_servers=(McpBinding(name="one", command=("server-a",)),),
+        skills=SkillBinding(paths=(str(skill_dir),)),
+    )
+    result = ApiAgent(AgentConfig(capabilities=caps)).run("p")
+
+    assert result.has_errors()
+    assert "MCP tool name conflict" in result.errors[0]
+    assert "skill_demo" in result.errors[0]
+    assert mcp.exited
+    # The model was never called — the run fails before any provider spend.
+    assert fake.calls == []
+
+
 def test_execute_tears_down_open_sessions_when_a_later_server_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

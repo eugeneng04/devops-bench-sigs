@@ -848,6 +848,33 @@ def test_execute_fails_when_a_granted_server_is_absent_from_the_listing(
     assert "gke (<not listed>)" in result.errors[0]
 
 
+def test_execute_fails_when_the_mcp_listing_command_exits_non_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-zero ``gemini mcp list`` means the CLI never dialled the servers —
+    a malformed settings.json or an unknown flag. Parsing that output for status
+    rows would report the generic "<not listed>" instead of the cause the CLI
+    already printed."""
+
+    def fake_run(argv, **kwargs):
+        if argv[1:3] == ["mcp", "list"]:
+            return SimpleNamespace(
+                stdout="",
+                stderr="SyntaxError: Unexpected token } in JSON at position 42\n",
+                returncode=1,
+            )
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(gemini_mod, "run", fake_run)
+    caps = AllCapabilities(mcp_servers=(McpBinding(name="gke", command=("gke-mcp",)),))
+
+    result = GeminiCliAgent(AgentConfig(target="gemini", capabilities=caps)).run("p")
+
+    assert "'gemini mcp list' exited 1" in result.errors[0]
+    assert "Unexpected token }" in result.errors[0]
+    assert "<not listed>" not in result.errors[0]
+
+
 def test_execute_skips_the_cli_gate_when_no_mcp_is_granted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
