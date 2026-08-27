@@ -351,6 +351,11 @@ def _usage_tokens(usage: dict) -> dict[str, int | None]:
     honour the contract that ``output`` excludes ``reasoning`` while ``total``
     stays exact. Without that details block ``reasoning`` stays ``None`` rather
     than a fabricated ``0``.
+
+    ``total`` is only filled in once ``output`` is known. The accumulator path
+    leaves that bucket unreported on purpose (see :data:`_ACC_USAGE_KEYS`), and
+    a prompt-side-only sum published under ``total`` reaches the dashboard row
+    verbatim — an absent total beats one that undercounts the whole output side.
     """
     tokens = empty_tokens()
     output = _int_or_none(usage.get("output_tokens"))
@@ -365,7 +370,6 @@ def _usage_tokens(usage: dict) -> dict[str, int | None]:
         reasoning=reasoning,
         output=output,
     )
-    reported = [v for k, v in tokens.items() if k != "total" and v is not None]
-    if reported:
-        tokens["total"] = sum(reported)
+    if output is not None:
+        tokens["total"] = sum(v for k, v in tokens.items() if k != "total" and v is not None)
     return tokens

@@ -397,7 +397,7 @@ def test_parse_stream_json_falls_back_to_assistant_text_without_result_event() -
 def test_parse_stream_json_falls_back_to_accumulated_usage_without_result_event() -> None:
     """A truncated stream (no terminal ``result``) still yields prompt-side token
     counts, summed from the per-turn assistant ``usage``. ``output`` stays
-    unreported — see the next test."""
+    unreported — see the next test — so ``total`` stays unreported with it."""
     blob = _stream(
         _assistant(
             {"type": "text", "text": "a"},
@@ -410,14 +410,16 @@ def test_parse_stream_json_falls_back_to_accumulated_usage_without_result_event(
     )
     output, _trajectory, tokens, errors = parse_stream_json(blob)
     assert output == "ab"
-    assert tokens == _tok(input=30, cached=2, cache_write=3, total=35)
+    assert tokens == _tok(input=30, cached=2, cache_write=3)
     assert errors == []
 
 
 def test_parse_stream_json_accumulator_leaves_output_unreported() -> None:
     """Per-turn ``usage.output_tokens`` is the ``message_start`` placeholder — a
     handful of tokens against a real terminal count in the thousands. Summing it
-    would persist an invented number, so the bucket is left ``None``."""
+    would persist an invented number, so the bucket is left ``None``. ``total``
+    follows it: a prompt-side-only sum reaches the dashboard row as the run's
+    total, understating it by the whole output side."""
     blob = _stream(
         _assistant(
             {"type": "text", "text": "..."},
@@ -427,7 +429,8 @@ def test_parse_stream_json_accumulator_leaves_output_unreported() -> None:
     )
     _output, _trajectory, tokens, _errors = parse_stream_json(blob)
     assert tokens["output"] is None
-    assert tokens == _tok(input=4, total=4)
+    assert tokens["total"] is None
+    assert tokens == _tok(input=4)
 
 
 def test_parse_stream_json_result_usage_wins_over_accumulated() -> None:
@@ -457,7 +460,7 @@ def test_parse_stream_json_falls_back_when_result_usage_degenerate() -> None:
         {"type": "result", "subtype": "success", "result": "x", "usage": {}},
     )
     _output, _trajectory, tokens, _errors = parse_stream_json(blob)
-    assert tokens == _tok(input=15, total=15)
+    assert tokens == _tok(input=15)
 
 
 def test_parse_stream_json_result_string_is_authoritative_over_text() -> None:
@@ -486,7 +489,7 @@ def test_parse_stream_json_dedupes_accumulated_usage_by_message_id() -> None:
         ),
     )
     _output, _trajectory, tokens, _errors = parse_stream_json(blob)
-    assert tokens == _tok(input=100, cached=8, total=108)
+    assert tokens == _tok(input=100, cached=8)
 
 
 def test_parse_stream_json_empty_result_falls_back_to_text() -> None:
