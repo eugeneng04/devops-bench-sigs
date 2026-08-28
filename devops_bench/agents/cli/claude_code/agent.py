@@ -49,6 +49,7 @@ import os
 import re
 import tempfile
 from collections.abc import Iterator
+from functools import cache
 from pathlib import Path
 
 from devops_bench.agents.base import AGENTS, AgentHarness
@@ -106,12 +107,17 @@ _MCP_WAIT_MIN_VERSION = (2, 1, 221)
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
 
+@cache
 def _claude_version(target: str) -> tuple[int, int, int] | None:
     """Parse ``claude --version``, or ``None`` when it cannot be determined.
 
     An unreadable version is not an error: ``config.target`` may be a wrapper
     script with its own ``--version`` surface, and refusing to run on a probe
     that merely failed to parse would be worse than the risk it guards.
+
+    Cached per target: a matrix run drives one binary across every task, and the
+    version cannot change under a live process. An inconclusive probe caches too,
+    so a wrapper without a ``--version`` surface is not re-spawned per task.
     """
     try:
         completed = run([target, "--version"], check=False, timeout=30)
@@ -345,17 +351,19 @@ class ClaudeCodeAgent(AgentHarness):
                         input=_CLOSED_STDIN,
                     )
                 except SubprocessError as exc:
-                    # str(exc) embeds the child's full stderr, so rebuild the
-                    # message from the clipped tail rather than interpolating it.
-                    # A timeout raises with the partial stream-json captured
-                    # before the kill; fall through so the trajectory is
-                    # recovered rather than dropped.
+                    # Under ``check=False`` the only way ``run`` raises is a
+                    # timeout, so report it as one rather than as an exit -1 that
+                    # reads like a crash. str(exc) embeds the child's full
+                    # stderr, so rebuild the message from the clipped tail rather
+                    # than interpolating it. The timeout carries the partial
+                    # stream-json captured before the kill; fall through so the
+                    # trajectory is recovered rather than dropped.
                     stderr = _stderr_tail(exc.stderr)
                     returncode = exc.returncode
                     stdout = exc.stdout or ""
-                    reason = (
-                        f"claude subprocess error: exit {returncode}: {stderr or '<no stderr>'}"
-                    )
+                    reason = f"claude timed out after {self.config.timeout_sec}s"
+                    if stderr:
+                        reason += f": {stderr}"
                 except OSError as exc:
                     # Spawn failure core.subprocess.run does not wrap: usually a
                     # missing / non-executable binary, but also a vanished cwd.

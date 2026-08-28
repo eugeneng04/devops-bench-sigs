@@ -200,7 +200,10 @@ def parse_stream_json(stdout: str) -> tuple[str, list[dict], dict, list[str]]:
             # surface terminal-failure statuses (see ``_MCP_FAILED_STATUSES``)
             # rather than scoring a silently-degraded run clean.
             if event.get("subtype") == "init":
-                for server in event.get("mcp_servers") or []:
+                mcp_servers = event.get("mcp_servers")
+                if not isinstance(mcp_servers, list):
+                    continue
+                for server in mcp_servers:
                     if not isinstance(server, dict):
                         continue
                     status = str(server.get("status", "")).lower()

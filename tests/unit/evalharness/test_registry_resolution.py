@@ -23,6 +23,7 @@ resolves with **no harness edit**.
 from __future__ import annotations
 
 from collections.abc import Generator
+from pathlib import Path
 
 import pytest
 from pytest_mock import MockerFixture
@@ -168,7 +169,7 @@ def test_entry_point_agent_resolves_with_no_harness_edit(
     assert isinstance(_DummyAgent.last_config, AgentConfig)
 
 
-def test_manifest_records_the_canonical_harness_key(tmp_path, mocker: MockerFixture) -> None:
+def test_manifest_records_the_canonical_harness_key(tmp_path: Path, mocker: MockerFixture) -> None:
     """An arm selected via an alias records the canonical key, not the alias.
 
     ``harness`` is contractually the canonical key (``ResultRow.harness``), and

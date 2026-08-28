@@ -20,6 +20,7 @@ import json
 import os
 import stat
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -41,6 +42,15 @@ from devops_bench.agents.cli.claude_code.agent import _build_argv, _build_env
 from devops_bench.agents.result import TOKEN_BUCKETS, empty_tokens
 from devops_bench.core.errors import ConfigError, SubprocessError
 from devops_bench.results.normalize import normalize_tokens
+
+
+@pytest.fixture(autouse=True)
+def _reset_version_cache() -> Iterator[None]:
+    """``_claude_version`` is cached per target, and every test here drives the
+    same ``"claude"`` target through a different probe double."""
+    claude_mod._claude_version.cache_clear()  # noqa: SLF001 - cache under test control
+    yield
+    claude_mod._claude_version.cache_clear()  # noqa: SLF001 - cache under test control
 
 
 def _stream(*events: dict) -> str:
@@ -913,14 +923,19 @@ def test_execute_captures_stderr_on_clean_exit(monkeypatch: pytest.MonkeyPatch) 
     assert not any("exited" in e for e in result.errors)
 
 
-def test_execute_handles_subprocess_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_execute_reports_a_timeout_as_a_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``run`` is called with ``check=False``, so the only ``SubprocessError`` it
+    raises is a timeout. Naming it keeps the wall-clock budget out of the crash
+    bucket, where ``exit -1`` would have put it."""
+
     def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
-        raise SubprocessError(argv, returncode=-1, stdout="", stderr="timeout")
+        raise SubprocessError(argv, returncode=-1, stdout="", stderr="killed")
 
     monkeypatch.setattr(claude_mod, "run", fake_run)
-    result = ClaudeCodeAgent(AgentConfig(target="claude")).run("p")
+    result = ClaudeCodeAgent(AgentConfig(target="claude", timeout_sec=900)).run("p")
     assert result.has_errors()
-    assert "subprocess error" in result.errors[0]
+    assert result.errors[0] == "claude timed out after 900s: killed"
+    assert result.metadata["returncode"] == -1
     assert result.trajectory == []
 
 
@@ -941,7 +956,7 @@ def test_execute_recovers_partial_trajectory_on_timeout(monkeypatch: pytest.Monk
     monkeypatch.setattr(claude_mod, "run", fake_run)
     result = ClaudeCodeAgent(AgentConfig(target="claude")).run("p")
     assert result.has_errors()
-    assert any("subprocess error" in e for e in result.errors)
+    assert any("timed out" in e for e in result.errors)
     assert [step["name"] for step in result.trajectory] == ["gke__list_clusters"]
     assert result.metadata["stderr"] == "killed after timeout"
 
@@ -1067,6 +1082,27 @@ def test_execute_refuses_mcp_run_on_a_binary_predating_the_startup_wait(
     assert result.tokens == empty_tokens()
     assert "2.1.220" in result.errors[0]
     assert "2.1.221" in result.errors[0]
+
+
+def test_execute_probes_the_version_once_per_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A matrix run drives one binary across every task, and the version cannot
+    change under a live process, so the probe is spawned once rather than once
+    per MCP-bound task."""
+    probes = 0
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal probes
+        if "--version" in argv:
+            probes += 1
+            return SimpleNamespace(stdout="2.1.228 (Claude Code)\n", stderr="", returncode=0)
+        return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(claude_mod, "run", fake_run)
+    agent = ClaudeCodeAgent(AgentConfig(target="claude", capabilities=_mcp_caps()))
+    agent.run("first")
+    agent.run("second")
+
+    assert probes == 1
 
 
 def test_execute_skips_the_version_probe_without_mcp_bindings(
