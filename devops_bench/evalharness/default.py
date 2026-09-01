@@ -71,6 +71,7 @@ _log = get_logger("evalharness.default")
 # registry, with no edit here.
 _BUILTIN_AGENT_MODULES: tuple[str, ...] = (
     "devops_bench.agents.cli.gemini_cli",
+    "devops_bench.agents.cli.claude_code",
     "devops_bench.agents.cli.openclaw",
     "devops_bench.agents.cli.antigravity",
     "devops_bench.agents.api.agent",
@@ -79,6 +80,7 @@ _BUILTIN_AGENT_MODULES: tuple[str, ...] = (
 # Aliases normalized to canonical agent keys before registry lookup.
 _AGENT_TYPE_ALIASES: dict[str, str] = {
     "gemini-cli": "gemini",
+    "claude-code": "claude",
 }
 
 # Default agent type when neither --agent-type nor BENCH_AGENT_TYPE is set.
@@ -121,6 +123,17 @@ def _ensure_builtin_agents_registered() -> None:
             # raise a clear ``NotRegisteredError`` later if the user selects
             # an agent whose module did not load.
             _log.debug("optional agent module %s not importable: %s", module, exc)
+
+
+def _canonical_agent_type(agent_type: str) -> str:
+    """Normalize an agent-type alias to its canonical registry key.
+
+    The single source of truth for both registry lookup and result recording,
+    so an arm selected via a friendly alias (``claude-code`` / ``gemini-cli``)
+    aggregates under the same ``harness`` / ``setup_id`` as the canonical key
+    instead of splitting into a second dashboard setup.
+    """
+    return _AGENT_TYPE_ALIASES.get(agent_type, agent_type)
 
 
 class DefaultEvalHarness(Harness):
@@ -235,7 +248,7 @@ class DefaultEvalHarness(Harness):
                 canonical key.
         """
         _ensure_builtin_agents_registered()
-        key = _AGENT_TYPE_ALIASES.get(agent_type, agent_type)
+        key = _canonical_agent_type(agent_type)
         agent_cls = AGENTS.get(key)
         if agent_cls is None:
             raise NotRegisteredError(AGENTS.name, key, AGENTS.keys())
@@ -674,15 +687,23 @@ class DefaultEvalHarness(Harness):
         augmentation = derive_augmentation(
             {"use_mcp": self.use_mcp, "skills": list(self._granted_skill_paths)}
         )
-        model = self._agent_config.model or self._agent_config.provider or self.agent_type
+        # Record the canonical harness key so an arm selected via a friendly
+        # alias (e.g. ``claude-code`` / ``gemini-cli``) aggregates with the
+        # canonical key rather than splitting into a second dashboard setup.
+        harness = _canonical_agent_type(self.agent_type)
+        model = self._agent_config.model or self._agent_config.provider or harness
         manifest = Manifest(
             schema_version=SCHEMA_VERSION,
             run_id=run_dir.name,
             t=datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            setup_id=results_setup_id(model, self.agent_type, augmentation),
+            setup_id=results_setup_id(model, harness, augmentation),
             model=model,
-            harness=self.agent_type,
+            harness=harness,
             augmentation=augmentation,
+            # Only the wall-clock cap: ``max_turns`` is read by the API agent
+            # alone, so stamping it would advertise a CLI arm a budget that
+            # never bound it.
+            timeout_sec=self._agent_config.timeout_sec,
         )
         rows = build_rows(detailed_results, manifest)
         self.reporter.write_rows(run_dir, [row.to_dict() for row in rows])
@@ -942,6 +963,10 @@ class DefaultEvalHarness(Harness):
                     task.validated and not agent_errors and bool(dumped.get("trajectory"))
                 ),
                 "errors": agent_errors,
+                "terminal_reason": dumped.get("terminal_reason", ""),
+                "model_turns": dumped.get("model_turns"),
+                "tool_wait_sec": dumped.get("tool_wait_sec"),
+                "served_models": dumped.get("served_models") or [],
                 # First-error scalar so a parser reading ``error`` finds the
                 # same key on the success shape (None when nothing went wrong).
                 "error": agent_errors[0] if agent_errors else None,
@@ -1048,6 +1073,15 @@ class DefaultEvalHarness(Harness):
             "status": "",
             "error": None,
             "errors": [],
+            # Why the agent stopped (see ``agents.result.TERMINAL_REASONS``).
+            # Empty on a failed record: the harness never got far enough to
+            # observe the agent's own ending.
+            "terminal_reason": "",
+            # Model round-trips and time inside tools; both unknown on a
+            # record the harness never ran.
+            "model_turns": None,
+            "tool_wait_sec": None,
+            "served_models": [],
             # ``scores`` (the per-metric mapping) is populated by ``_score`` for
             # success records; failed records leave it as the empty dict so the
             # key is always present. There is no aggregate scalar score: the

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -91,7 +92,12 @@ def _build_settings(mcp_servers: tuple[McpBinding, ...], *, skills_enabled: bool
     return settings
 
 
-def _build_argv(target: str, prompt: str, allowed_tools: tuple[str, ...]) -> list[str]:
+def _build_argv(
+    target: str,
+    prompt: str,
+    allowed_tools: tuple[str, ...],
+    extra_flags: tuple[str, ...] = (),
+) -> list[str]:
     """Build the ``gemini`` invocation for ``prompt``.
 
     ``--approval-mode yolo`` is always passed so the CLI auto-approves every tool
@@ -116,6 +122,7 @@ def _build_argv(target: str, prompt: str, allowed_tools: tuple[str, ...]) -> lis
         prompt: Task prompt.
         allowed_tools: Pre-approved tool names; each yields a separate
             ``--allowed-tools <name>`` pair (redundant under yolo).
+        extra_flags: Optional extra CLI flags to forward to the binary.
 
     Returns:
         The argv list ready to hand to ``core.subprocess.run``.
@@ -129,6 +136,8 @@ def _build_argv(target: str, prompt: str, allowed_tools: tuple[str, ...]) -> lis
         # `--extensions=` disables extensions; `-e=`/`-e=""` print help + exit 1
         # on gemini >= 0.47, and `-e none` loads an extension named "none".
         argv.append("--extensions=")
+    if extra_flags:
+        argv.extend(extra_flags)
     argv.extend(["-p", prompt])
     return argv
 
@@ -224,7 +233,7 @@ class GeminiCliAgent(AgentHarness):
         """
         caps = self.config.capabilities
         target = os.path.expanduser(self.config.target or "gemini")
-        argv = _build_argv(target, prompt, caps.allowed_tools)
+        argv = _build_argv(target, prompt, caps.allowed_tools, self.config.extra_flags)
         env_overlay = _build_env(self.config)
         rules_text = caps.rules.text
 
@@ -240,6 +249,7 @@ class GeminiCliAgent(AgentHarness):
                 (gemini_dir / _GEMINI_SETTINGS_FILE).write_text(
                     json.dumps(settings, indent=2), encoding="utf-8"
                 )
+            started = time.monotonic()
             try:
                 completed = run(
                     argv,
@@ -249,13 +259,32 @@ class GeminiCliAgent(AgentHarness):
                     timeout=self.config.timeout_sec,
                 )
             except SubprocessError as exc:
-                return AgentResult.errored(f"gemini subprocess error: {exc}")
+                # The stream-json written before the kill is a valid prefix of
+                # the event stream, so the trajectory and tokens the run did
+                # manage are still parseable. Recovering them keeps a timed-out
+                # gemini row comparable with openclaw's and antigravity's,
+                # which also recover partial telemetry.
+                partial = parse_stream_json(exc.stdout or "")
+                return AgentResult(
+                    output=partial.output or f"Error: gemini subprocess error: {exc}",
+                    trajectory=partial.trajectory,
+                    tokens=partial.tokens,
+                    latency=time.monotonic() - started,
+                    errors=[f"gemini subprocess error: {exc}", *partial.errors],
+                    terminal_reason="timeout" if exc.timed_out else "error",
+                    tool_wait_sec=partial.tool_wait_sec,
+                    served_models=partial.served_models,
+                )
             except OSError as exc:
                 # Missing / non-executable binary; core.subprocess.run does not wrap.
-                return AgentResult.errored(f"gemini binary unavailable: {exc}")
+                return AgentResult.errored(
+                    f"gemini binary unavailable: {exc}", latency=time.monotonic() - started
+                )
+            agent_sec = time.monotonic() - started
 
-        output, trajectory, tokens, parse_errors = parse_stream_json(completed.stdout or "")
-        errors: list[str] = list(parse_errors)
+        parsed = parse_stream_json(completed.stdout or "")
+        output, trajectory, tokens = parsed.output, parsed.trajectory, parsed.tokens
+        errors: list[str] = list(parsed.errors)
         if completed.returncode != 0:
             stderr = (completed.stderr or "").strip()
             errors.append(f"gemini exited {completed.returncode}: {stderr or '<no stderr>'}")
@@ -268,6 +297,12 @@ class GeminiCliAgent(AgentHarness):
             output=output,
             trajectory=trajectory,
             tokens=tokens,
+            latency=agent_sec,
             errors=errors,
+            # The CLI's own turn cap is invisible from outside the process,
+            # so a capped run lands in "completed".
+            terminal_reason="error" if completed.returncode != 0 else "completed",
+            tool_wait_sec=parsed.tool_wait_sec,
+            served_models=parsed.served_models,
             metadata=metadata,
         )
