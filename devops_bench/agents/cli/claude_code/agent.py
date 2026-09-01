@@ -48,6 +48,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from collections.abc import Iterator
 from functools import cache
 from pathlib import Path
@@ -341,6 +342,8 @@ class ClaudeCodeAgent(AgentHarness):
             )
             with _claude_config_dir() as config_dir:
                 env_overlay = _build_env(self.config, config_dir=config_dir)
+                timed_out = False
+                started = time.monotonic()
                 try:
                     completed = run(
                         argv,
@@ -358,6 +361,7 @@ class ClaudeCodeAgent(AgentHarness):
                     # than interpolating it. The timeout carries the partial
                     # stream-json captured before the kill; fall through so the
                     # trajectory is recovered rather than dropped.
+                    timed_out = True
                     stderr = _stderr_tail(exc.stderr)
                     returncode = exc.returncode
                     stdout = exc.stdout or ""
@@ -367,7 +371,9 @@ class ClaudeCodeAgent(AgentHarness):
                 except OSError as exc:
                     # Spawn failure core.subprocess.run does not wrap: usually a
                     # missing / non-executable binary, but also a vanished cwd.
-                    return AgentResult.errored(f"failed to spawn claude: {exc}")
+                    return AgentResult.errored(
+                        f"failed to spawn claude: {exc}", latency=time.monotonic() - started
+                    )
                 else:
                     stderr = _stderr_tail(completed.stderr)
                     returncode = completed.returncode
@@ -377,9 +383,11 @@ class ClaudeCodeAgent(AgentHarness):
                         if returncode == 0
                         else f"claude exited {returncode}: {stderr or '<no stderr>'}"
                     )
+                agent_sec = time.monotonic() - started
 
-        output, trajectory, tokens, parse_errors = parse_stream_json(stdout)
-        errors: list[str] = list(parse_errors)
+        parsed = parse_stream_json(stdout)
+        output = parsed.output
+        errors: list[str] = list(parsed.errors)
         metadata: dict = {}
         if stderr:
             # Keep stderr for diagnosis even on a clean exit — e.g. MCP startup
@@ -391,8 +399,25 @@ class ClaudeCodeAgent(AgentHarness):
             output = output or f"Error: {reason}"
         return AgentResult(
             output=output,
-            trajectory=trajectory,
-            tokens=tokens,
+            trajectory=parsed.trajectory,
+            tokens=parsed.tokens,
+            latency=agent_sec,
             errors=errors,
+            # The timeout is the harness's own doing and outranks whatever the
+            # killed process managed to write; a non-zero exit outranks a
+            # terminal event claiming success, since the CLI can still fail
+            # after the query loop ends. Otherwise the stream's own reason
+            # stands, and a stream that never reached its terminal event falls
+            # back to the exit code.
+            terminal_reason=(
+                "timeout"
+                if timed_out
+                else "error"
+                if returncode != 0
+                else parsed.terminal_reason or "completed"
+            ),
+            tool_wait_sec=parsed.tool_wait_sec,
+            served_models=parsed.served_models,
+            model_turns=parsed.model_turns,
             metadata=metadata,
         )
