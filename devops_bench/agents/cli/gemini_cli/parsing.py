@@ -25,6 +25,7 @@ from collections.abc import Mapping
 from typing import NamedTuple
 
 from devops_bench.agents.result import ToolCall, empty_tokens
+from devops_bench.agents.shared.telemetry import note_model
 from devops_bench.agents.shared.timing import merged_span_sec, parse_event_time
 
 __all__: list[str] = ["StreamParse", "parse_stream_json"]
@@ -123,10 +124,6 @@ def parse_stream_json(stdout: str) -> StreamParse:
     spans: list[tuple[float, float]] = []
     served_models: list[str] = []
 
-    def note_model(value: object) -> None:
-        if isinstance(value, str) and value and value not in served_models:
-            served_models.append(value)
-
     for lineno, raw in enumerate(stdout.splitlines(), start=1):
         line = raw.strip()
         if not line:
@@ -142,7 +139,7 @@ def parse_stream_json(stdout: str) -> StreamParse:
         etype = event.get("type")
         event_time = parse_event_time(event.get("timestamp"))
         if etype == "init":
-            note_model(event.get("model"))
+            note_model(served_models, event.get("model"))
         elif etype == "message":
             # ``role="user"`` echoes the prompt and is skipped.
             if event.get("role") in ("assistant", "model"):
@@ -211,7 +208,7 @@ def parse_stream_json(stdout: str) -> StreamParse:
                 per_model = stats.get("models")
                 if isinstance(per_model, Mapping):
                     for name in per_model:
-                        note_model(name)
+                        note_model(served_models, name)
             elif isinstance(usage, dict):
                 tokens = usage
 

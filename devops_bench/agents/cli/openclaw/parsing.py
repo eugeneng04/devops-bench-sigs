@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from devops_bench.agents.result import ToolCall
+from devops_bench.agents.shared.telemetry import note_model
 from devops_bench.agents.shared.timing import merged_span_sec, parse_event_time
 from devops_bench.core import get_logger
 
@@ -291,9 +292,7 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
         elif etype == "assistant.message":
             model_turns += 1
             msg = data.get("message") if isinstance(data.get("message"), dict) else {}
-            served = msg.get("model")
-            if isinstance(served, str) and served and served not in served_models:
-                served_models.append(served)
+            note_model(served_models, msg.get("model"))
             _accumulate_cache_write(tokens, msg.get("usage"))
             txt = _join_text(msg.get("content"))
             if txt:

@@ -28,6 +28,7 @@ from collections.abc import Iterator
 from typing import NamedTuple
 
 from devops_bench.agents.result import ToolCall, empty_tokens
+from devops_bench.agents.shared.telemetry import note_model
 from devops_bench.agents.shared.timing import merged_span_sec, parse_event_time
 
 __all__ = ["StreamParse", "parse_stream_json"]
@@ -112,12 +113,18 @@ _MCP_FAILED_STATUSES = frozenset({"failed", "error", "disconnected", "needs-auth
 
 # The CLI stamps its own reason for ending the query loop on the terminal
 # ``result`` event -- ``completed``, ``max_turns``, ``api_error``,
-# ``prompt_too_long``, ``aborted_tools`` and a dozen more. Only ``completed``
-# means the agent handed control back on its own; every other reason is a run
-# that stopped short, which the bench's four-value vocabulary records as
-# ``error`` (see ``agents.result.TERMINAL_REASONS``). The specific reason is not
-# dropped: whichever branch flagged the run also appends it to ``errors``.
+# ``prompt_too_long``, ``aborted_tools`` and a dozen more. Mapping them onto the
+# bench's four-value vocabulary (``agents.result.TERMINAL_REASONS``) keeps two
+# of them out of the failure bucket: ``completed`` is the agent handing control
+# back, and the turn cap is the bench's own ``--max-turns`` ceiling, which that
+# vocabulary puts in ``completed`` so an efficiency limit does not read as a
+# capability failure. Claude Code is the only harness that can see its cap --
+# the others land in ``completed`` because the cap is invisible to them -- so
+# bucketing it as ``error`` here would make the harnesses incomparable. Every
+# other reason is a failure. The reason string itself always reaches ``errors``.
 _CLI_COMPLETED_REASON = "completed"
+_CLI_TURN_CAP_REASON = "max_turns"
+_CLI_TURN_CAP_SUBTYPE = "error_max_turns"
 
 
 def _iter_events(stdout: str) -> Iterator[tuple[object, str | None]]:
@@ -162,10 +169,12 @@ class StreamParse(NamedTuple):
         tokens: Canonical token buckets.
         errors: Decode failures, unmatched ``tool_result`` blocks, failed MCP
             servers, and the run's own terminal failure.
-        terminal_reason: One of :data:`~devops_bench.agents.result.TERMINAL_REASONS`
-            derived from the terminal event (see :data:`_CLI_COMPLETED_REASON`),
-            or ``""`` when the stream carried no terminal event -- a truncated
-            pipe, which the caller resolves from the exit code instead.
+        terminal_reason: ``"completed"`` or ``"error"`` from the first terminal
+            event (see :data:`_CLI_COMPLETED_REASON`), or ``""`` when the stream
+            carried no terminal event -- a truncated pipe, which the caller
+            resolves from the exit code instead. ``"timeout"``, the fourth value
+            in :data:`~devops_bench.agents.result.TERMINAL_REASONS`, is the
+            harness's own verdict and is never derived from the stream.
         model_turns: Distinct assistant ``message.id`` values, or ``None`` when
             the stream carried no identified assistant message. This is the
             model round-trip count, which is *not* the terminal event's
@@ -173,7 +182,9 @@ class StreamParse(NamedTuple):
             a single API message answering with two ``tool_use`` blocks raises
             ``num_turns`` by two while the model was called once.
         tool_wait_sec: Wall-clock seconds inside tool calls, concurrent calls
-            counted once; ``None`` when no call could be timed.
+            counted once; ``None`` when no call could be timed. Best-effort: a
+            call whose two envelopes are not both timestamped contributes
+            nothing, so a partially stamped stream reports a lower bound.
         served_models: Distinct model ids from the assistant envelopes, in
             first-seen order. Read from the messages rather than the terminal
             event's ``modelUsage``, whose keys also include the CLI's own
@@ -281,18 +292,27 @@ def parse_stream_json(stdout: str) -> StreamParse:
             message = event.get("message")
             if not isinstance(message, dict):
                 continue
-            # Accumulate per-turn usage so a truncated stream (no terminal
-            # ``result`` event) still yields token counts. Claude Code emits one
-            # envelope per content block of a single API message, each repeating
-            # the identical ``usage``, so count each message id only once.
-            msg_id = message.get("id")
-            if not (isinstance(msg_id, str) and msg_id in seen_message_ids):
-                if isinstance(msg_id, str):
-                    seen_message_ids.add(msg_id)
-                _add_usage(acc_usage, message.get("usage"))
-            served = message.get("model")
-            if isinstance(served, str) and served and served not in served_models:
-                served_models.append(served)
+            # The CLI renders its own failures -- a 404, an over-long prompt, an
+            # interrupt -- as an assistant envelope stamped ``is_api_error_message``,
+            # carrying ``model: "<synthetic>"``, a UUID in place of a ``msg_``
+            # id and all-zero usage. Its text is the error the user should see,
+            # so it still feeds ``output``, but no model was called: counting it
+            # would put a model id that does not exist on the leaderboard and
+            # invent a round-trip.
+            if not event.get("is_api_error_message"):
+                # Accumulate per-turn usage so a truncated stream (no terminal
+                # ``result`` event) still yields token counts. Claude Code emits
+                # one envelope per content block of a single API message, each
+                # repeating the identical ``usage``, so count each message id
+                # only once. An envelope with no usable id is left uncounted
+                # rather than merged with every other unidentified message.
+                msg_id = message.get("id")
+                identified = isinstance(msg_id, str) and bool(msg_id)
+                if not (identified and msg_id in seen_message_ids):
+                    if identified:
+                        seen_message_ids.add(str(msg_id))
+                    _add_usage(acc_usage, message.get("usage"))
+                note_model(served_models, message.get("model"))
             event_time = parse_event_time(event.get("timestamp"))
             content = message.get("content")
             if not isinstance(content, list):
@@ -354,34 +374,38 @@ def parse_stream_json(stdout: str) -> StreamParse:
             if isinstance(usage, dict) and _has_usage(usage):
                 tokens = _usage_tokens(usage)
                 result_usage_seen = True
+            # First terminal event wins, matching the answer/usage guards above:
+            # a later event must not append a failure the resolved reason no
+            # longer reflects, which would leave ``errors`` contradicting it.
+            if terminal_reason:
+                continue
             cli_reason = event.get("terminal_reason")
             cli_reason = cli_reason if isinstance(cli_reason, str) and cli_reason else None
-            failed = False
             subtype = event.get("subtype")
-            if isinstance(subtype, str) and subtype.startswith("error_"):
-                failed = True
-                errors.append(f"stream-json result error: {subtype}")
+            status = event.get("api_error_status")
+            detail = f" (api status {status})" if status is not None else ""
+            if cli_reason is not None and cli_reason != _CLI_COMPLETED_REASON:
+                # The CLI's reason names *why* the loop ended; the flags below
+                # only say that something went wrong. Prefer it, or a run
+                # stopped by ``prompt_too_long`` or ``api_error`` would be
+                # recorded as an anonymous failure.
+                note = f"stream-json result terminal_reason: {cli_reason}{detail}"
+            elif isinstance(subtype, str) and subtype.startswith("error_"):
+                note = f"stream-json result error: {subtype}"
             elif event.get("is_error"):
-                failed = True
                 # A failed API call can still carry ``subtype: "success"``
-                # (observed: a 404 model-not-found, whose ``terminal_reason`` is
-                # ``api_error``). Without this the run would score as clean with
-                # an empty trajectory and zeroed usage.
-                status = event.get("api_error_status")
-                detail = f" (api status {status})" if status is not None else ""
-                errors.append(f"stream-json result flagged is_error{detail}")
-            elif cli_reason is not None and cli_reason != _CLI_COMPLETED_REASON:
-                # A loop that stopped short without tripping either flag above
-                # (e.g. ``prompt_too_long``, ``aborted_tools``). Recording only
-                # the bucketed reason would lose which one it was.
-                failed = True
-                errors.append(f"stream-json result terminal_reason: {cli_reason}")
-            # First terminal event wins, matching the answer/usage guards above.
+                # (observed: a 404 model-not-found). Without this the run would
+                # score as clean with an empty trajectory and zeroed usage.
+                note = f"stream-json result flagged is_error{detail}"
+            else:
+                note = ""
+            if note:
+                errors.append(note)
             # ``terminal_reason`` is optional on the event, so a binary that
-            # omits it still resolves from the failure flags rather than
-            # falling through to the exit code.
-            if not terminal_reason:
-                terminal_reason = "error" if failed else "completed"
+            # omits it resolves from the failure flags and the subtype instead
+            # of falling through to the exit code.
+            capped = cli_reason == _CLI_TURN_CAP_REASON or subtype == _CLI_TURN_CAP_SUBTYPE
+            terminal_reason = "error" if note and not capped else "completed"
 
     # ``result_output`` may be an empty string (error subtypes emit ``""``); fall
     # back to the accumulated assistant text so a real partial answer survives.

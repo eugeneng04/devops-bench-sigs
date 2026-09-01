@@ -354,18 +354,21 @@ class ClaudeCodeAgent(AgentHarness):
                         input=_CLOSED_STDIN,
                     )
                 except SubprocessError as exc:
-                    # Under ``check=False`` the only way ``run`` raises is a
-                    # timeout, so report it as one rather than as an exit -1 that
+                    # Report a timeout as one rather than as an exit -1 that
                     # reads like a crash. str(exc) embeds the child's full
                     # stderr, so rebuild the message from the clipped tail rather
                     # than interpolating it. The timeout carries the partial
                     # stream-json captured before the kill; fall through so the
                     # trajectory is recovered rather than dropped.
-                    timed_out = True
+                    timed_out = exc.timed_out
                     stderr = _stderr_tail(exc.stderr)
                     returncode = exc.returncode
                     stdout = exc.stdout or ""
-                    reason = f"claude timed out after {self.config.timeout_sec}s"
+                    reason = (
+                        f"claude timed out after {self.config.timeout_sec}s"
+                        if timed_out
+                        else f"claude failed to run: exit {returncode}"
+                    )
                     if stderr:
                         reason += f": {stderr}"
                 except OSError as exc:
@@ -404,17 +407,15 @@ class ClaudeCodeAgent(AgentHarness):
             latency=agent_sec,
             errors=errors,
             # The timeout is the harness's own doing and outranks whatever the
-            # killed process managed to write; a non-zero exit outranks a
-            # terminal event claiming success, since the CLI can still fail
-            # after the query loop ends. Otherwise the stream's own reason
-            # stands, and a stream that never reached its terminal event falls
-            # back to the exit code.
+            # killed process managed to write. Otherwise the stream's terminal
+            # event wins: it is more specific than the exit code, and the CLI
+            # exits 1 on a turn cap that the parser resolves to ``completed``.
+            # The exit code governs only a stream that never reached its
+            # terminal event -- a truncated pipe or a binary that died early.
             terminal_reason=(
                 "timeout"
                 if timed_out
-                else "error"
-                if returncode != 0
-                else parsed.terminal_reason or "completed"
+                else parsed.terminal_reason or ("error" if returncode != 0 else "completed")
             ),
             tool_wait_sec=parsed.tool_wait_sec,
             served_models=parsed.served_models,

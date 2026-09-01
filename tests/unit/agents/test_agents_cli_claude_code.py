@@ -721,35 +721,86 @@ def test_parse_stream_json_maps_a_completed_run_to_completed() -> None:
 
 def test_parse_stream_json_buckets_a_cli_specific_reason_as_error() -> None:
     """The CLI's reason vocabulary is far wider than the bench's four values, so
-    anything but ``completed`` buckets to ``error`` — with the specific reason
-    kept on ``errors`` rather than dropped."""
+    a failure reason buckets to ``error`` — with the specific reason kept on
+    ``errors`` rather than dropped."""
     blob = _stream(
         {
             "type": "result",
-            "subtype": "error_max_turns",
-            "terminal_reason": "max_turns",
+            "subtype": "error_during_execution",
+            "terminal_reason": "model_error",
             "result": "",
         }
     )
     parsed = parse_stream_json(blob)
     assert parsed.terminal_reason == "error"
+    assert parsed.errors == ["stream-json result terminal_reason: model_error"]
+
+
+def test_parse_stream_json_scores_a_turn_capped_run_as_completed() -> None:
+    """``TERMINAL_REASONS`` puts a turn cap in ``completed`` so an efficiency
+    ceiling does not read as a capability failure, and the sibling harnesses
+    land there because their cap is invisible from outside the process. Claude
+    Code can see its cap, so it has to be mapped there deliberately or the two
+    harnesses report opposite values for the same event."""
+    blob = _stream(
+        {
+            "type": "result",
+            "subtype": "error_max_turns",
+            "terminal_reason": "max_turns",
+            "is_error": True,
+            "result": "",
+        }
+    )
+    parsed = parse_stream_json(blob)
+    assert parsed.terminal_reason == "completed"
+    # The cap itself is not lost — it just is not a failure.
+    assert parsed.errors == ["stream-json result terminal_reason: max_turns"]
+
+
+def test_parse_stream_json_scores_a_turn_cap_as_completed_without_a_cli_reason() -> None:
+    """A binary predating ``terminal_reason`` shows the cap only in the subtype;
+    it must not land in a different bucket than the same run on a newer one."""
+    blob = _stream({"type": "result", "subtype": "error_max_turns", "result": ""})
+    parsed = parse_stream_json(blob)
+    assert parsed.terminal_reason == "completed"
     assert parsed.errors == ["stream-json result error: error_max_turns"]
 
 
-def test_parse_stream_json_buckets_a_stopped_short_reason_without_failure_flags() -> None:
-    """A loop that stopped short need not set ``is_error`` or an ``error_*``
-    subtype; the reason alone must still mark the run as failed."""
+def test_parse_stream_json_keeps_the_cli_reason_when_a_failure_flag_also_fired() -> None:
+    """Every reason the CLI itself classifies as an error (``api_error``,
+    ``prompt_too_long``, ``blocking_limit``) arrives as ``subtype: "success"``
+    with ``is_error`` set, so a mapping that only reads the flags would record
+    an anonymous failure for the whole reachable failure vocabulary."""
     blob = _stream(
         {
             "type": "result",
             "subtype": "success",
-            "terminal_reason": "prompt_too_long",
+            "is_error": True,
+            "api_error_status": 404,
+            "terminal_reason": "api_error",
+            "result": "The model x is not available.",
+        }
+    )
+    parsed = parse_stream_json(blob)
+    assert parsed.terminal_reason == "error"
+    assert parsed.errors == ["stream-json result terminal_reason: api_error (api status 404)"]
+
+
+def test_parse_stream_json_buckets_a_stopped_short_reason_without_failure_flags() -> None:
+    """A loop the CLI does not itself flag (``hook_stopped``, ``aborted_tools``)
+    sets neither ``is_error`` nor an ``error_*`` subtype; the reason alone must
+    still mark the run as failed."""
+    blob = _stream(
+        {
+            "type": "result",
+            "subtype": "success",
+            "terminal_reason": "hook_stopped",
             "result": "partial",
         }
     )
     parsed = parse_stream_json(blob)
     assert parsed.terminal_reason == "error"
-    assert parsed.errors == ["stream-json result terminal_reason: prompt_too_long"]
+    assert parsed.errors == ["stream-json result terminal_reason: hook_stopped"]
 
 
 def test_parse_stream_json_resolves_reason_from_flags_when_the_cli_omits_it() -> None:
@@ -767,12 +818,42 @@ def test_parse_stream_json_leaves_reason_unset_without_a_terminal_event() -> Non
     assert parse_stream_json(blob).terminal_reason == ""
 
 
-def test_parse_stream_json_first_terminal_reason_wins() -> None:
+def test_parse_stream_json_first_terminal_event_wins_for_reason_and_errors() -> None:
+    """A later terminal event must not append a failure the resolved reason no
+    longer reflects, or the row says ``completed`` while its own error list
+    names a mid-execution failure."""
     blob = _stream(
         {"type": "result", "subtype": "success", "terminal_reason": "completed", "result": "ok"},
         {"type": "result", "subtype": "error_during_execution", "result": ""},
     )
-    assert parse_stream_json(blob).terminal_reason == "completed"
+    parsed = parse_stream_json(blob)
+    assert parsed.terminal_reason == "completed"
+    assert parsed.errors == []
+
+
+def test_parse_stream_json_ignores_the_cli_synthetic_error_envelope() -> None:
+    """The CLI renders its own failures as an assistant envelope carrying
+    ``model: "<synthetic>"`` and a UUID id. Its text is the error the user
+    should see, but no model was called, so counting it would put a model id
+    that does not exist on the leaderboard and invent a round-trip."""
+    blob = _stream(
+        _assistant({"type": "text", "text": "hi"}, msg_id="msg_1", model="claude-opus-5"),
+        {
+            "type": "assistant",
+            "is_api_error_message": True,
+            "error": "model_not_found",
+            "message": {
+                "id": "0335a8d1-0723-4f3b-a1f6-d5d0b352aa5a",
+                "model": "<synthetic>",
+                "content": [{"type": "text", "text": "There's an issue with the selected model."}],
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        },
+    )
+    parsed = parse_stream_json(blob)
+    assert parsed.served_models == ["claude-opus-5"]
+    assert parsed.model_turns == 1
+    assert "There's an issue with the selected model." in parsed.output
 
 
 def test_parse_stream_json_counts_model_turns_by_message_id() -> None:
@@ -794,6 +875,18 @@ def test_parse_stream_json_leaves_model_turns_unreported_without_message_ids() -
     latter is unknown, and ``None`` is how the row records unknown."""
     blob = _stream(_assistant({"type": "text", "text": "hi"}))
     assert parse_stream_json(blob).model_turns is None
+
+
+def test_parse_stream_json_treats_an_empty_message_id_as_unidentified() -> None:
+    """An empty id is no id: counting it invents a turn, and deduping on it
+    merges genuinely distinct messages and drops the second one's usage."""
+    blob = _stream(
+        _assistant({"type": "text", "text": "a"}, msg_id="", usage={"input_tokens": 5}),
+        _assistant({"type": "text", "text": "b"}, msg_id="", usage={"input_tokens": 5}),
+    )
+    parsed = parse_stream_json(blob)
+    assert parsed.model_turns is None
+    assert parsed.tokens["input"] == 10
 
 
 def test_parse_stream_json_times_a_tool_call_from_its_envelope_timestamps() -> None:
@@ -1131,7 +1224,7 @@ def test_execute_reports_a_timeout_as_a_timeout(monkeypatch: pytest.MonkeyPatch)
     bucket, where ``exit -1`` would have put it."""
 
     def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
-        raise SubprocessError(argv, returncode=-1, stdout="", stderr="killed")
+        raise SubprocessError(argv, returncode=-1, stdout="", stderr="killed", timed_out=True)
 
     monkeypatch.setattr(claude_mod, "run", fake_run)
     result = ClaudeCodeAgent(AgentConfig(target="claude", timeout_sec=900)).run("p")
@@ -1153,7 +1246,9 @@ def test_execute_recovers_partial_trajectory_on_timeout(monkeypatch: pytest.Monk
     )
 
     def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
-        raise SubprocessError(argv, returncode=-1, stdout=partial, stderr="killed after timeout")
+        raise SubprocessError(
+            argv, returncode=-1, stdout=partial, stderr="killed after timeout", timed_out=True
+        )
 
     monkeypatch.setattr(claude_mod, "run", fake_run)
     result = ClaudeCodeAgent(AgentConfig(target="claude")).run("p")
@@ -1172,6 +1267,8 @@ def test_execute_handles_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None
     assert result.has_errors()
     assert "failed to spawn claude" in result.errors[0]
     assert result.tokens == _tok()
+    assert result.terminal_reason == "error"
+    assert result.latency > 0
 
 
 def test_execute_passes_timeout_to_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1229,28 +1326,50 @@ def test_execute_reports_timeout_over_the_streams_own_reason(
     )
 
     def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
-        raise SubprocessError(argv, returncode=-1, stdout=partial, stderr="killed")
+        raise SubprocessError(argv, returncode=-1, stdout=partial, stderr="killed", timed_out=True)
 
     monkeypatch.setattr(claude_mod, "run", fake_run)
     result = ClaudeCodeAgent(AgentConfig(target="claude")).run("p")
     assert result.terminal_reason == "timeout"
 
 
-def test_execute_reports_a_non_zero_exit_over_a_successful_terminal_event(
+def test_execute_reports_a_non_timeout_subprocess_error_as_an_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The CLI can fail *after* the query loop ends (e.g. writing the
-    transcript), so a non-zero exit outranks the stream claiming success."""
-    stream = _stream(
-        {"type": "result", "subtype": "success", "terminal_reason": "completed", "result": "ok"}
-    )
+    """``timed_out`` distinguishes the wall-clock kill from any other raise, so a
+    non-timeout failure is not mislabelled as one."""
 
     def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(stdout=stream, stderr="boom", returncode=1)
+        raise SubprocessError(argv, returncode=2, stdout="", stderr="boom", timed_out=False)
 
     monkeypatch.setattr(claude_mod, "run", fake_run)
     result = ClaudeCodeAgent(AgentConfig(target="claude")).run("p")
+    assert result.errors[0] == "claude failed to run: exit 2: boom"
     assert result.terminal_reason == "error"
+
+
+def test_execute_reports_the_terminal_event_over_a_non_zero_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI exits non-zero on a turn cap, which the parser resolves to
+    ``completed``, so the terminal event is the more specific signal."""
+    stream = _stream(
+        {
+            "type": "result",
+            "subtype": "error_max_turns",
+            "terminal_reason": "max_turns",
+            "is_error": True,
+            "result": "ok",
+        }
+    )
+
+    def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(stdout=stream, stderr="", returncode=1)
+
+    monkeypatch.setattr(claude_mod, "run", fake_run)
+    result = ClaudeCodeAgent(AgentConfig(target="claude")).run("p")
+    assert result.terminal_reason == "completed"
+    assert any("max_turns" in e for e in result.errors)
 
 
 def test_execute_falls_back_to_the_exit_code_without_a_terminal_event(
@@ -1264,14 +1383,19 @@ def test_execute_falls_back_to_the_exit_code_without_a_terminal_event(
     assert result.terminal_reason == "completed"
 
 
-def test_execute_reports_a_failed_spawn_as_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_execute_falls_back_to_a_non_zero_exit_without_a_terminal_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A truncated pipe or a binary that died before its terminal event leaves
+    the exit code as the only verdict available."""
+    stream = _stream(_assistant({"type": "text", "text": "partial"}))
+
     def fake_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
-        raise OSError("not found")
+        return SimpleNamespace(stdout=stream, stderr="boom", returncode=1)
 
     monkeypatch.setattr(claude_mod, "run", fake_run)
     result = ClaudeCodeAgent(AgentConfig(target="claude")).run("p")
     assert result.terminal_reason == "error"
-    assert result.latency > 0
 
 
 # ---------------------------------------------------------------------------
