@@ -189,12 +189,14 @@ class AgentResult:
                 which is a different signal from the agent failing.
 
         Returns:
-            An :class:`AgentResult` with empty trajectory and the message in
-            both ``output`` and ``errors``.
+            An :class:`AgentResult` with empty trajectory, the canonical
+            all-``None`` token shape, and the message in both ``output`` and
+            ``errors``.
         """
         return cls(
             output=f"Error: {msg}",
             trajectory=[],
+            tokens=empty_tokens(),
             latency=latency,
             errors=[msg],
             terminal_reason=terminal_reason,

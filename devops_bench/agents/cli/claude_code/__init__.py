@@ -12,14 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cloud providers selecting credentials and OpenTofu variables per cloud."""
+"""Claude Code CLI agent harness, named to distinguish it from the Claude model.
+
+The harness driver lives in :mod:`.agent` and the stream-json parser in
+:mod:`.parsing`. Importing this package self-registers the agent under the
+``"claude"`` key via ``@AGENTS.register``.
+"""
 
 from __future__ import annotations
 
-# Import for their registration side effects so the registry is populated.
-from devops_bench.providers import gcp as _gcp  # noqa: F401
-from devops_bench.providers import kind as _kind  # noqa: F401
-from devops_bench.providers import vcluster as _vcluster  # noqa: F401
-from devops_bench.providers.base import PROVIDERS, Provider, ResolveContext
+from devops_bench.agents.cli.claude_code.agent import ClaudeCodeAgent
+from devops_bench.agents.cli.claude_code.parsing import parse_stream_json
 
-__all__ = ["PROVIDERS", "Provider", "ResolveContext"]
+__all__ = ["ClaudeCodeAgent", "parse_stream_json"]

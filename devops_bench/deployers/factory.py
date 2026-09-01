@@ -19,7 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from devops_bench.core import ConfigError, get_bool, get_env
+from devops_bench.core import ConfigError, get_bool, get_env, resolve_tf_root
 from devops_bench.deployers.base import Deployer
 from devops_bench.deployers.noop import NoOpDeployer
 from devops_bench.deployers.tofu import TFDeployer
@@ -29,19 +29,21 @@ __all__ = ["get_deployer"]
 
 _DEFAULT_LOCATION = "us-central1-a"
 _DEFAULT_STACK = "prebuilt/kind"
+_DEDUCIBLE_PROVIDERS = frozenset({"kind", "vcluster"})
 
 
 def _select_provider(infra_config: dict[str, Any], stack: str) -> str:
     """Determine the provider name for a tofu stack.
 
     Precedence: ``INFRA_PROVIDER`` env → explicit ``provider`` config key →
-    ``kind`` deduced from an in-repo stack name. The env var wins so a task can
-    pin a default ``provider`` in its config while runs stay overridable from
-    the environment (matching ``TARGET_DEPLOYMENT_NAME`` / ``NAMESPACE``).
-    Deduction is only applied to in-repo (relative) stacks named ``kind``; an
-    out-of-repo (absolute or ``~``) stack, or any in-repo stack not named
-    ``kind``, must name its provider explicitly — no cloud is assumed by
-    default, so a new provider never silently inherits another's defaults.
+    directory name deduction from a supported in-repository local stack name. The env
+    var wins so a task can pin a default ``provider`` in its config while runs
+    stay overridable from the environment (matching
+    ``TARGET_DEPLOYMENT_NAME`` / ``NAMESPACE``). Deduction is only applied to
+    in-repo (relative) stacks matching a local, non-billable provider name
+    (``kind``, ``vcluster``); billable clouds or out-of-repo stacks must name
+    their provider explicitly — no cloud is assumed by default, so a cloud provider
+    is never silently selected or charged without explicit configuration.
 
     Args:
         infra_config: Task infrastructure config.
@@ -52,17 +54,21 @@ def _select_provider(infra_config: dict[str, Any], stack: str) -> str:
 
     Raises:
         ConfigError: If no explicit provider is given and the stack does not
-            deduce to ``kind``.
+            deduce to a deducible local provider directory name.
     """
     explicit = (get_env("INFRA_PROVIDER", "") or infra_config.get("provider") or "").strip().lower()
     if explicit:
         return explicit
     stack_path = Path(stack).expanduser()
-    if not stack_path.is_absolute() and stack_path.name == "kind":
-        return "kind"
+    if not stack_path.is_absolute():
+        tf_root = resolve_tf_root()
+        resolved = (tf_root / stack_path).resolve()
+        is_in_repo = tf_root in resolved.parents or resolved == tf_root
+        if is_in_repo and resolved.name in _DEDUCIBLE_PROVIDERS:
+            return resolved.name
     raise ConfigError(
         f"stack {stack!r} requires an explicit provider; set 'provider' in task "
-        "config or the INFRA_PROVIDER env var (e.g. 'gcp' or 'kind')"
+        "config or the INFRA_PROVIDER env var to a supported provider"
     )
 
 
@@ -74,9 +80,9 @@ def get_deployer(
 ) -> Deployer:
     """Instantiate the deployer selected by task config and environment.
 
-    OpenTofu (``tofu``) is the sole provisioning engine; the provider (``gcp`` or
-    ``kind``) only supplies credentials and stack variable defaults. Two layers
-    can skip provisioning, with the env layer winning:
+    OpenTofu (``tofu``) is the sole provisioning engine; the selected provider
+    only supplies credentials and stack variable defaults. Two layers can skip
+    provisioning, with the env layer winning:
 
     * ``deployer: noop`` (config) *declares* a task that needs no infrastructure.
     * ``BENCH_NO_INFRA=true`` (env) *overrides* any config to skip infra for a

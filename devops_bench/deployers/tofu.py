@@ -29,7 +29,12 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from devops_bench.core import ClusterInfo, ConfigError, get_env, get_logger
+from devops_bench.core import (
+    ClusterInfo,
+    ConfigError,
+    get_logger,
+    resolve_tf_root,
+)
 from devops_bench.core.subprocess import run
 from devops_bench.deployers.base import Deployer
 
@@ -40,27 +45,13 @@ __all__ = ["TFDeployer"]
 
 # This module lives at ``<repo_root>/devops_bench/deployers/tofu.py``; the repo
 # root is therefore three levels up, and Tofu stacks live under ``<repo_root>/tf``.
-# Default only — ``_resolve_tf_root`` consults ``BENCH_TF_ROOT`` first.
+# Default only — ``resolve_tf_root`` consults ``BENCH_TF_ROOT`` first.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _TF_ROOT = _REPO_ROOT / "tf"
 
 _log = get_logger("deployers.tofu")
 
-
-def _resolve_tf_root() -> Path:
-    """Return the stack root: ``$BENCH_TF_ROOT`` override, else ``<repo_root>/tf``.
-
-    Read per call (not at import) so setting the variable after import works.
-    Under a pip install the default points inside ``site-packages`` where no
-    ``tf/`` tree exists, so installed-library users set ``BENCH_TF_ROOT`` to the
-    directory holding their stacks. Two constraints on an override root: it is
-    copied *whole* per isolated run (stacks reference modules via relative
-    ``../../`` paths, so keep it lean), and it should not be an ancestor of the
-    run scratch dir (``BENCH_RUN_STATE_ROOT``) — :func:`_isolated_work_dir`
-    refuses to copy in that case and degrades to the shared stack dir.
-    """
-    override = get_env("BENCH_TF_ROOT")
-    return Path(override).expanduser().resolve() if override else _TF_ROOT
+_resolve_tf_root = resolve_tf_root
 
 
 def _format_var(value: Any) -> str:
@@ -221,6 +212,7 @@ class TFDeployer(Deployer):
         self.provider = provider
         self.variables = variables or {}
         self.custom_keys = custom_keys or set()
+        self._cluster_info: ClusterInfo | None = None
 
     def _var_flags(self) -> list[str]:
         # Scan the directory tofu actually runs in (the isolated per-run copy
@@ -279,27 +271,49 @@ class TFDeployer(Deployer):
         run(cmd, cwd=self.work_dir, capture=False)
 
     def down(self) -> None:
-        tf_path = Path(self.work_dir)
-        if not tf_path.exists():
-            _log.warning(
-                "TF directory %s (stack: %s) not found. Skipping teardown.",
-                self.work_dir,
-                self.tf_dir,
+        """Tear down the OpenTofu stack and run provider cleanup.
+
+        Invokes ``tofu destroy`` to release provisioned infrastructure, and
+        guarantees execution of ``provider.cleanup()`` via a ``finally`` block to
+        clean up temporary scratch files and provider-specific resources.
+        """
+        cluster_info = self._cluster_info
+        if cluster_info is None:
+            cluster_info = ClusterInfo.from_dict(
+                {
+                    "name": self.variables.get("cluster_name", ""),
+                    "location": self.variables.get("location", "local"),
+                    "project": self.variables.get("project_id"),
+                    "kubeconfig_path": self.variables.get("kubeconfig_path"),
+                }
             )
-            return
 
-        self.provider.ensure_account_credentials()
-        run(["tofu", "init", "-input=false"], cwd=self.work_dir, capture=False)
+        destroy_success = False
+        try:
+            tf_path = Path(self.work_dir)
+            if not tf_path.exists():
+                _log.warning(
+                    "TF directory %s (stack: %s) not found. Skipping teardown.",
+                    self.work_dir,
+                    self.tf_dir,
+                )
+                return
 
-        cmd = [
-            "tofu",
-            "destroy",
-            "-auto-approve",
-            "-input=false",
-            *self._state_flags(),
-            *self._var_flags(),
-        ]
-        run(cmd, cwd=self.work_dir, capture=False)
+            self.provider.ensure_account_credentials()
+            run(["tofu", "init", "-input=false"], cwd=self.work_dir, capture=False)
+
+            cmd = [
+                "tofu",
+                "destroy",
+                "-auto-approve",
+                "-input=false",
+                *self._state_flags(),
+                *self._var_flags(),
+            ]
+            run(cmd, cwd=self.work_dir, capture=False)
+            destroy_success = True
+        finally:
+            self.provider.cleanup(cluster_info, variables=self.variables, success=destroy_success)
 
     def get_cluster_info(self) -> ClusterInfo:
         """Read cluster details from the stack outputs.
@@ -321,16 +335,30 @@ class TFDeployer(Deployer):
             capture=True,
         )
         try:
-            outputs = json.loads(result.stdout)
+            raw_outputs = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
             raise ConfigError("failed to parse 'tofu output -json'") from exc
 
-        cluster_name = outputs.get("cluster_name", {}).get("value")
+        if not isinstance(raw_outputs, dict):
+            raise ConfigError(
+                f"Expected dict from 'tofu output -json', got {type(raw_outputs).__name__}"
+            )
+
+        outputs = {
+            k: v.get("value")
+            for k, v in raw_outputs.items()
+            if isinstance(v, dict) and "value" in v
+        }
+
+        cluster_name = outputs.get("cluster_name")
         if not cluster_name:
             raise ConfigError("Failed to retrieve 'cluster_name' from TF outputs.")
 
-        location = outputs.get("cluster_location", {}).get("value")
+        location = outputs.get("cluster_location")
         if not location:
             raise ConfigError("Failed to retrieve 'cluster_location' from TF outputs.")
 
-        return self.provider.ensure_cluster_credentials(cluster_name, location, self.variables)
+        self._cluster_info = self.provider.ensure_cluster_credentials(
+            cluster_name, location, self.variables, outputs=outputs
+        )
+        return self._cluster_info
