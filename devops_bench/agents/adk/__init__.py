@@ -12,24 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reusable Kubernetes primitives: kubectl wrappers and wait/poll conditions."""
+"""In-process harness for agents built with the Agent Development Kit (ADK).
 
-from devops_bench.k8s.conditions import poll_until
-from devops_bench.k8s.kubectl import (
-    apply,
-    get_resource,
-    is_not_found,
-    port_forward,
-    rollout_status,
-    wait,
-)
+The harness loads a caller-supplied ADK agent, drives it through ADK's own
+``Runner``, and folds the resulting event stream into the canonical trajectory.
+Importing this package pulls no SDK — :mod:`devops_bench.agents.adk.agent`
+imports ``google.adk`` lazily inside ``_execute`` so a host without the optional
+``adk`` extra can still import the agents tree.
+"""
 
-__all__ = [
-    "apply",
-    "get_resource",
-    "is_not_found",
-    "poll_until",
-    "port_forward",
-    "rollout_status",
-    "wait",
-]
+from __future__ import annotations
