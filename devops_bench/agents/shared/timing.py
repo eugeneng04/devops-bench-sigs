@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Turning CLI-transcript timestamps into the wall clock a run spent in tools."""
+"""Turning agent-transcript timestamps into the wall clock a run spent in tools."""
 
 from __future__ import annotations
 
@@ -24,10 +24,11 @@ __all__ = ["merged_span_sec", "parse_event_time"]
 def parse_event_time(value: object) -> float | None:
     """Parse a transcript event timestamp into epoch seconds.
 
-    Both CLI transcripts stamp events as ISO-8601 with a ``Z`` suffix
-    (``2026-08-24T17:44:45.862Z``), which ``fromisoformat`` only accepts from
-    Python 3.11 on; the explicit ``+00:00`` swap keeps the intent visible rather
-    than resting on that.
+    Two spellings reach here. The CLI transcripts stamp events as ISO-8601 with
+    a ``Z`` suffix (``2026-08-24T17:44:45.862Z``), which ``fromisoformat`` only
+    accepts from Python 3.11 on; the explicit ``+00:00`` swap keeps the intent
+    visible rather than resting on that. The in-process ADK event stream stamps
+    epoch seconds as a ``float`` already, so it passes straight through.
 
     Args:
         value: The raw ``ts`` / ``timestamp`` field, or anything else.
@@ -37,6 +38,11 @@ def parse_event_time(value: object) -> float | None:
         transcript that drops the field is normal on older CLI versions, so this
         is a "no timing available" signal, not an error.
     """
+    # ``bool`` first: ``True`` is an ``int``, and epoch second 1 is not a time.
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
     if not isinstance(value, str) or not value:
         return None
     try:

@@ -30,6 +30,11 @@ Each event carries a ``content.parts`` list. Three part shapes matter:
 Calls and responses are correlated by the ``id`` ADK stamps on both sides, so a
 call and its result fold into one :class:`~devops_bench.agents.result.ToolCall`
 rather than two trajectory entries.
+
+Three event-level fields outside ``content`` carry the run's telemetry:
+``timestamp`` (epoch seconds, on every event), ``usage_metadata`` (one block per
+LLM call), and ``model_version`` (the id the provider reported, on the events
+the model authored).
 """
 
 from __future__ import annotations
@@ -37,11 +42,13 @@ from __future__ import annotations
 import json
 from collections import deque
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, NamedTuple
 
 from devops_bench.agents.result import ToolCall, empty_tokens
+from devops_bench.agents.shared.telemetry import note_model
+from devops_bench.agents.shared.timing import merged_span_sec, parse_event_time
 
-__all__: list[str] = ["parse_event_stream"]
+__all__: list[str] = ["EventParse", "parse_event_stream"]
 
 # ``usage_metadata`` field -> the accumulator slot it feeds. ADK passes the
 # google-genai usage block through verbatim, so these are the genai names.
@@ -158,9 +165,36 @@ def _canonical_tokens(sums: Mapping[str, int], seen: set[str]) -> dict[str, int 
     return tokens
 
 
-def parse_event_stream(
-    events: Sequence[Any],
-) -> tuple[str, list[dict], dict[str, int | None], list[str]]:
+class EventParse(NamedTuple):
+    """What one serialized ADK event stream yielded.
+
+    Attributes:
+        output: Concatenated assistant text.
+        trajectory: ``ToolCall.to_dict()`` mappings in call order.
+        tokens: Canonical token buckets summed over the run's LLM calls.
+        errors: ADK ``error_code`` / ``error_message`` events, tool responses
+            matching no call, and events of an unexpected type.
+        tool_wait_sec: Wall-clock seconds inside tool calls, concurrent calls
+            counted once; ``None`` when no call could be timed.
+        served_models: Distinct ``model_version`` ids the run was answered
+            with, in first-seen order. Every ADK model backend stamps the id
+            the provider reported, which is not always the one requested.
+        model_turns: LLM round-trips, counted as the events carrying a
+            ``usage_metadata`` block -- the same events the token sums are
+            built from, so the two columns always agree. ``None`` when the
+            stream reported no usage at all.
+    """
+
+    output: str
+    trajectory: list[dict]
+    tokens: dict[str, int | None]
+    errors: list[str]
+    tool_wait_sec: float | None
+    served_models: list[str]
+    model_turns: int | None
+
+
+def parse_event_stream(events: Sequence[Any]) -> EventParse:
     """Fold a serialized ADK event stream into the canonical result shape.
 
     The parser is lenient by design — an unrecognized part shape is skipped
@@ -176,9 +210,12 @@ def parse_event_stream(
         events: Serialized ``Event`` mappings in the order ADK yielded them.
 
     Returns:
-        A ``(output, trajectory, tokens, errors)`` tuple. ``trajectory`` is a
-        list of ``ToolCall.to_dict()`` mappings in call order; a call whose
-        result never arrived stays ``status="called"`` with ``result=None``.
+        An :class:`EventParse`. A call whose result never arrived stays
+        ``status="called"`` with ``result=None``. Every event carries a
+        ``timestamp``, so pairing a ``function_call`` with the event bearing
+        its ``function_response`` gives each call a real duration and the run a
+        total tool wait -- without which a slow cluster and a slow model are the
+        same number on a leaderboard that ranks latency lower-is-better.
     """
     output_parts: list[str] = []
     errors: list[str] = []
@@ -189,6 +226,13 @@ def parse_event_stream(
     pending_unkeyed: deque[ToolCall] = deque()
     sums: dict[str, int] = {}
     seen: set[str] = set()
+    served_models: list[str] = []
+    turns = 0
+    # Call start times, keyed the same two ways the pending calls are, so a
+    # response folds back onto the right start whether or not ADK stamped ids.
+    started_by_id: dict[str, float] = {}
+    started_unkeyed: deque[float | None] = deque()
+    spans: list[tuple[float, float]] = []
 
     for index, event in enumerate(events):
         if not isinstance(event, Mapping):
@@ -202,10 +246,15 @@ def parse_event_stream(
                 f"event {index} reported {code or 'an error'}: {message or '<no detail>'}"
             )
 
-        _accumulate_usage(event.get("usage_metadata"), sums, seen)
+        usage = event.get("usage_metadata")
+        if isinstance(usage, Mapping):
+            turns += 1
+        _accumulate_usage(usage, sums, seen)
+        note_model(served_models, event.get("model_version"))
 
         partial = bool(event.get("partial"))
         user_content = _is_user_content(event)
+        event_time = parse_event_time(event.get("timestamp"))
 
         for part in _parts(event):
             if not isinstance(part, Mapping):
@@ -222,13 +271,19 @@ def parse_event_stream(
                 call_id = call.get("id")
                 if call_id is None:
                     pending_unkeyed.append(entry)
+                    started_unkeyed.append(event_time)
                 else:
                     pending_by_id[str(call_id)] = entry
+                    if event_time is not None:
+                        started_by_id[str(call_id)] = event_time
                 continue
 
             response = part.get("function_response")
             if isinstance(response, Mapping):
-                _fold_response(response, pending_by_id, pending_unkeyed, errors, index)
+                start = _pop_start(response, started_by_id, started_unkeyed)
+                folded = _fold_response(response, pending_by_id, pending_unkeyed, errors, index)
+                if folded and start is not None and event_time is not None and event_time >= start:
+                    spans.append((start, event_time))
                 continue
 
             # ``thought`` marks a reasoning part: it is not the answer.
@@ -242,9 +297,35 @@ def parse_event_stream(
             ):
                 output_parts.append(text)
 
-    output = "".join(output_parts)
-    tokens = _canonical_tokens(sums, seen)
-    return output, [entry.to_dict() for entry in trajectory], tokens, errors
+    return EventParse(
+        output="".join(output_parts),
+        trajectory=[entry.to_dict() for entry in trajectory],
+        tokens=_canonical_tokens(sums, seen),
+        errors=errors,
+        tool_wait_sec=merged_span_sec(spans),
+        served_models=served_models,
+        # 0 turns means the stream carried no usage at all, not a run that
+        # never called the model -- a stream exists because one was called.
+        model_turns=turns or None,
+    )
+
+
+def _pop_start(
+    response: Mapping[str, Any],
+    started_by_id: dict[str, float],
+    started_unkeyed: deque[float | None],
+) -> float | None:
+    """Take the start time of the call this ``function_response`` answers.
+
+    Mirrors :func:`_fold_response`'s matching exactly -- by ``id``, else the
+    oldest id-less call -- so the two stay in step. An id-less call whose event
+    had no usable timestamp still occupies a slot in the queue, otherwise the
+    next response would pair with the wrong start.
+    """
+    call_id = response.get("id")
+    if call_id is not None:
+        return started_by_id.pop(str(call_id), None)
+    return started_unkeyed.popleft() if started_unkeyed else None
 
 
 def _fold_response(
@@ -253,13 +334,18 @@ def _fold_response(
     pending_unkeyed: deque[ToolCall],
     errors: list[str],
     index: int,
-) -> None:
+) -> bool:
     """Attach one ``function_response`` to the call it answers.
 
     Matching is by ADK's correlation ``id``; a response with no id is paired
     with the oldest id-less call still awaiting a result, which is exact for a
     stream that answers calls in the order they were made. A response matching
     nothing is reported on ``errors`` rather than dropped.
+
+    Returns:
+        ``True`` when the response was folded onto a call, ``False`` when it
+        matched none -- an orphan has no call to time, so the caller must not
+        record a span for it.
     """
     call_id = response.get("id")
     entry: ToolCall | None = None
@@ -273,7 +359,8 @@ def _fold_response(
         errors.append(
             f"event {index}: tool response for {name!r} (id={call_id!r}) matched no pending call"
         )
-        return
+        return False
 
     entry.result, is_error = _response_text(response.get("response"))
     entry.status = "error" if is_error else "completed"
+    return True

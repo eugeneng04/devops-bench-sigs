@@ -27,12 +27,19 @@ def test_parse_event_time_reads_the_z_suffixed_stamps_both_clis_emit() -> None:
     assert round(b - a, 3) == 0.219
 
 
+def test_parse_event_time_passes_epoch_seconds_through() -> None:
+    """ADK stamps its events with a ``float`` epoch, not an ISO-8601 string."""
+    assert parse_event_time(1789425592.927646) == 1789425592.927646
+    assert parse_event_time(1724521485) == 1724521485.0
+
+
 def test_parse_event_time_returns_none_for_anything_unusable() -> None:
     """An older CLI that omits the field means "no timing", not a crash."""
     assert parse_event_time(None) is None
     assert parse_event_time("") is None
-    assert parse_event_time(1724521485) is None
     assert parse_event_time("not a timestamp") is None
+    # ``True`` is an ``int``; epoch second 1 is not a time anyone stamped.
+    assert parse_event_time(True) is None
 
 
 def test_merged_span_sec_counts_concurrent_calls_once() -> None:
