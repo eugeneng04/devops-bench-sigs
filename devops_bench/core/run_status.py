@@ -22,10 +22,19 @@ it, which is how a dead agent published a perfect 1.0 in the first place.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any
 
-__all__ = ["UNSCOREABLE_RUN_STATUSES", "is_unscoreable_run"]
+__all__ = ["UNSCOREABLE_RUN_STATUSES", "is_placeholder_output", "is_unscoreable_run"]
+
+# Redaction placeholders openclaw's sanitizer writes over a final message it
+# refused to store ("[Malformed diagnostic JSON redacted]", "[Oversized
+# diagnostic JSON redacted]"). Anchored to the whole string: a real answer that
+# merely *mentions* a redaction never matches, and the bracketed sentence shape
+# keeps a sibling placeholder from a future oc version covered without
+# swallowing arbitrary bracketed text.
+_PLACEHOLDER_OUTPUT = re.compile(r"\[[A-Za-z][A-Za-z ]* redacted\]")
 
 #: Statuses that say outright that the agent did not complete its turn.
 #: Historical records use these; see :func:`is_unscoreable_run` for why the
@@ -59,3 +68,22 @@ def is_unscoreable_run(record: Mapping[str, Any]) -> bool:
     if str(record.get("status") or "") in UNSCOREABLE_RUN_STATUSES:
         return True
     return bool(record.get("errors")) and not record.get("trajectory")
+
+
+def is_placeholder_output(output: Any) -> bool:
+    """Whether ``output`` is a tool-side redaction placeholder, not an answer.
+
+    openclaw's own sanitizer sometimes replaces the final assistant message in
+    its trajectory store with a bracketed placeholder before the harness ever
+    reads it. The text is truthy, so without this check it flows into the
+    record's ``output`` and gets judged as if the agent had answered with it —
+    which is how a run with a 149-step trajectory and a passing verification
+    report published an ``OutcomeValidity`` of 0.0.
+
+    Args:
+        output: The record's captured final output, of any type.
+
+    Returns:
+        ``True`` when the whole string is one redaction placeholder.
+    """
+    return isinstance(output, str) and _PLACEHOLDER_OUTPUT.fullmatch(output.strip()) is not None

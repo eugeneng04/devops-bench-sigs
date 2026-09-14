@@ -21,7 +21,13 @@ from typing import Any
 
 from deepeval.test_case import LLMTestCase
 
-from devops_bench.core import get_bool, get_logger, is_unscoreable_run, score_keys
+from devops_bench.core import (
+    get_bool,
+    get_logger,
+    is_placeholder_output,
+    is_unscoreable_run,
+    score_keys,
+)
 
 # Imported for their @METRICS.register side effects.
 from devops_bench.metrics import (
@@ -261,6 +267,15 @@ def _build_context(res: dict[str, Any], judge_model: Any, use_mcp: bool) -> Metr
     latency = res.get("latency")
     retrieval_context = res.get("retrieval_context")
 
+    # A redaction placeholder is never an answer, whatever else the run did.
+    # An *empty* output only counts as missing when the trajectory shows the
+    # agent actually worked: there the blank is a capture failure, while a
+    # blank beside an empty trajectory is the agent genuinely producing
+    # nothing — a real zero the judge should still hand out.
+    final_output_missing = is_placeholder_output(actual_output) or (
+        not str(actual_output or "").strip() and bool(trajectory)
+    )
+
     # Tool names surface with an MCP server prefix (e.g. ``default__generate_manifest``);
     # expected-tool checks in tasks reference the canonical name (``generate_manifest``).
     # Normalize only for the judge test cases so tool-call matching isn't brittle;
@@ -312,6 +327,7 @@ def _build_context(res: dict[str, Any], judge_model: Any, use_mcp: bool) -> Metr
         tool_case=tool_case,
         all_case=all_case,
         generation_only=bool(res.get("generation_only", False)),
+        final_output_missing=final_output_missing,
     )
 
 

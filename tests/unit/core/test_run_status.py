@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from devops_bench.core import is_unscoreable_run
+from devops_bench.core import is_placeholder_output, is_unscoreable_run
 
 
 def test_an_explicit_agent_error_status_is_unscoreable() -> None:
@@ -41,3 +41,30 @@ def test_errors_alongside_real_work_are_ordinary() -> None:
 
 def test_a_clean_run_is_scoreable() -> None:
     assert is_unscoreable_run({"status": "success", "trajectory": [{"name": "kubectl"}]}) is False
+
+
+def test_the_observed_redaction_placeholders_are_placeholders() -> None:
+    # Both strings openclaw's sanitizer has been seen writing over a final
+    # message (run_20260911_172304: the first landed in ``output`` and was
+    # judged as the agent's answer).
+    assert is_placeholder_output("[Malformed diagnostic JSON redacted]") is True
+    assert is_placeholder_output("[Oversized diagnostic JSON redacted]") is True
+
+
+def test_surrounding_whitespace_does_not_hide_a_placeholder() -> None:
+    assert is_placeholder_output("  [Malformed diagnostic JSON redacted]\n") is True
+
+
+def test_an_answer_mentioning_a_redaction_is_not_a_placeholder() -> None:
+    # The match is anchored to the whole string, so prose about redaction —
+    # or a placeholder quoted inside a real answer — never abstains a judge.
+    assert is_placeholder_output("The log line [secret redacted] was expected; done.") is False
+    assert is_placeholder_output("Saw '[Malformed diagnostic JSON redacted]' and retried.") is False
+
+
+def test_empty_and_non_string_outputs_are_not_placeholders() -> None:
+    # Emptiness is a separate signal with its own rule (it needs the
+    # trajectory to disambiguate); this predicate only names the redactions.
+    assert is_placeholder_output("") is False
+    assert is_placeholder_output(None) is False
+    assert is_placeholder_output(["[Malformed diagnostic JSON redacted]"]) is False
