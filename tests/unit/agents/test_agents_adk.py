@@ -399,6 +399,42 @@ def test_parse_event_stream_keeps_id_less_call_starts_in_step() -> None:
     assert parsed.tool_wait_sec == 7.0
 
 
+def test_parse_event_stream_matches_reused_call_ids_in_emission_order() -> None:
+    """Two live calls can share an id; the second must not overwrite the first.
+
+    Overwriting pairs the first call's result with the second call's start,
+    reporting a tool wait shorter than the run and inventing an orphan error.
+    """
+    call_a = {
+        "content": {"role": "model", "parts": [{"function_call": {"id": "x", "name": "a"}}]},
+        "timestamp": 1000.0,
+    }
+    call_b = {
+        "content": {"role": "model", "parts": [{"function_call": {"id": "x", "name": "b"}}]},
+        "timestamp": 1005.0,
+    }
+    resp_a = {
+        "content": {
+            "role": "user",
+            "parts": [{"function_response": {"id": "x", "response": "ra"}}],
+        },
+        "timestamp": 1010.0,
+    }
+    resp_b = {
+        "content": {
+            "role": "user",
+            "parts": [{"function_response": {"id": "x", "response": "rb"}}],
+        },
+        "timestamp": 1020.0,
+    }
+
+    parsed = parsing.parse_event_stream([call_a, call_b, resp_a, resp_b])
+
+    assert parsed.errors == []
+    assert [(e["name"], e["result"]) for e in parsed.trajectory] == [("a", "ra"), ("b", "rb")]
+    assert parsed.tool_wait_sec == 20.0
+
+
 # --------------------------------------------------------------------------
 # Target resolution helpers
 # --------------------------------------------------------------------------

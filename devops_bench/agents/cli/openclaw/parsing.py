@@ -72,12 +72,11 @@ def _accumulate_usage(acc: dict, usage: dict, *, top_level: bool = True) -> None
     added; nested mappings (e.g. a ``cost`` breakdown) are summed recursively;
     booleans and other non-numeric values are ignored.
 
-    The top-level ``cacheWrite`` is skipped even though today's rollup omits it,
-    so the bucket keeps a single source (:func:`_accumulate_cache_write`) on any
-    openclaw version rather than double-counting on one that starts reporting
-    it. The skip is deliberately not applied inside nested mappings: a ``cost``
-    breakdown itemizes cache-write *dollars*, which have no second source, so
-    dropping that entry would leave the sub-buckets short of their own total.
+    The top-level ``cacheWrite`` is left to :func:`_resolve_cache_write`, which
+    settles it against the per-call events. The skip is not applied inside
+    nested mappings: a ``cost`` breakdown itemizes cache-write *dollars*, which
+    have no second source, so dropping it would leave the sub-buckets short of
+    their own total.
 
     Args:
         acc: Accumulator mutated in place.
@@ -97,17 +96,11 @@ def _accumulate_usage(acc: dict, usage: dict, *, top_level: bool = True) -> None
 
 
 def _accumulate_cache_write(acc: dict, usage: object) -> None:
-    """Add one model call's ``cacheWrite`` to the running usage accumulator.
-
-    ``model.completed.usage`` omits ``cacheWrite``; the per-call
-    ``assistant.message.usage`` is the only event that carries it. So this one
-    bucket is summed from here and every other bucket from ``model.completed``,
-    which otherwise reconciles to the token against the per-call events.
+    """Sum one event's ``cacheWrite`` into ``acc``, in place.
 
     Args:
-        acc: Token accumulator mutated in place.
-        usage: A single ``assistant.message`` usage mapping, or anything else
-            (ignored).
+        acc: Cache-write accumulator mutated in place.
+        usage: A usage mapping, or anything else (ignored).
     """
     if not isinstance(usage, dict):
         return
@@ -116,24 +109,30 @@ def _accumulate_cache_write(acc: dict, usage: object) -> None:
         acc["cacheWrite"] = acc.get("cacheWrite", 0) + written
 
 
-def _fold_cache_write_into_total(acc: dict) -> None:
-    """Add the recovered ``cacheWrite`` to the rollup total, in place.
+def _resolve_cache_write(acc: dict, rollup: dict, per_call: dict) -> None:
+    """Settle the ``cacheWrite`` bucket on whichever event reported it.
 
-    ``model.completed`` omits ``cacheWrite`` from both the buckets *and* the
-    ``total`` it reports, so a total copied through verbatim understates the run
-    by exactly the cache writes :func:`_accumulate_cache_write` recovered. The
-    canonical contract is that ``total`` is the sum of every bucket (see
+    Today's ``model.completed`` rollup omits ``cacheWrite`` from both its
+    buckets and its ``total``, so the bucket is recovered from the per-call
+    ``assistant.message`` events and folded into the total -- the canonical
+    contract is that ``total`` is the sum of every bucket (see
     :data:`~devops_bench.agents.result.TOKEN_BUCKETS`), and cache writes are
-    billed above input on Anthropic, so leaving the gap would understate the
-    priciest bucket on every openclaw run.
+    billed above input on Anthropic. A version that does report it has already
+    counted it in ``total``, so that value is taken as-is and nothing is folded.
 
     Args:
-        acc: Token accumulator mutated in place. Left untouched when no
-            ``cacheWrite`` was recovered or the rollup reported no total.
+        acc: Token accumulator mutated in place.
+        rollup: Cache writes seen on ``model.completed.usage``.
+        per_call: Cache writes seen on ``assistant.message.usage``.
     """
-    written = acc.get("cacheWrite")
+    written = rollup.get("cacheWrite")
+    if isinstance(written, (int, float)):
+        acc["cacheWrite"] = written
+        return
+    written = per_call.get("cacheWrite")
     if not isinstance(written, (int, float)):
         return
+    acc["cacheWrite"] = written
     for key in ("total", "totalTokens"):
         current = acc.get(key)
         if isinstance(current, (int, float)):
@@ -211,13 +210,17 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
         ``reasoning`` normalizes to ``None`` rather than a fabricated ``0``.
     """
     tokens: dict = {}
+    rollup_cache_write: dict = {}
+    per_call_cache_write: dict = {}
     errors: list[str] = []
     output = ""
     fallback_output: list[str] = []
-    pending: dict[str, ToolCall] = {}
+    # Each id maps to a FIFO queue of pending ``(call, started_at)`` pairs:
+    # distinct calls can legitimately reuse an id, so results are matched in
+    # emission order rather than the second call overwriting the first.
+    pending: dict[str, list[tuple[ToolCall, float | None]]] = {}
     trajectory: list[ToolCall] = []
     model_turns = 0
-    started_at: dict[str, float] = {}
     spans: list[tuple[float, float]] = []
     served_models: list[str] = []
 
@@ -249,9 +252,7 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
             )
             trajectory.append(call)
             if call_id:
-                pending[str(call_id)] = call
-                if event_time is not None:
-                    started_at[str(call_id)] = event_time
+                pending.setdefault(str(call_id), []).append((call, event_time))
         elif etype == "tool.result":
             msg = data.get("message") if isinstance(data.get("message"), dict) else data
             call_id = msg.get("toolCallId") or msg.get("id") or ""
@@ -260,8 +261,9 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
             is_error = bool(msg.get("isError")) or (
                 str(details.get("status", "")).lower() in ("error", "failed", "failure")
             )
-            target = pending.pop(str(call_id), None) if call_id else None
-            if target is None:
+            queue = pending.get(str(call_id)) if call_id else None
+            entry = queue.pop(0) if queue else None
+            if entry is None:
                 # Drop the orphan from the trajectory but surface it on errors.
                 # Synthesizing a free-floating result entry would break the
                 # "every trajectory item is a real ToolCall the model issued"
@@ -275,15 +277,16 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
                     f"(id={call_id!r}, content={preview!r})"
                 )
                 continue
+            target, started = entry
             target.result = text
             target.status = "error" if is_error else "completed"
-            start = started_at.pop(str(call_id), None)
-            if start is not None and event_time is not None and event_time >= start:
-                spans.append((start, event_time))
+            if started is not None and event_time is not None:
+                spans.append((started, event_time))
         elif etype == "model.completed":
             usage = data.get("usage")
             if isinstance(usage, dict):
                 _accumulate_usage(tokens, usage)
+                _accumulate_cache_write(rollup_cache_write, usage)
             texts = data.get("assistantTexts")
             if isinstance(texts, list):
                 joined = "\n".join(t for t in texts if isinstance(t, str))
@@ -293,14 +296,14 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
             model_turns += 1
             msg = data.get("message") if isinstance(data.get("message"), dict) else {}
             note_model(served_models, msg.get("model"))
-            _accumulate_cache_write(tokens, msg.get("usage"))
+            _accumulate_cache_write(per_call_cache_write, msg.get("usage"))
             txt = _join_text(msg.get("content"))
             if txt:
                 fallback_output.append(txt)
 
     if not output and fallback_output:
         output = "\n".join(fallback_output)
-    _fold_cache_write_into_total(tokens)
+    _resolve_cache_write(tokens, rollup_cache_write, per_call_cache_write)
 
     return TrajectoryExport(
         trajectory=[call.to_dict() for call in trajectory],

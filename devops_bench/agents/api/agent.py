@@ -483,6 +483,11 @@ class ApiAgent(AgentHarness):
                 terminal_reason="timeout",
             )
 
+        # The whole turn, not ``loop_result.latency``, which accumulates only the
+        # provider calls and so excludes tool dispatch. Every CLI harness brackets
+        # its whole subprocess; a model-only number is not comparable to those.
+        agent_sec = time.monotonic() - start
+
         trajectory, orphan_errors = _fold_with_extraction_errors(loop_result.contents)
         tokens = extract_tokens(loop_result.response)
         metadata: dict[str, Any] = {
@@ -495,7 +500,7 @@ class ApiAgent(AgentHarness):
             output=loop_result.final_text,
             trajectory=trajectory,
             tokens=tokens,
-            latency=loop_result.latency,
+            latency=agent_sec,
             errors=list(dispatch_errors) + orphan_errors,
             # The loop returned on its own. Its own turn cap lands here too,
             # matching how a CLI agent's internal cap is recorded.

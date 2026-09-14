@@ -33,6 +33,20 @@ def test_parse_event_time_passes_epoch_seconds_through() -> None:
     assert parse_event_time(1724521485) == 1724521485.0
 
 
+def test_parse_event_time_reads_an_offset_less_stamp_as_utc() -> None:
+    """Reading it as local time would shift a span by the runner's UTC offset."""
+    assert parse_event_time("2026-08-24T17:44:45.862") == parse_event_time(
+        "2026-08-24T17:44:45.862Z"
+    )
+
+
+def test_parse_event_time_honors_an_explicit_offset() -> None:
+    """An offset that is present is the stamp's own, not a default."""
+    assert parse_event_time("2026-08-24T10:44:45.862-07:00") == parse_event_time(
+        "2026-08-24T17:44:45.862Z"
+    )
+
+
 def test_parse_event_time_returns_none_for_anything_unusable() -> None:
     """An older CLI that omits the field means "no timing", not a crash."""
     assert parse_event_time(None) is None

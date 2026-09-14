@@ -291,11 +291,11 @@ def test_parse_trajectory_export_sums_nested_cost_breakdown() -> None:
 
 
 def test_parse_trajectory_export_keeps_cache_write_inside_a_nested_cost_block() -> None:
-    """The top-level ``cacheWrite`` skip must not reach into the cost breakdown.
+    """The top-level ``cacheWrite`` handling must not reach into the cost breakdown.
 
-    The token bucket is skipped so it keeps one source, but cost dollars have no
-    second source -- dropping them would leave the itemized costs short of their
-    own total.
+    The token bucket is settled against the per-call events, but cost dollars
+    have no second source -- dropping them would leave the itemized costs short
+    of their own total.
     """
     blob = _events(
         {
@@ -310,10 +310,57 @@ def test_parse_trajectory_export_keeps_cache_write_inside_a_nested_cost_block() 
         },
     )
     tokens = parse_trajectory_export(blob).tokens
-    # The rollup's own cacheWrite is still ignored (single-sourced elsewhere)...
-    assert "cacheWrite" not in tokens
-    # ...but the nested cost entry survives.
     assert tokens["cost"] == {"input": 0.5, "cacheWrite": 0.25, "total": 0.75}
+
+
+def test_parse_trajectory_export_does_not_double_count_a_reported_cache_write() -> None:
+    """A rollup reporting ``cacheWrite`` already counted it in ``total``.
+
+    Folding the per-call sum on top would report a total larger than the sum of
+    its own buckets.
+    """
+    blob = _events(
+        {
+            "type": "model.completed",
+            "data": {"usage": {"input": 10, "output": 5, "cacheWrite": 7, "total": 22}},
+        },
+        {"type": "assistant.message", "data": {"message": {"usage": {"cacheWrite": 7}}}},
+    )
+    tokens = parse_trajectory_export(blob).tokens
+    assert tokens["cacheWrite"] == 7
+    assert tokens["total"] == 22
+
+
+def test_parse_trajectory_export_keeps_a_cache_write_only_the_rollup_reported() -> None:
+    """The bucket must survive when no ``assistant.message`` carried it."""
+    blob = _events(
+        {
+            "type": "model.completed",
+            "data": {"usage": {"input": 10, "output": 5, "cacheWrite": 7, "total": 22}},
+        },
+        {"type": "assistant.message", "data": {"message": {"usage": {}}}},
+    )
+    tokens = parse_trajectory_export(blob).tokens
+    assert tokens["cacheWrite"] == 7
+    assert tokens["total"] == 22
+
+
+def test_parse_trajectory_export_matches_reused_tool_ids_in_emission_order() -> None:
+    """Two live calls can share an id; the second must not overwrite the first.
+
+    Overwriting pairs the first call's result with the second call's start,
+    reporting a tool wait shorter than the run and inventing an orphan error.
+    """
+    blob = _events(
+        {**_tool_call("x", "a", {}), "ts": "2026-08-24T17:57:28.000Z"},
+        {**_tool_call("x", "b", {}), "ts": "2026-08-24T17:57:29.000Z"},
+        {**_tool_result("x", "ra"), "ts": "2026-08-24T17:57:30.000Z"},
+        {**_tool_result("x", "rb"), "ts": "2026-08-24T17:57:32.000Z"},
+    )
+    export = parse_trajectory_export(blob)
+    assert export.errors == []
+    assert [(c["name"], c["result"]) for c in export.trajectory] == [("a", "ra"), ("b", "rb")]
+    assert export.tool_wait_sec == pytest.approx(4.0, abs=1e-6)
 
 
 def test_parse_trajectory_export_marks_failed_tool_result_as_error() -> None:

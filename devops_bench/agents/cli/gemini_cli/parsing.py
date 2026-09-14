@@ -118,9 +118,11 @@ def parse_stream_json(stdout: str) -> StreamParse:
     output_parts: list[str] = []
     tokens: dict = {}
     errors: list[str] = []
-    pending: dict[str, ToolCall] = {}
+    # Each id maps to a FIFO queue of pending ``(call, started_at)`` pairs:
+    # distinct calls can legitimately reuse an id, so results are matched in
+    # emission order rather than the second call overwriting the first.
+    pending: dict[str, list[tuple[ToolCall, float | None]]] = {}
     trajectory: list[ToolCall] = []
-    started_at: dict[str, float] = {}
     spans: list[tuple[float, float]] = []
     served_models: list[str] = []
 
@@ -165,15 +167,15 @@ def parse_stream_json(stdout: str) -> StreamParse:
             )
             trajectory.append(call)
             if call_id:
-                pending[str(call_id)] = call
-                if event_time is not None:
-                    started_at[str(call_id)] = event_time
+                pending.setdefault(str(call_id), []).append((call, event_time))
         elif etype == "tool_result":
             call_id = event.get("tool_id") or event.get("tool_use_id") or event.get("id") or ""
-            target = pending.pop(str(call_id), None) if call_id else None
-            if target is None:
+            queue = pending.get(str(call_id)) if call_id else None
+            entry = queue.pop(0) if queue else None
+            if entry is None:
                 errors.append(f"stream-json tool_result without matching tool_use (id={call_id!r})")
                 continue
+            target, started = entry
             # tool_result carries only a status; accept a content/output
             # payload as a fallback when present.
             content = event.get("content")
@@ -186,9 +188,8 @@ def parse_stream_json(stdout: str) -> StreamParse:
             status = str(event.get("status", "")).lower()
             failed = bool(event.get("is_error")) or status in ("error", "failed", "failure")
             target.status = "error" if failed else "completed"
-            start = started_at.pop(str(call_id), None)
-            if start is not None and event_time is not None and event_time >= start:
-                spans.append((start, event_time))
+            if started is not None and event_time is not None:
+                spans.append((started, event_time))
         elif etype == "error":
             msg = event.get("message") or event.get("error") or str(event)
             errors.append(f"stream-json error event: {msg}")

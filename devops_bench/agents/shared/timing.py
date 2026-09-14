@@ -24,11 +24,10 @@ __all__ = ["merged_span_sec", "parse_event_time"]
 def parse_event_time(value: object) -> float | None:
     """Parse a transcript event timestamp into epoch seconds.
 
-    Two spellings reach here. The CLI transcripts stamp events as ISO-8601 with
-    a ``Z`` suffix (``2026-08-24T17:44:45.862Z``), which ``fromisoformat`` only
-    accepts from Python 3.11 on; the explicit ``+00:00`` swap keeps the intent
-    visible rather than resting on that. The in-process ADK event stream stamps
-    epoch seconds as a ``float`` already, so it passes straight through.
+    Two spellings reach here: CLI transcripts stamp ISO-8601 (``Z`` suffix or an
+    explicit offset), and the in-process ADK event stream stamps epoch seconds as
+    a ``float`` already. A stamp carrying no offset is read as UTC, so the result
+    never depends on the runner's local zone.
 
     Args:
         value: The raw ``ts`` / ``timestamp`` field, or anything else.
@@ -46,9 +45,12 @@ def parse_event_time(value: object) -> float | None:
     if not isinstance(value, str) or not value:
         return None
     try:
-        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        stamped = datetime.datetime.fromisoformat(value)
     except ValueError:
         return None
+    if stamped.tzinfo is None:
+        stamped = stamped.replace(tzinfo=datetime.UTC)
+    return stamped.timestamp()
 
 
 def merged_span_sec(intervals: list[tuple[float, float]]) -> float | None:

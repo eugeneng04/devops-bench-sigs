@@ -133,6 +133,12 @@ _OPENCLAW_STATE_DIRNAME = "state"
 _OPENCLAW_SKILLS_DIRNAME = "skills"
 _OPENCLAW_CONFIG_FILE = "openclaw.json"
 
+# Trajectory extraction runs after the agent turn, including after it timed out,
+# so it cannot inherit the turn's budget: two reads at ``timeout_sec`` each would
+# let one task occupy three times its allotted wall clock. These are local
+# metadata reads, not agent work.
+_EXTRACT_TIMEOUT_SEC = 120
+
 # Bare model ids (the part after ``provider/``) absent from openclaw's built-in
 # catalog; the harness registers these per-run (see :func:`_build_model_override`).
 # TODO(deferred): supported-model-name maintenance is tracked separately (#147).
@@ -559,7 +565,7 @@ class OpenClawAgent(AgentHarness):
             sessions = run(
                 [oc_bin, "sessions", "--agent", self.agent_name, "--json"],
                 check=False,
-                timeout=self.config.timeout_sec,
+                timeout=_EXTRACT_TIMEOUT_SEC,
                 extra_env=env_overlay,
             )
         except SubprocessError as exc:
@@ -594,7 +600,7 @@ class OpenClawAgent(AgentHarness):
                         "--json",
                     ],
                     check=False,
-                    timeout=self.config.timeout_sec,
+                    timeout=_EXTRACT_TIMEOUT_SEC,
                     extra_env=env_overlay,
                 )
             except SubprocessError as exc:

@@ -183,6 +183,49 @@ def test_parse_stream_json_leaves_tool_wait_none_without_timestamps() -> None:
     assert parse_stream_json(blob).tool_wait_sec is None
 
 
+def test_parse_stream_json_matches_reused_tool_ids_in_emission_order() -> None:
+    """Two live calls can share an id; the second must not overwrite the first.
+
+    Overwriting pairs the first call's result with the second call's start,
+    reporting a tool wait shorter than the run and inventing an orphan error.
+    """
+    blob = "\n".join(
+        json.dumps(e)
+        for e in (
+            {
+                "type": "tool_use",
+                "tool_id": "x",
+                "tool_name": "a",
+                "timestamp": "2026-08-24T17:57:28.000Z",
+            },
+            {
+                "type": "tool_use",
+                "tool_id": "x",
+                "tool_name": "b",
+                "timestamp": "2026-08-24T17:57:29.000Z",
+            },
+            {
+                "type": "tool_result",
+                "tool_id": "x",
+                "content": "ra",
+                "status": "success",
+                "timestamp": "2026-08-24T17:57:30.000Z",
+            },
+            {
+                "type": "tool_result",
+                "tool_id": "x",
+                "content": "rb",
+                "status": "success",
+                "timestamp": "2026-08-24T17:57:32.000Z",
+            },
+        )
+    )
+    parsed = parse_stream_json(blob)
+    assert parsed.errors == []
+    assert [(c["name"], c["result"]) for c in parsed.trajectory] == [("a", "ra"), ("b", "rb")]
+    assert parsed.tool_wait_sec == pytest.approx(4.0, abs=1e-6)
+
+
 def test_parse_stream_json_records_json_decode_errors_on_errors_list() -> None:
     blob = "{not json}\n" + json.dumps({"type": "result", "output": "ok"}) + "\n"
     parsed = parse_stream_json(blob)

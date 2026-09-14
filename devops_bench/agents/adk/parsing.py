@@ -180,9 +180,10 @@ class EventParse(NamedTuple):
             with, in first-seen order. Every ADK model backend stamps the id
             the provider reported, which is not always the one requested.
         model_turns: LLM round-trips, counted as the events carrying a
-            ``usage_metadata`` block -- the same events the token sums are
-            built from, so the two columns always agree. ``None`` when the
-            stream reported no usage at all.
+            ``usage_metadata`` block. The block's field names are not required
+            to be ones :data:`_USAGE_FIELDS` knows, so a turn can be counted
+            while its tokens are not (a LiteLlm backend naming them
+            differently). ``None`` when no event carried the block at all.
     """
 
     output: str
@@ -222,16 +223,15 @@ def parse_event_stream(events: Sequence[Any]) -> EventParse:
     trajectory: list[ToolCall] = []
     # Calls still awaiting a result: keyed by ADK's correlation id, with a FIFO
     # queue for the id-less calls some models emit.
-    pending_by_id: dict[str, ToolCall] = {}
-    pending_unkeyed: deque[ToolCall] = deque()
+    # Pending calls carry their own start time. Each id maps to a FIFO queue:
+    # distinct calls can legitimately reuse an id, so responses are matched in
+    # emission order rather than the second call overwriting the first.
+    pending_by_id: dict[str, list[tuple[ToolCall, float | None]]] = {}
+    pending_unkeyed: deque[tuple[ToolCall, float | None]] = deque()
     sums: dict[str, int] = {}
     seen: set[str] = set()
     served_models: list[str] = []
     turns = 0
-    # Call start times, keyed the same two ways the pending calls are, so a
-    # response folds back onto the right start whether or not ADK stamped ids.
-    started_by_id: dict[str, float] = {}
-    started_unkeyed: deque[float | None] = deque()
     spans: list[tuple[float, float]] = []
 
     for index, event in enumerate(events):
@@ -270,20 +270,16 @@ def parse_event_stream(events: Sequence[Any]) -> EventParse:
                 trajectory.append(entry)
                 call_id = call.get("id")
                 if call_id is None:
-                    pending_unkeyed.append(entry)
-                    started_unkeyed.append(event_time)
+                    pending_unkeyed.append((entry, event_time))
                 else:
-                    pending_by_id[str(call_id)] = entry
-                    if event_time is not None:
-                        started_by_id[str(call_id)] = event_time
+                    pending_by_id.setdefault(str(call_id), []).append((entry, event_time))
                 continue
 
             response = part.get("function_response")
             if isinstance(response, Mapping):
-                start = _pop_start(response, started_by_id, started_unkeyed)
-                folded = _fold_response(response, pending_by_id, pending_unkeyed, errors, index)
-                if folded and start is not None and event_time is not None and event_time >= start:
-                    spans.append((start, event_time))
+                started = _fold_response(response, pending_by_id, pending_unkeyed, errors, index)
+                if started is not None and event_time is not None:
+                    spans.append((started, event_time))
                 continue
 
             # ``thought`` marks a reasoning part: it is not the answer.
@@ -310,31 +306,13 @@ def parse_event_stream(events: Sequence[Any]) -> EventParse:
     )
 
 
-def _pop_start(
-    response: Mapping[str, Any],
-    started_by_id: dict[str, float],
-    started_unkeyed: deque[float | None],
-) -> float | None:
-    """Take the start time of the call this ``function_response`` answers.
-
-    Mirrors :func:`_fold_response`'s matching exactly -- by ``id``, else the
-    oldest id-less call -- so the two stay in step. An id-less call whose event
-    had no usable timestamp still occupies a slot in the queue, otherwise the
-    next response would pair with the wrong start.
-    """
-    call_id = response.get("id")
-    if call_id is not None:
-        return started_by_id.pop(str(call_id), None)
-    return started_unkeyed.popleft() if started_unkeyed else None
-
-
 def _fold_response(
     response: Mapping[str, Any],
-    pending_by_id: dict[str, ToolCall],
-    pending_unkeyed: deque[ToolCall],
+    pending_by_id: dict[str, list[tuple[ToolCall, float | None]]],
+    pending_unkeyed: deque[tuple[ToolCall, float | None]],
     errors: list[str],
     index: int,
-) -> bool:
+) -> float | None:
     """Attach one ``function_response`` to the call it answers.
 
     Matching is by ADK's correlation ``id``; a response with no id is paired
@@ -343,24 +321,26 @@ def _fold_response(
     nothing is reported on ``errors`` rather than dropped.
 
     Returns:
-        ``True`` when the response was folded onto a call, ``False`` when it
-        matched none -- an orphan has no call to time, so the caller must not
-        record a span for it.
+        The matched call's start time, or ``None`` when the response matched no
+        call or that call's event carried no usable timestamp -- either way the
+        caller has nothing to time.
     """
     call_id = response.get("id")
-    entry: ToolCall | None = None
+    matched: tuple[ToolCall, float | None] | None = None
     if call_id is not None:
-        entry = pending_by_id.pop(str(call_id), None)
+        queue = pending_by_id.get(str(call_id))
+        matched = queue.pop(0) if queue else None
     elif pending_unkeyed:
-        entry = pending_unkeyed.popleft()
+        matched = pending_unkeyed.popleft()
 
-    if entry is None:
+    if matched is None:
         name = response.get("name") or "<unnamed>"
         errors.append(
             f"event {index}: tool response for {name!r} (id={call_id!r}) matched no pending call"
         )
-        return False
+        return None
 
+    entry, started = matched
     entry.result, is_error = _response_text(response.get("response"))
     entry.status = "error" if is_error else "completed"
-    return True
+    return started
