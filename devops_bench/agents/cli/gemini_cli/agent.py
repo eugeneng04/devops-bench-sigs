@@ -299,8 +299,6 @@ class GeminiCliAgent(AgentHarness):
             tokens=tokens,
             latency=agent_sec,
             errors=errors,
-            # The CLI's own turn cap is invisible from outside the process,
-            # so a capped run lands in "completed".
             terminal_reason="error" if completed.returncode != 0 else "completed",
             tool_wait_sec=parsed.tool_wait_sec,
             served_models=parsed.served_models,

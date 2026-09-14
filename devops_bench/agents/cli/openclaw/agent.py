@@ -63,7 +63,6 @@ from typing import TYPE_CHECKING
 
 from devops_bench.agents.base import AGENTS, AgentHarness
 from devops_bench.agents.cli.openclaw.parsing import (
-    TrajectoryExport,
     _pick_session_key,
     _read_export_bundle,
     _strip_ansi,
@@ -76,6 +75,7 @@ from devops_bench.agents.shared.cli_capabilities import (
     build_mcp_servers,
     materialize_skills,
 )
+from devops_bench.agents.shared.telemetry import ParsedRun
 from devops_bench.core import SubprocessError, get_logger
 from devops_bench.core.errors import ConfigError
 from devops_bench.core.model_providers import resolve_provider
@@ -531,9 +531,7 @@ class OpenClawAgent(AgentHarness):
             tokens=export.tokens,
             latency=agent_sec,
             errors=errors,
-            # ``oc``'s own turn cap is invisible from outside the process, so
-            # a capped run lands in "completed". A failed trajectory export is
-            # not a reason the *agent* stopped, so it does not change this.
+            # A failed trajectory export is not a reason the *agent* stopped.
             terminal_reason=reason,
             tool_wait_sec=export.tool_wait_sec,
             served_models=export.served_models,
@@ -541,7 +539,7 @@ class OpenClawAgent(AgentHarness):
             metadata=metadata,
         )
 
-    def _extract_trajectory(self, oc_bin: str, env_overlay: dict[str, str]) -> TrajectoryExport:
+    def _extract_trajectory(self, oc_bin: str, env_overlay: dict[str, str]) -> ParsedRun:
         """Run ``oc sessions`` + ``export-trajectory`` and parse the bundle.
 
         ``env_overlay`` carries ``OPENCLAW_STATE_DIR`` (and ``OPENCLAW_CONFIG_PATH``
@@ -549,7 +547,7 @@ class OpenClawAgent(AgentHarness):
         isolated state the agent turn wrote to.
 
         Returns:
-            A :class:`~...parsing.TrajectoryExport`. Its ``output`` is the agent's
+            A :class:`~...shared.telemetry.ParsedRun`. Its ``output`` is the agent's
             final answer parsed from the bundle's ``events.jsonl``
             (``model.completed.assistantTexts``) when present, else ``""``; the
             caller falls back to the ansi-stripped subprocess stdout when empty.
@@ -570,20 +568,20 @@ class OpenClawAgent(AgentHarness):
             )
         except SubprocessError as exc:
             errors.append(f"oc sessions failed: {exc}")
-            return TrajectoryExport.empty(errors)
+            return ParsedRun(errors=errors)
         except OSError as exc:
             errors.append(f"oc sessions: binary unavailable: {exc}")
-            return TrajectoryExport.empty(errors)
+            return ParsedRun(errors=errors)
 
         if sessions.returncode != 0:
             stderr = (sessions.stderr or "").strip()
             errors.append(f"oc sessions exited {sessions.returncode}: {stderr or '<no stderr>'}")
-            return TrajectoryExport.empty(errors)
+            return ParsedRun(errors=errors)
 
         key = _pick_session_key(sessions.stdout or "")
         if key is None:
             errors.append("oc sessions returned no session key")
-            return TrajectoryExport.empty(errors)
+            return ParsedRun(errors=errors)
 
         with tempfile.TemporaryDirectory(prefix="oc-export-") as tmpdir:
             workspace = Path(tmpdir)
@@ -605,23 +603,23 @@ class OpenClawAgent(AgentHarness):
                 )
             except SubprocessError as exc:
                 errors.append(f"oc export-trajectory failed: {exc}")
-                return TrajectoryExport.empty(errors)
+                return ParsedRun(errors=errors)
             except OSError as exc:
                 errors.append(f"oc export-trajectory: binary unavailable: {exc}")
-                return TrajectoryExport.empty(errors)
+                return ParsedRun(errors=errors)
 
             if export.returncode != 0:
                 stderr = (export.stderr or "").strip()
                 errors.append(
                     f"oc export-trajectory exited {export.returncode}: {stderr or '<no stderr>'}"
                 )
-                return TrajectoryExport.empty(errors)
+                return ParsedRun(errors=errors)
 
             events_text, read_errors = _read_export_bundle(workspace)
             errors.extend(read_errors)
             if not events_text:
-                return TrajectoryExport.empty(errors)
+                return ParsedRun(errors=errors)
 
             parsed = parse_trajectory_export(events_text)
-            errors.extend(parsed.errors)
-            return parsed._replace(errors=errors)
+            parsed.errors = errors + parsed.errors
+            return parsed

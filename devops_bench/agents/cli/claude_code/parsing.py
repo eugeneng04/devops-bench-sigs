@@ -25,13 +25,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterator
-from typing import NamedTuple
 
 from devops_bench.agents.result import ToolCall, empty_tokens
-from devops_bench.agents.shared.telemetry import note_model
+from devops_bench.agents.shared.telemetry import ParsedRun, note_model
 from devops_bench.agents.shared.timing import merged_span_sec, parse_event_time
 
-__all__ = ["StreamParse", "parse_stream_json"]
+__all__ = ["parse_stream_json"]
 
 
 def _int_or_none(val: object) -> int | None:
@@ -111,17 +110,9 @@ def _normalize_tool_name(name: str) -> str:
 _MCP_FAILED_STATUSES = frozenset({"failed", "error", "disconnected", "needs-auth", "needs_auth"})
 
 
-# The CLI stamps its own reason for ending the query loop on the terminal
-# ``result`` event -- ``completed``, ``max_turns``, ``api_error``,
-# ``prompt_too_long``, ``aborted_tools`` and a dozen more. Mapping them onto the
-# bench's four-value vocabulary (``agents.result.TERMINAL_REASONS``) keeps two
-# of them out of the failure bucket: ``completed`` is the agent handing control
-# back, and the turn cap is the bench's own ``--max-turns`` ceiling, which that
-# vocabulary puts in ``completed`` so an efficiency limit does not read as a
-# capability failure. Claude Code is the only harness that can see its cap --
-# the others land in ``completed`` because the cap is invisible to them -- so
-# bucketing it as ``error`` here would make the harnesses incomparable. Every
-# other reason is a failure. The reason string itself always reaches ``errors``.
+# The CLI's own reasons for ending the query loop, mapped onto
+# :data:`~devops_bench.agents.result.TERMINAL_REASONS`. Every other reason it
+# emits is a failure; the reason string itself always reaches ``errors``.
 _CLI_COMPLETED_REASON = "completed"
 _CLI_TURN_CAP_REASON = "max_turns"
 _CLI_TURN_CAP_SUBTYPE = "error_max_turns"
@@ -160,50 +151,7 @@ def _iter_events(stdout: str) -> Iterator[tuple[object, str | None]]:
             yield event, None
 
 
-class StreamParse(NamedTuple):
-    """What one ``--output-format stream-json`` stdout stream yielded.
-
-    Attributes:
-        output: Final answer text.
-        trajectory: ``ToolCall.to_dict()`` mappings, ordered as emitted.
-        tokens: Canonical token buckets.
-        errors: Decode failures, unmatched ``tool_result`` blocks, failed MCP
-            servers, and the run's own terminal failure.
-        terminal_reason: ``"completed"`` or ``"error"`` from the first terminal
-            event (see :data:`_CLI_COMPLETED_REASON`), or ``""`` when the stream
-            carried no terminal event -- a truncated pipe, which the caller
-            resolves from the exit code instead. ``"timeout"``, the fourth value
-            in :data:`~devops_bench.agents.result.TERMINAL_REASONS`, is the
-            harness's own verdict and is never derived from the stream.
-        model_turns: Distinct assistant ``message.id`` values, or ``None`` when
-            the stream carried no identified assistant message. This is the
-            model round-trip count, which is *not* the terminal event's
-            ``num_turns``: Claude Code emits one envelope per content block, so
-            a single API message answering with two ``tool_use`` blocks raises
-            ``num_turns`` by two while the model was called once.
-        tool_wait_sec: Wall-clock seconds inside tool calls, concurrent calls
-            counted once; ``None`` when no call could be timed. Best-effort: a
-            call whose two envelopes are not both timestamped contributes
-            nothing, so a partially stamped stream reports a lower bound.
-        served_models: Distinct model ids from the assistant envelopes, in
-            first-seen order. Read from the messages rather than the terminal
-            event's ``modelUsage``, whose keys also include the CLI's own
-            internal helper model (observed: a ``claude-haiku-4-5`` entry on a
-            run answered entirely by ``claude-opus-5``) -- attributing a score
-            to that would be wrong.
-    """
-
-    output: str
-    trajectory: list[dict]
-    tokens: dict
-    errors: list[str]
-    terminal_reason: str
-    model_turns: int | None
-    tool_wait_sec: float | None
-    served_models: list[str]
-
-
-def parse_stream_json(stdout: str) -> StreamParse:
+def parse_stream_json(stdout: str) -> ParsedRun:
     """Parse a Claude Code ``--output-format stream-json`` stdout stream.
 
     The stream is newline-delimited JSON in the wrapped SDK form: each line is
@@ -225,10 +173,9 @@ def parse_stream_json(stdout: str) -> StreamParse:
 
     ``assistant`` and ``user`` envelopes carry a top-level ISO-8601
     ``timestamp``, so pairing a ``tool_use`` block with the ``tool_result`` that
-    answers it gives the run a real tool wait -- without which a slow cluster
-    and a slow model are the same number on the leaderboard. The terminal
-    event's ``duration_ms``/``duration_api_ms`` are deliberately *not* used for
-    this: they measure concurrent work independently and their difference goes
+    answers it gives the run a real tool wait. The terminal event's
+    ``duration_ms``/``duration_api_ms`` are deliberately *not* used for this:
+    they measure concurrent work independently and their difference goes
     negative on a real run (observed: 4901ms wall against 6553ms of API time).
 
     The accumulated assistant ``text`` doubles as a fallback answer when no
@@ -243,7 +190,15 @@ def parse_stream_json(stdout: str) -> StreamParse:
         stdout: Raw process stdout, possibly empty.
 
     Returns:
-        A :class:`StreamParse`.
+        A :class:`~devops_bench.agents.shared.telemetry.ParsedRun`.
+        ``model_turns`` counts distinct assistant ``message.id`` values, which
+        is *not* the terminal event's ``num_turns``: the CLI emits one envelope
+        per content block, so one API message answering with two ``tool_use``
+        blocks raises ``num_turns`` by two while the model was called once.
+        ``served_models`` is read from the assistant envelopes rather than the
+        terminal event's ``modelUsage``, whose keys also include the CLI's own
+        internal helper model (observed: a ``claude-haiku-4-5`` entry on a run
+        answered entirely by ``claude-opus-5``).
     """
     text_parts: list[str] = []
     result_output: str | None = None
@@ -256,9 +211,9 @@ def parse_stream_json(stdout: str) -> StreamParse:
     errors: list[str] = []
     # Each id maps to a FIFO queue of pending ``(call, started_at)`` pairs:
     # distinct tool_use blocks can legitimately reuse an id, so results are
-    # matched in emission order rather than the second call silently
-    # overwriting the first. ``started_at`` is ``None`` on a stream whose
-    # envelopes carry no parseable timestamp.
+    # matched in emission order rather than the second call overwriting the
+    # first. ``started_at`` is ``None`` on a stream whose envelopes carry no
+    # parseable timestamp.
     pending: dict[str, list[tuple[ToolCall, float | None]]] = {}
     trajectory: list[ToolCall] = []
     spans: list[tuple[float, float]] = []
@@ -374,9 +329,9 @@ def parse_stream_json(stdout: str) -> StreamParse:
             if isinstance(usage, dict) and _has_usage(usage):
                 tokens = _usage_tokens(usage)
                 result_usage_seen = True
-            # First terminal event wins, matching the answer/usage guards above:
-            # a later event must not append a failure the resolved reason no
-            # longer reflects, which would leave ``errors`` contradicting it.
+            # First terminal event wins: a later one must not append a failure
+            # the resolved reason no longer reflects, which would leave
+            # ``errors`` contradicting it.
             if terminal_reason:
                 continue
             cli_reason = event.get("terminal_reason")
@@ -414,7 +369,7 @@ def parse_stream_json(stdout: str) -> StreamParse:
     # recognized usage — a terminal event that reported genuine zeros is trusted.
     if not result_usage_seen and acc_usage:
         tokens = _usage_tokens(acc_usage)
-    return StreamParse(
+    return ParsedRun(
         output=output,
         trajectory=[call.to_dict() for call in trajectory],
         tokens=tokens,

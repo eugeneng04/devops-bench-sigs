@@ -86,9 +86,8 @@ class AgentResult:
 
     Attributes:
         output: Final assistant text the judge grades.
-        trajectory: Ordered list of ``ToolCall.to_dict()`` entries (optionally
-            interleaved with text turns by API agents). Every agent emits the
-            same canonical entry shape so metrics consume one schema.
+        trajectory: Ordered list of ``ToolCall.to_dict()`` entries. Every agent
+            emits the same canonical entry shape so metrics consume one schema.
         tokens: Provider-reported token usage (shape is provider-defined; pass
             through verbatim).
         latency: Wall-clock seconds of the agent turn itself. A harness that

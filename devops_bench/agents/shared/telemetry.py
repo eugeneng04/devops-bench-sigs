@@ -12,21 +12,58 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-run telemetry every CLI parser reports the same way."""
+"""Per-run telemetry every agent parser reports the same way.
+
+Keeping the shape and the first-seen-model rule here means a change to either
+lands on every harness at once.
+"""
 
 from __future__ import annotations
 
-__all__ = ["note_model"]
+import dataclasses
+
+__all__ = ["ParsedRun", "note_model"]
+
+
+@dataclasses.dataclass(slots=True)
+class ParsedRun:
+    """What one agent transcript yielded.
+
+    Every harness parser returns this, so a new telemetry column is added once
+    here rather than once per harness. Fields carry the semantics documented on
+    :class:`~devops_bench.agents.result.AgentResult`; only the deviations are
+    restated below.
+
+    Attributes:
+        output: The agent's final answer text; ``""`` when none was found.
+        trajectory: ``ToolCall.to_dict()`` mappings, in emission order.
+        tokens: Canonical token buckets summed over the run.
+        errors: Decode failures, unmatched tool results, and any failure the
+            transcript itself reported.
+        tool_wait_sec: Best-effort: a call whose two envelopes are not both
+            timestamped contributes nothing, so a partially stamped transcript
+            reports a lower bound.
+        served_models: Read from the transcript, which names the id the provider
+            answered with rather than the one requested.
+        model_turns: ``None`` when the transcript carried nothing to count.
+        terminal_reason: ``""`` when the transcript carried no terminal event --
+            a truncated pipe, which the caller resolves from the exit code
+            instead. ``"timeout"`` is the harness's own verdict and is never
+            derived from a transcript.
+    """
+
+    output: str = ""
+    trajectory: list[dict] = dataclasses.field(default_factory=list)
+    tokens: dict = dataclasses.field(default_factory=dict)
+    errors: list[str] = dataclasses.field(default_factory=list)
+    tool_wait_sec: float | None = None
+    served_models: list[str] = dataclasses.field(default_factory=list)
+    model_turns: int | None = None
+    terminal_reason: str = ""
 
 
 def note_model(served_models: list[str], value: object) -> None:
     """Append ``value`` to ``served_models`` if it is a new model id.
-
-    Every CLI transcript names the model that answered somewhere, and all of
-    them feed the same ``AgentResult.served_models`` contract: distinct ids in
-    first-seen order. Keeping the rule in one place means a change to it — id
-    normalization, say — lands on every harness at once rather than on whichever
-    two of three the author remembered.
 
     Args:
         served_models: List to append to, mutated in place.

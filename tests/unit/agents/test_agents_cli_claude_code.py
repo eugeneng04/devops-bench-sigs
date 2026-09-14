@@ -39,8 +39,8 @@ from devops_bench.agents.capabilities import (
 from devops_bench.agents.cli.claude_code import ClaudeCodeAgent, parse_stream_json
 from devops_bench.agents.cli.claude_code import agent as claude_mod
 from devops_bench.agents.cli.claude_code.agent import _build_argv, _build_env
-from devops_bench.agents.cli.claude_code.parsing import StreamParse
 from devops_bench.agents.result import TOKEN_BUCKETS, empty_tokens
+from devops_bench.agents.shared.telemetry import ParsedRun
 from devops_bench.core.errors import ConfigError, SubprocessError
 from devops_bench.results.normalize import normalize_tokens
 
@@ -317,16 +317,7 @@ def test_parse_stream_json_ignores_a_false_is_error() -> None:
 
 
 def test_parse_stream_json_empty_input_returns_empty() -> None:
-    assert parse_stream_json("") == StreamParse(
-        output="",
-        trajectory=[],
-        tokens=_tok(),
-        errors=[],
-        terminal_reason="",
-        model_turns=None,
-        tool_wait_sec=None,
-        served_models=[],
-    )
+    assert parse_stream_json("") == ParsedRun(tokens=_tok())
 
 
 def test_parse_stream_json_flags_failed_mcp_server_at_init() -> None:

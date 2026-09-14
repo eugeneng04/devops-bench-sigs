@@ -69,17 +69,9 @@ CATASTROPHIC_SCORE_KEY = score_keys.VERIFICATION_CATASTROPHIC_KEY
 # Token usage aliases per provider, in lookup priority. The canonical keys
 # (``input`` / ``cached`` / ``reasoning`` / ``output``; see
 # ``devops_bench.agents.result.TOKEN_BUCKETS``) come first; the rest keep
-# historical ``results.json`` records readable.
-#
-# The CLI harnesses pass their tool's own usage keys through verbatim, so the
-# tool's spelling is part of this contract. OpenClaw emits camelCase
-# ``cacheRead`` / ``cacheWrite`` / ``totalTokens`` from every one of its
-# provider adapters, with ``input`` already net of both cache buckets — see
-# ``@openclaw/ai``'s ``parseChunkUsage``, whose per-call total is
-# ``input + output + cacheRead + cacheWrite``. The session rollup on
-# ``model.completed`` is a different total that drops ``cacheWrite`` from both
-# its buckets and its sum, so the openclaw parser folds that bucket back in
-# before the record is written; totals here are read, never recomputed.
+# historical ``results.json`` records readable. The CLI harnesses pass their
+# tool's own usage keys through verbatim, so the tool's spelling is part of
+# this contract. Totals here are read, never recomputed.
 _INPUT_TOKEN_KEYS = ("input", "prompt_tokens", "prompt_token_count", "input_tokens")
 _OUTPUT_TOKEN_KEYS = (
     "output",
@@ -292,28 +284,19 @@ def _scoring_version(scores: Mapping[str, Any] | None) -> str:
 def count_tool_calls(trajectory: Any, errors: Any = None) -> tuple[int | None, int | None]:
     """Return ``(tool_calls, tool_errors)`` for a record's trajectory.
 
-    Only ``ToolCall.to_dict()`` entries count, recognised by a string ``name``.
-    Every harness emits nothing else today, but :class:`AgentResult` documents
-    its trajectory as tool calls "optionally interleaved with text turns by API
-    agents", and a text turn is a mapping too — counting one would inflate the
-    column. Entries that are not mappings are skipped rather than raising: a
-    malformed record should lose a count, not a whole run.
-
-    Only ``status == "error"`` counts as an error. ``called`` and
-    ``interrupted`` are the same condition — a call the parser never saw
-    resolve — labelled differently by different parsers, so counting either
-    would make the column incomparable across harnesses.
+    Only entries carrying a string ``name`` count, and only ``status ==
+    "error"`` counts as an error: ``called`` and ``interrupted`` are the same
+    condition — a call the parser never saw resolve — labelled differently by
+    different parsers, so counting either would make the column incomparable
+    across harnesses.
 
     An empty trajectory is ambiguous on its own: a run that legitimately
     answered without calling a tool and a run whose transcript export failed
     both land there. ``errors`` breaks the tie, because every path that loses a
-    transcript reports why — the openclaw exporter appends its failure, a
-    timeout appends its own, and a failed record carries the exception. So an
-    empty trajectory alongside an empty ``errors`` list is a genuine ``(0, 0)``,
-    and anything else stays ``None`` rather than sinking a dashboard average
-    with a zero that means "not captured". This is the same test the harness
-    applies to ``validated`` (``not errors and bool(trajectory)``), minus the
-    part that discards a clean zero.
+    transcript reports why. So an empty trajectory alongside an empty
+    ``errors`` list is a genuine ``(0, 0)``, and anything else stays ``None``
+    rather than sinking a dashboard average with a zero that means "not
+    captured".
 
     Args:
         trajectory: The record's ``trajectory`` list, or ``None``.
@@ -387,8 +370,8 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
         correctness = _first_score(scores, _CORRECTNESS_KEYS)
         catastrophic_score = extract_score(scores, CATASTROPHIC_SCORE_KEY)
         tool_calls, tool_errors = count_tool_calls(record.get("trajectory"), record.get("errors"))
-        # 0 turns for a run that produced output is a parse miss, not a fact.
-        turns = _coerce_int(record.get("model_turns")) or 0
+        # A reported 0 is a parse miss, not a run that never called the model.
+        turns = _coerce_int(record.get("model_turns")) or None
         rows.append(
             ResultRow(
                 setup_id=manifest.setup_id,
@@ -408,7 +391,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 tool_score=extract_score(scores, TOOL_SCORE_KEY),
                 tool_calls=tool_calls,
                 tool_errors=tool_errors,
-                model_turns=turns if turns > 0 else None,
+                model_turns=turns,
                 tool_wait_sec=_non_negative_float_or_none(record.get("tool_wait_sec")),
                 served_model=_served_model(record.get("served_models")),
                 latency_sec=float(record.get("latency") or 0.0),

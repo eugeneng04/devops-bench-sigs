@@ -42,13 +42,13 @@ from __future__ import annotations
 import json
 from collections import deque
 from collections.abc import Mapping, Sequence
-from typing import Any, NamedTuple
+from typing import Any
 
 from devops_bench.agents.result import ToolCall, empty_tokens
-from devops_bench.agents.shared.telemetry import note_model
+from devops_bench.agents.shared.telemetry import ParsedRun, note_model
 from devops_bench.agents.shared.timing import merged_span_sec, parse_event_time
 
-__all__: list[str] = ["EventParse", "parse_event_stream"]
+__all__: list[str] = ["parse_event_stream"]
 
 # ``usage_metadata`` field -> the accumulator slot it feeds. ADK passes the
 # google-genai usage block through verbatim, so these are the genai names.
@@ -165,37 +165,7 @@ def _canonical_tokens(sums: Mapping[str, int], seen: set[str]) -> dict[str, int 
     return tokens
 
 
-class EventParse(NamedTuple):
-    """What one serialized ADK event stream yielded.
-
-    Attributes:
-        output: Concatenated assistant text.
-        trajectory: ``ToolCall.to_dict()`` mappings in call order.
-        tokens: Canonical token buckets summed over the run's LLM calls.
-        errors: ADK ``error_code`` / ``error_message`` events, tool responses
-            matching no call, and events of an unexpected type.
-        tool_wait_sec: Wall-clock seconds inside tool calls, concurrent calls
-            counted once; ``None`` when no call could be timed.
-        served_models: Distinct ``model_version`` ids the run was answered
-            with, in first-seen order. Every ADK model backend stamps the id
-            the provider reported, which is not always the one requested.
-        model_turns: LLM round-trips, counted as the events carrying a
-            ``usage_metadata`` block. The block's field names are not required
-            to be ones :data:`_USAGE_FIELDS` knows, so a turn can be counted
-            while its tokens are not (a LiteLlm backend naming them
-            differently). ``None`` when no event carried the block at all.
-    """
-
-    output: str
-    trajectory: list[dict]
-    tokens: dict[str, int | None]
-    errors: list[str]
-    tool_wait_sec: float | None
-    served_models: list[str]
-    model_turns: int | None
-
-
-def parse_event_stream(events: Sequence[Any]) -> EventParse:
+def parse_event_stream(events: Sequence[Any]) -> ParsedRun:
     """Fold a serialized ADK event stream into the canonical result shape.
 
     The parser is lenient by design — an unrecognized part shape is skipped
@@ -211,19 +181,18 @@ def parse_event_stream(events: Sequence[Any]) -> EventParse:
         events: Serialized ``Event`` mappings in the order ADK yielded them.
 
     Returns:
-        An :class:`EventParse`. A call whose result never arrived stays
-        ``status="called"`` with ``result=None``. Every event carries a
-        ``timestamp``, so pairing a ``function_call`` with the event bearing
-        its ``function_response`` gives each call a real duration and the run a
-        total tool wait -- without which a slow cluster and a slow model are the
-        same number on a leaderboard that ranks latency lower-is-better.
+        A :class:`~devops_bench.agents.shared.telemetry.ParsedRun`. A call whose
+        result never arrived stays ``status="called"`` with ``result=None``.
+        ``tool_wait_sec`` pairs each ``function_call`` with the event bearing its
+        ``function_response``; ``served_models`` reads ``model_version``, and
+        ``model_turns`` counts the events carrying ``usage_metadata``.
     """
     output_parts: list[str] = []
     errors: list[str] = []
     trajectory: list[ToolCall] = []
-    # Calls still awaiting a result: keyed by ADK's correlation id, with a FIFO
-    # queue for the id-less calls some models emit.
-    # Pending calls carry their own start time. Each id maps to a FIFO queue:
+    # Pending calls carry their own start time, keyed by ADK's correlation id
+    # with a FIFO queue for the id-less calls some models emit. Each id maps to
+    # a queue rather than one call:
     # distinct calls can legitimately reuse an id, so responses are matched in
     # emission order rather than the second call overwriting the first.
     pending_by_id: dict[str, list[tuple[ToolCall, float | None]]] = {}
@@ -293,7 +262,7 @@ def parse_event_stream(events: Sequence[Any]) -> EventParse:
             ):
                 output_parts.append(text)
 
-    return EventParse(
+    return ParsedRun(
         output="".join(output_parts),
         trajectory=[entry.to_dict() for entry in trajectory],
         tokens=_canonical_tokens(sums, seen),

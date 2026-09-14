@@ -22,13 +22,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from typing import NamedTuple
 
 from devops_bench.agents.result import ToolCall, empty_tokens
-from devops_bench.agents.shared.telemetry import note_model
+from devops_bench.agents.shared.telemetry import ParsedRun, note_model
 from devops_bench.agents.shared.timing import merged_span_sec, parse_event_time
 
-__all__: list[str] = ["StreamParse", "parse_stream_json"]
+__all__: list[str] = ["parse_stream_json"]
 
 
 def _int_or_none(value: object) -> int | None:
@@ -63,33 +62,7 @@ def _canonical_tokens(stats: Mapping[str, object]) -> dict[str, int | None]:
     return tokens
 
 
-class StreamParse(NamedTuple):
-    """What one ``--output-format stream-json`` stdout stream yielded.
-
-    Attributes:
-        output: Concatenated assistant text.
-        trajectory: ``ToolCall.to_dict()`` mappings, ordered as emitted.
-        tokens: Canonical token buckets from the terminal ``result.stats``.
-        errors: Decode failures, unmatched ``tool_result`` events, and the
-            stream's own ``error`` events (e.g. a provider rate limit), which
-            can accompany an otherwise clean exit.
-        tool_wait_sec: Wall-clock seconds inside tool calls, concurrent calls
-            counted once; ``None`` when no call could be timed.
-        served_models: Distinct model ids the CLI actually used, in first-seen
-            order -- ``init.model`` plus every key of ``result.stats.models``,
-            since the requested id can be an alias (``gemini-3-flash`` resolved
-            to ``gemini-3-flash-preview`` in a live run).
-    """
-
-    output: str
-    trajectory: list[dict]
-    tokens: dict
-    errors: list[str]
-    tool_wait_sec: float | None
-    served_models: list[str]
-
-
-def parse_stream_json(stdout: str) -> StreamParse:
+def parse_stream_json(stdout: str) -> ParsedRun:
     """Parse a Gemini ``--output-format stream-json`` stdout stream.
 
     The stream is newline-delimited JSON events. The parser is intentionally
@@ -110,10 +83,11 @@ def parse_stream_json(stdout: str) -> StreamParse:
         stdout: Raw process stdout, possibly empty.
 
     Returns:
-        A :class:`StreamParse`. Every event carries a ``timestamp``, so pairing
-        ``tool_use`` with its ``tool_result`` gives each call a real duration
-        and the run a total tool wait -- without which a slow cluster and a slow
-        model are the same number on the leaderboard.
+        A :class:`~devops_bench.agents.shared.telemetry.ParsedRun`.
+        ``tool_wait_sec`` pairs each ``tool_use`` with its ``tool_result``;
+        ``served_models`` is ``init.model`` plus every key of
+        ``result.stats.models``, since the requested id can be an alias
+        (``gemini-3-flash`` resolved to ``gemini-3-flash-preview`` in a live run).
     """
     output_parts: list[str] = []
     tokens: dict = {}
@@ -213,7 +187,7 @@ def parse_stream_json(stdout: str) -> StreamParse:
             elif isinstance(usage, dict):
                 tokens = usage
 
-    return StreamParse(
+    return ParsedRun(
         output="".join(output_parts),
         trajectory=[call.to_dict() for call in trajectory],
         tokens=tokens,

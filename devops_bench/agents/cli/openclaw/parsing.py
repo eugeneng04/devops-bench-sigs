@@ -24,14 +24,13 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import NamedTuple
 
 from devops_bench.agents.result import ToolCall
-from devops_bench.agents.shared.telemetry import note_model
+from devops_bench.agents.shared.telemetry import ParsedRun, note_model
 from devops_bench.agents.shared.timing import merged_span_sec, parse_event_time
 from devops_bench.core import get_logger
 
-__all__ = ["TrajectoryExport", "parse_trajectory_export"]
+__all__ = ["parse_trajectory_export"]
 
 _log = get_logger("agents.cli.openclaw.parsing")
 
@@ -139,37 +138,7 @@ def _resolve_cache_write(acc: dict, rollup: dict, per_call: dict) -> None:
             acc[key] = current + written
 
 
-class TrajectoryExport(NamedTuple):
-    """What one ``events.jsonl`` yielded.
-
-    Attributes:
-        trajectory: ``ToolCall.to_dict()`` mappings, in issue order.
-        tokens: Canonical usage summed across the run.
-        output: The agent's final answer text; ``""`` when none was found.
-        errors: Extraction failures worth surfacing.
-        model_turns: Model round-trips, or ``None`` when the export carried no
-            ``assistant.message`` events to count.
-        tool_wait_sec: Wall-clock seconds inside tool calls, concurrent calls
-            counted once; ``None`` when no call could be timed.
-        served_models: Distinct model ids the provider answered with, in
-            first-seen order.
-    """
-
-    trajectory: list[dict]
-    tokens: dict
-    output: str
-    errors: list[str]
-    model_turns: int | None
-    tool_wait_sec: float | None
-    served_models: list[str]
-
-    @classmethod
-    def empty(cls, errors: list[str]) -> TrajectoryExport:
-        """Return an export that recovered nothing but ``errors``."""
-        return cls([], {}, "", errors, None, None, [])
-
-
-def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
+def parse_trajectory_export(jsonl_text: str) -> ParsedRun:
     """Parse an ``oc sessions export-trajectory`` ``events.jsonl`` into the canonical shape.
 
     The export bundle's ``events.jsonl`` is line-delimited JSON. Each line is an
@@ -197,13 +166,13 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
         jsonl_text: Raw contents of ``events.jsonl`` inside the export bundle.
 
     Returns:
-        A :class:`TrajectoryExport`. ``tokens`` is the usage summed across every
-        ``model.completed`` turn (not just the last), plus ``cacheWrite`` summed
-        across the per-call ``assistant.message`` events and folded into the
-        reported total, which omits it too. ``model_turns`` counts
-        ``assistant.message`` events, one per model round-trip -- which is not
-        ``len(trajectory)``, because a single message can carry several
-        ``toolCall`` entries (seen live) and a text-only message carries none.
+        A :class:`~devops_bench.agents.shared.telemetry.ParsedRun`. ``tokens``
+        is the usage summed across every ``model.completed`` turn, not just the
+        last; ``cacheWrite`` is settled separately (see
+        :func:`_resolve_cache_write`). ``model_turns`` counts
+        ``assistant.message`` events, which is not ``len(trajectory)``: a single
+        message can carry several ``toolCall`` entries (seen live) and a
+        text-only message carries none.
 
         There is no reasoning bucket: openclaw's usage payload carries none at
         any thinking level (checked live at ``off`` and ``high``), so
@@ -305,7 +274,7 @@ def parse_trajectory_export(jsonl_text: str) -> TrajectoryExport:
         output = "\n".join(fallback_output)
     _resolve_cache_write(tokens, rollup_cache_write, per_call_cache_write)
 
-    return TrajectoryExport(
+    return ParsedRun(
         trajectory=[call.to_dict() for call in trajectory],
         tokens=tokens,
         output=output,
