@@ -54,9 +54,11 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shlex
 import shutil
 import tempfile
+from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -125,6 +127,81 @@ def _ensure_node_on_path(env_overlay: dict[str, str]) -> dict[str, str]:
 
 
 _log = get_logger("agents.cli.openclaw.agent")
+
+# First version-shaped token in ``oc --version`` output, prerelease suffix
+# included (``2026.8.2``, ``2026.9.1-beta.1``).
+_OC_VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?")
+
+
+@cache
+def _host_oc_version(oc_bin: str) -> str | None:
+    """Parse ``oc --version`` from the host binary, or ``None``.
+
+    Mirrors the ``claude_code`` version probe's philosophy: an unreadable
+    version is not an error (``config.target`` may be a wrapper with its own
+    ``--version`` surface), and refusing to run on a probe that merely failed
+    to parse would be worse than the risk it guards. Cached per binary — a
+    matrix run drives one binary across every task.
+    """
+    try:
+        completed = run([oc_bin, "--version"], check=False, timeout=30)
+    except (OSError, SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    match = _OC_VERSION_RE.search(completed.stdout or "")
+    return match[0] if match else None
+
+
+@cache
+def _image_oc_version(image: str) -> str | None:
+    """Parse ``oc --version`` from the sandbox image's binary, or ``None``.
+
+    Runs a short-lived throwaway container. The generous timeout covers a
+    cold image pull; on a warm host the probe is sub-second, and it runs once
+    per image thanks to the cache.
+    """
+    try:
+        completed = run(
+            ["docker", "run", "--rm", "--entrypoint", "oc", image, "--version"],
+            check=False,
+            timeout=300,
+        )
+    except (OSError, SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    match = _OC_VERSION_RE.search(completed.stdout or "")
+    return match[0] if match else None
+
+
+def _oc_version_skew(oc_bin: str, image: str) -> str | None:
+    """Describe a host/image ``oc`` version mismatch, or ``None`` when safe.
+
+    On a sandboxed run the *container's* oc writes the session store and the
+    *host's* oc reads it back afterwards (see ``supports_sandbox``). oc
+    refuses a store written by a different version ("written by version X,
+    but this command is running Y"), and that refusal used to surface as an
+    empty trajectory on a record still stamped ``status: "success"`` — a
+    whole cluster spin-up spent producing nothing gradable. Equality is
+    required rather than an ordering: prerelease suffixes make "newer" a
+    guess, and the two binaries are meant to be pinned together anyway.
+
+    Returns:
+        A human-readable description of the skew, or ``None`` when the
+        versions match or either probe was inconclusive.
+    """
+    host = _host_oc_version(oc_bin)
+    image_version = _image_oc_version(image)
+    if host is None or image_version is None or host == image_version:
+        return None
+    return (
+        f"oc version skew: host oc is {host} but sandbox image {image} ships oc "
+        f"{image_version}. The post-run trajectory export would fail against the "
+        "session store the container wrote, leaving an empty trajectory. Align "
+        "the host oc with the image before running."
+    )
+
 
 # Per-run layout under the temp working dir. ``state`` is openclaw's state root
 # (sessions + the managed skills tree); ``openclaw.json`` is the isolated config
@@ -705,6 +782,16 @@ class OpenClawAgent(AgentHarness):
         """
         caps = self.config.capabilities
         oc_bin = self._resolve_oc_bin()
+
+        # Fail before the agent turn, not after: with a skewed pair the run
+        # itself would succeed and only the post-run export would refuse the
+        # container-written session store, burning a full turn (and, live, a
+        # cluster) to produce an empty trajectory.
+        if self.config.sandbox is not None and self.config.sandbox.image:
+            skew = _oc_version_skew(oc_bin, self.config.sandbox.image)
+            if skew:
+                return AgentResult.errored(skew)
+
         final_prompt = _prepend_rules(caps.rules.text, prompt)
 
         with agent_workdir(workspace_path, prefix="oc-run-") as workdir:
