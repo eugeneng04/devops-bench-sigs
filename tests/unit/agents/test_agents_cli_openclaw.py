@@ -45,6 +45,7 @@ from devops_bench.agents.cli.openclaw.agent import (
     _oc_model_id,
 )
 from devops_bench.agents.cli.openclaw.parsing import _pick_session_key, _strip_ansi
+from devops_bench.agents.sandbox import SandboxSpec
 from devops_bench.core.errors import ConfigError, SubprocessError
 
 
@@ -493,6 +494,93 @@ def test_execute_falls_back_to_stdout_when_bundle_has_no_answer(
 
     result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("p")
     assert result.output == "bare stdout answer"
+
+
+def test_oc_version_probe_parses_a_prerelease_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ``__wrapped__`` bypasses the @cache so the fake run is actually hit.
+    monkeypatch.setattr(
+        oc_mod, "run", lambda argv, **kw: _make_subprocess_result("2026.9.1-beta.1\n", "", 0)
+    )
+    assert oc_mod._host_oc_version.__wrapped__("oc") == "2026.9.1-beta.1"
+    assert oc_mod._image_oc_version.__wrapped__("img") == "2026.9.1-beta.1"
+
+
+def _raise_oserror(argv, **kw):
+    raise OSError("docker not installed")
+
+
+def test_oc_version_probe_is_inconclusive_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A wrapper without a --version surface, or a docker failure, must yield
+    # None (probe inconclusive) rather than raising — refusing to run on a
+    # failed probe would be worse than the risk it guards.
+    monkeypatch.setattr(
+        oc_mod, "run", lambda argv, **kw: _make_subprocess_result("no version here", "", 1)
+    )
+    assert oc_mod._host_oc_version.__wrapped__("oc-a") is None
+    monkeypatch.setattr(oc_mod, "run", _raise_oserror)
+    assert oc_mod._image_oc_version.__wrapped__("img-a") is None
+
+
+def test_oc_version_skew_names_both_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(oc_mod, "_host_oc_version", lambda b: "2026.8.2")
+    monkeypatch.setattr(oc_mod, "_image_oc_version", lambda i: "2026.9.1-beta.1")
+    skew = oc_mod._oc_version_skew("oc", "img")
+    assert skew is not None
+    assert "2026.8.2" in skew
+    assert "2026.9.1-beta.1" in skew
+
+
+def test_oc_version_skew_silent_on_match_or_inconclusive_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(oc_mod, "_host_oc_version", lambda b: "2026.9.1-beta.1")
+    monkeypatch.setattr(oc_mod, "_image_oc_version", lambda i: "2026.9.1-beta.1")
+    assert oc_mod._oc_version_skew("oc", "img") is None
+    monkeypatch.setattr(oc_mod, "_host_oc_version", lambda b: None)
+    assert oc_mod._oc_version_skew("oc", "img") is None
+
+
+def test_execute_fails_fast_on_sandboxed_version_skew(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A skewed host/image oc pair errors before the agent turn ever launches.
+
+    The live failure this guards: the run itself succeeded, but the post-run
+    export refused the container-written session store ("written by version
+    2026.9.1-beta.1, but this command is running 2026.8.2"), burning a full
+    cluster spin-up to produce an empty trajectory stamped success.
+    """
+    monkeypatch.setattr(oc_mod, "_oc_version_skew", lambda b, i: "oc version skew: boom")
+
+    def never_run(argv, **kw):
+        raise AssertionError("the agent turn must not launch on a skewed pair")
+
+    monkeypatch.setattr(oc_mod, "run", never_run)
+    agent = OpenClawAgent(
+        AgentConfig(target=str(tmp_path / "oc"), sandbox=SandboxSpec(image="img"))
+    )
+    result = agent._execute("p")
+    assert result.has_errors()
+    assert any("version skew" in e for e in result.errors)
+    assert result.trajectory == []
+
+
+def test_execute_unsandboxed_skips_the_version_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def never_probe(b, i):
+        raise AssertionError("no sandbox image, so nothing to compare against")
+
+    monkeypatch.setattr(oc_mod, "_oc_version_skew", never_probe)
+    _install_oc_run(
+        monkeypatch,
+        lambda *a, **k: _make_subprocess_result("OK\n", "", 0),
+        _bundle_writer(SAMPLE_EVENTS),
+    )
+    result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("p")
+    assert result.errors == []
 
 
 def test_execute_keeps_the_export_bundle_in_a_harness_workspace(
