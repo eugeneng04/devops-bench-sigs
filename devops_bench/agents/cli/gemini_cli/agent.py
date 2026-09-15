@@ -274,6 +274,7 @@ class GeminiCliAgent(AgentHarness):
                     terminal_reason="timeout" if exc.timed_out else "error",
                     tool_wait_sec=partial.tool_wait_sec,
                     served_models=partial.served_models,
+                    model_turns=partial.model_turns,
                 )
             except OSError as exc:
                 # Missing / non-executable binary; core.subprocess.run does not wrap.
@@ -302,5 +303,6 @@ class GeminiCliAgent(AgentHarness):
             terminal_reason="error" if completed.returncode != 0 else "completed",
             tool_wait_sec=parsed.tool_wait_sec,
             served_models=parsed.served_models,
+            model_turns=parsed.model_turns,
             metadata=metadata,
         )

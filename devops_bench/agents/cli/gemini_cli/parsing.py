@@ -88,6 +88,10 @@ def parse_stream_json(stdout: str) -> ParsedRun:
         ``served_models`` is ``init.model`` plus every key of
         ``result.stats.models``, since the requested id can be an alias
         (``gemini-3-flash`` resolved to ``gemini-3-flash-preview`` in a live run).
+        ``model_turns`` is segmented rather than read: the stream reports no
+        request count, and assistant ``message`` events are delta chunks (two
+        for one answer in a live run), so a turn is the model-authored run of
+        events between two ``tool_result`` batches.
     """
     output_parts: list[str] = []
     tokens: dict = {}
@@ -99,6 +103,8 @@ def parse_stream_json(stdout: str) -> ParsedRun:
     trajectory: list[ToolCall] = []
     spans: list[tuple[float, float]] = []
     served_models: list[str] = []
+    turns = 0
+    turn_open = False
 
     for lineno, raw in enumerate(stdout.splitlines(), start=1):
         line = raw.strip()
@@ -119,6 +125,9 @@ def parse_stream_json(stdout: str) -> ParsedRun:
         elif etype == "message":
             # ``role="user"`` echoes the prompt and is skipped.
             if event.get("role") in ("assistant", "model"):
+                if not turn_open:
+                    turns += 1
+                    turn_open = True
                 content = event.get("content")
                 if isinstance(content, str):
                     output_parts.append(content)
@@ -128,6 +137,9 @@ def parse_stream_json(stdout: str) -> ParsedRun:
                         if isinstance(part, dict) and isinstance(part.get("text"), str):
                             output_parts.append(part["text"])
         elif etype == "tool_use":
+            if not turn_open:
+                turns += 1
+                turn_open = True
             call_id = event.get("tool_id") or event.get("id") or event.get("tool_use_id") or ""
             args = event.get("parameters")
             if args is None:
@@ -143,6 +155,7 @@ def parse_stream_json(stdout: str) -> ParsedRun:
             if call_id:
                 pending.setdefault(str(call_id), []).append((call, event_time))
         elif etype == "tool_result":
+            turn_open = False
             call_id = event.get("tool_id") or event.get("tool_use_id") or event.get("id") or ""
             queue = pending.get(str(call_id)) if call_id else None
             entry = queue.pop(0) if queue else None
@@ -194,4 +207,5 @@ def parse_stream_json(stdout: str) -> ParsedRun:
         errors=errors,
         tool_wait_sec=merged_span_sec(spans),
         served_models=served_models,
+        model_turns=turns or None,
     )

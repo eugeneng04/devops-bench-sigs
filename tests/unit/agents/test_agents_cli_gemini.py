@@ -133,6 +133,39 @@ def test_parse_stream_json_leaves_served_models_empty_when_unreported() -> None:
     assert parse_stream_json(blob).served_models == []
 
 
+def test_parse_stream_json_segments_model_turns_between_tool_batches() -> None:
+    """Shape captured live: one turn issues both reads, a second answers.
+
+    ``result.stats`` carries no request count, and the CLI marks assistant
+    ``message`` events ``delta: true`` — two chunks for one answer — so
+    counting either events or tool calls would overcount.
+    """
+    blob = _stream(
+        {"type": "init", "model": "auto"},
+        {"type": "message", "role": "user", "content": "read both files"},
+        {"type": "tool_use", "tool_name": "read_file", "tool_id": "read_file__call_1"},
+        {"type": "tool_use", "tool_name": "read_file", "tool_id": "read_file__call_2"},
+        {"type": "tool_result", "tool_id": "read_file__call_1", "status": "success"},
+        {"type": "tool_result", "tool_id": "read_file__call_2", "status": "success"},
+        {"type": "message", "role": "assistant", "content": "a.txt:\n", "delta": True},
+        {"type": "message", "role": "assistant", "content": "hello", "delta": True},
+        {"type": "result", "status": "success", "stats": {"total_tokens": 16616}},
+    )
+    assert parse_stream_json(blob).model_turns == 2
+
+
+def test_parse_stream_json_counts_a_tool_free_answer_as_one_turn() -> None:
+    blob = _stream(
+        {"type": "message", "role": "user", "content": "say ok"},
+        {"type": "message", "role": "assistant", "content": "OK", "delta": True},
+    )
+    assert parse_stream_json(blob).model_turns == 1
+
+
+def test_parse_stream_json_reports_no_model_turns_for_an_empty_stream() -> None:
+    assert parse_stream_json("").model_turns is None
+
+
 def test_parse_stream_json_times_tools_and_merges_concurrent_calls() -> None:
     """Overlapping calls count once, so tool wait can never exceed the run.
 
