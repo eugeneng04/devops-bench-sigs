@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shutil
 import time
 from typing import TYPE_CHECKING
@@ -27,8 +28,10 @@ from devops_bench import core
 from devops_bench.agents import base
 from devops_bench.agents import config as agents_config
 from devops_bench.agents import result as agents_result
+from devops_bench.agents import sandbox as sandbox_mod
 from devops_bench.agents.cli.antigravity import parsing
 from devops_bench.agents.shared import cli_capabilities
+from devops_bench.agents.shared.vertex_env import vertex_location
 from devops_bench.core import subprocess as devops_subprocess
 
 if TYPE_CHECKING:
@@ -39,6 +42,12 @@ __all__ = ["AgyCliAgent"]
 _log = core.get_logger("agents.cli.antigravity")
 
 _GCLOUD_LOOKUP_TIMEOUT_SEC = 10
+
+# The image ships its own agy on PATH; the host binary path is meaningless
+# inside the container. Same idiom as openclaw's _CONTAINER_OC_BIN — without
+# it, _resolve_binary's host fallback (~/.local/bin/agy, or an absolute
+# AGENT_TARGET) crosses the boundary verbatim in argv[0] and fails to exec.
+_CONTAINER_AGY_BIN = "agy"
 
 # agy flushes usage to the conversation DB asynchronously after process exit;
 # poll briefly for the rows before giving up.
@@ -77,12 +86,81 @@ def _read_db_state(db_path: pathlib.Path) -> parsing.DbTokenState:
     return state
 
 
-def _resolve_model_name(model: str) -> str:
-    """Resolve a provider-qualified model id to the bare name ``agy`` expects.
+# agy names the reasoning tier separately from the model: every selection in its
+# catalogue is a base model plus one of these, and there is no untiered form --
+# a bare slug is refused with "requires --effort".
+_AGY_EFFORT_TIERS = ("low", "medium", "high")
 
-    e.g. ``"google/gemini-3.5-flash"`` -> ``"gemini-3.5-flash"``.
+# Vertex publishes preview model ids with this suffix. agy's catalogue does not
+# carry it and rejects the suffixed id outright, with or without --effort.
+_VERTEX_PREVIEW_SUFFIX = "-preview"
+
+# A display-name selection ("Gemini 3.1 Pro (Low)") already names its tier, and
+# agy errors if --effort is passed alongside one. Recognize it so it survives
+# untouched: it is the spelling ``agy --help`` steers operators towards.
+_DISPLAY_TIER_RE = re.compile(r"\((?:low|medium|high)\)\s*$", re.IGNORECASE)
+
+# The tier is a scoring variable, not a formatting detail -- `low` and `high`
+# are materially different agents. `high` is the least surprising default
+# because the other harnesses run their model with no reasoning throttle, so
+# anything lower would hand the agy arm a handicap that reads as a capability
+# gap in the results rather than as the configuration choice it is.
+_DEFAULT_AGY_EFFORT = "high"
+_EFFORT_ENV = "AGENT_MODEL_EFFORT"
+
+
+def _default_effort() -> str:
+    """Resolve the reasoning tier to request when the model id names none.
+
+    Returns:
+        The tier from ``AGENT_MODEL_EFFORT``, or ``high``.
+
+    Raises:
+        core.ConfigError: If ``AGENT_MODEL_EFFORT`` names an unknown tier.
+            Rejected here rather than passed through, so a typo fails on the
+            misconfiguration itself instead of surfacing seconds later as agy's
+            own startup error in the middle of a scored arm.
     """
-    return model.split("/")[-1]
+    effort = os.environ.get(_EFFORT_ENV, "").strip()
+    if not effort:
+        return _DEFAULT_AGY_EFFORT
+    if effort.lower() not in _AGY_EFFORT_TIERS:
+        raise core.ConfigError(
+            f"{_EFFORT_ENV}={effort!r} is not a reasoning tier agy accepts "
+            f"(known: {', '.join(_AGY_EFFORT_TIERS)})"
+        )
+    return effort.lower()
+
+
+def _resolve_model_name(model: str) -> tuple[str, str | None]:
+    """Resolve a matrix model id to the ``(model, effort)`` pair ``agy`` expects.
+
+    ``AGENT_MODEL`` is one value shared by every arm and by the judge, and it is
+    spelled for Vertex -- ``google/gemini-3.1-pro-preview``. agy accepts neither
+    the provider prefix nor the ``-preview`` suffix, and refuses any selection
+    that does not name a reasoning tier exactly once. Normalizing here confines
+    the quirk to the one harness that has it; respelling ``AGENT_MODEL`` instead
+    would desynchronize the agy arm's label from every other arm in the matrix.
+
+    e.g. ``"google/gemini-3.1-pro-preview"`` -> ``("gemini-3.1-pro", "high")``.
+
+    Args:
+        model: The configured model id, optionally provider-qualified.
+
+    Returns:
+        The id to pass as ``--model``, and the tier to pass as ``--effort`` --
+        or ``None`` for the tier when the id already names its own, in which
+        case ``--effort`` must be omitted or agy rejects the pair.
+    """
+    name = model.split("/")[-1].strip()
+    if _DISPLAY_TIER_RE.search(name):
+        return name, None
+    if name.endswith(_VERTEX_PREVIEW_SUFFIX):
+        name = name[: -len(_VERTEX_PREVIEW_SUFFIX)]
+    for tier in _AGY_EFFORT_TIERS:
+        if name.lower().endswith(f"-{tier}"):
+            return name[: -len(tier) - 1], tier
+    return name, _default_effort()
 
 
 def _build_settings(
@@ -93,7 +171,16 @@ def _build_settings(
     *,
     skills_enabled: bool = False,
 ) -> dict:
-    """Assemble the Antigravity ``settings.json`` payload for a run."""
+    """Assemble the Antigravity ``settings.json`` payload for a run.
+
+    ``model`` must already be the resolved spelling from
+    ``_resolve_model_name``, identical to the one passed as ``--model``. agy
+    does not validate ``defaultModel`` -- an unknown value there is ignored in
+    silence and the run falls back to a default model -- so the flag's loud
+    validation is the only guard, and it only guards a value settings agrees
+    with. The tier is deliberately not written here: it rides on ``--effort``,
+    and agy exposes no verified settings key for it.
+    """
     settings: dict = {}
     servers = cli_capabilities.build_mcp_servers(mcp_servers)
     if servers:
@@ -101,7 +188,7 @@ def _build_settings(
     if skills_enabled:
         settings["experimental"] = {"skills": True}
     if model:
-        settings["modelConfigs"] = {"defaultModel": _resolve_model_name(model)}
+        settings["modelConfigs"] = {"defaultModel": model}
 
     # Add GCP block if project/location are provided (needed for GCA/GKE tools)
     if project or location:
@@ -132,8 +219,11 @@ def _build_env(config: agents_config.AgentConfig) -> dict[str, str]:
     if config.api_key:
         overlay["GEMINI_API_KEY"] = config.api_key
         overlay["GOOGLE_API_KEY"] = config.api_key
-    if config.model:
-        overlay["GEMINI_MODEL"] = _resolve_model_name(config.model)
+
+    # No GEMINI_MODEL here. It is a Gemini CLI variable; agy ignores it
+    # entirely -- verified against 1.2.0, where a garbage value raises no error
+    # and a valid one does not change the model the run reports. The model
+    # travels on --model, which is also the only spelling agy validates.
 
     if config.extra_env:
         overlay.update(config.extra_env)
@@ -178,10 +268,25 @@ class AgyCliAgent(base.AgentHarness):
     """Antigravity CLI agent harness driving the ``agy`` binary.
 
     Lays down capabilities (rules, MCP, skills) in the workspace
-    directory and spawns the ``agy`` binary. It preserves the user's real
-    HOME to leverage cached OAuth/ADC credentials. The trajectory is
-    extracted by parsing the generated transcript JSONL log file.
+    directory and spawns the ``agy`` binary. The trajectory is extracted by
+    parsing the generated transcript JSONL log file.
+
+    **Credentials and HOME.** Unsandboxed, the run inherits the operator's real
+    HOME so ``agy`` can use its cached OAuth token and ADC. Sandboxed, HOME is
+    container-owned (``/workspace/home``) and the operator's profile is not
+    mounted at all — which is the point. The one credential the agent still
+    needs, its OAuth token, crosses deliberately: it is *copied* into the
+    per-run config dir under the workspace (see ``_execute``), so it rides in
+    on the workspace mount rather than through the operator's home. ADC and the
+    gcloud config never cross; the sandbox's deny filter drops them.
     """
+
+    # Every agent-owned subprocess here goes through run_agent_cmd, so a
+    # sandboxed run is actually contained. The gcloud project/location lookups
+    # stay on the host deliberately: they run before the agent, read the
+    # operator's own config to resolve defaults, and their result crosses as a
+    # value in the settings file rather than as access to gcloud.
+    supports_sandbox = True
 
     def __init__(self, config: agents_config.AgentConfig | None = None) -> None:
         super().__init__(config)
@@ -206,6 +311,21 @@ class AgyCliAgent(base.AgentHarness):
         caps = self.config.capabilities
         binary = self._resolve_binary()
 
+        # Resolved once so the --model flag and settings.json cannot disagree,
+        # and before any workspace is built so a bad AGENT_MODEL_EFFORT fails
+        # here rather than after the run has started costing something.
+        model_name: str | None = None
+        effort: str | None = None
+        if self.config.model:
+            model_name, effort = _resolve_model_name(self.config.model)
+            if model_name != self.config.model:
+                _log.warning(
+                    "agy does not accept the configured model id %r; running --model %s%s",
+                    self.config.model,
+                    model_name,
+                    f" --effort {effort}" if effort else "",
+                )
+
         env_overlay = _build_env(self.config)
 
         with cli_capabilities.agent_workdir(workspace_path, prefix="agy-run-") as workdir:
@@ -228,26 +348,42 @@ class AgyCliAgent(base.AgentHarness):
                 env_overlay["GOOGLE_CLOUD_PROJECT"] = project
                 env_overlay["GCP_PROJECT"] = project
 
-            location = (
-                os.environ.get("GOOGLE_CLOUD_LOCATION")
-                or os.environ.get("GCP_LOCATION")
-                or _get_gcloud_location()
-                or "us-central1"
-            )
-            if location:
-                env_overlay["GOOGLE_CLOUD_LOCATION"] = location
-                env_overlay["GCP_LOCATION"] = location
+            # Shared with the Gemini CLI harness so the two cannot drift; the
+            # gcloud lookup stays a lazy fallback, consulted only when the env
+            # chain is empty.
+            location = vertex_location(fallback=_get_gcloud_location)
+            env_overlay["GOOGLE_CLOUD_LOCATION"] = location
+            # Written but deliberately not *read* back (see vertex_env): agy's
+            # own GCP tooling has always been handed this spelling, and dropping
+            # it is a behavior change for the binary, not a routing fix. It only
+            # ever reaches the agy subprocess, never the deployers.
+            env_overlay["GCP_LOCATION"] = location
 
             # Explicit gemini_dir keeps agy on the workspace settings, not real HOME.
+            # The argv crosses the sandbox boundary verbatim, so the config
+            # dir must be the container spelling — same idiom as openclaw's
+            # OPENCLAW_STATE_DIR translation. Host spelling stays in
+            # gemini_dir for the post-run transcript read on this side.
+            gemini_dir_arg = str(gemini_dir)
+            spec = self.config.sandbox
+            if spec is not None and spec.workspace is not None:
+                gemini_dir_arg = sandbox_mod.container_path(spec.workspace, gemini_dir)
+                # The host binary path means nothing inside the image, which
+                # ships its own agy on PATH.
+                binary = _CONTAINER_AGY_BIN
             argv = [
                 binary,
                 "--dangerously-skip-permissions",
-                f"--gemini_dir={gemini_dir}",
+                f"--gemini_dir={gemini_dir_arg}",
             ]
             if project:
                 argv.append(f"--project={project}")
-            if self.config.model:
-                argv.append(f"--model={_resolve_model_name(self.config.model)}")
+            if model_name:
+                argv.append(f"--model={model_name}")
+                # Omitted when the id already names its tier: agy rejects the
+                # two spellings together.
+                if effort:
+                    argv.append(f"--effort={effort}")
             if self.config.extra_flags:
                 argv.extend(self.config.extra_flags)
             argv.append(f"--prompt={prompt}")
@@ -267,7 +403,7 @@ class AgyCliAgent(base.AgentHarness):
 
             settings = _build_settings(
                 caps.mcp_servers,
-                self.config.model,
+                model_name,
                 project,
                 location,
                 skills_enabled=bool(skill_names),
@@ -298,12 +434,18 @@ class AgyCliAgent(base.AgentHarness):
             timeout_exc: core.SubprocessError | None = None
             started = time.monotonic()
             try:
-                completed = devops_subprocess.run(
+                # Through the sandbox seam: containerised when
+                # ``config.sandbox`` is set, byte-identical to the previous
+                # direct ``run(...)`` otherwise. The overlay is the resolved
+                # configuration, so it is exactly what should cross the
+                # boundary — by value, never as inherited process env.
+                completed = self.run_agent_cmd(
                     argv,
                     extra_env=env_overlay,
                     cwd=workdir,
                     check=False,
                     timeout=self.config.timeout_sec,
+                    host_run=devops_subprocess.run,
                 )
             except core.SubprocessError as exc:
                 # check=False means this can only be a timeout. agy may have

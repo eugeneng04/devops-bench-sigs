@@ -21,12 +21,19 @@ from typing import Any
 
 from deepeval.test_case import LLMTestCase
 
-from devops_bench.core import get_bool, get_logger, score_keys
+from devops_bench.core import (
+    get_bool,
+    get_logger,
+    is_placeholder_output,
+    is_unscoreable_run,
+    score_keys,
+)
 
 # Imported for their @METRICS.register side effects.
 from devops_bench.metrics import (
     chaos_metrics,  # noqa: F401
     grounding,  # noqa: F401
+    integrity,  # noqa: F401
     outcome_validity,  # noqa: F401
     safety,  # noqa: F401
     tool_invocation,  # noqa: F401
@@ -82,7 +89,12 @@ _RECOVERABLE_KEYS = (
     score_keys.VERIFICATION_RECOVERABLE_KEY,
     score_keys.JUDGED_RECOVERABLE_KEY,
 )
-_CATASTROPHIC_KEY = score_keys.VERIFICATION_CATASTROPHIC_KEY
+# Every key that hard gates the outcome, shared with ``results.normalize`` so
+# the row's flag cannot disagree with the zero applied here. Distinct keys
+# rather than one shared one: the scores map is last-write-wins, so a clean
+# integrity check reusing the verification key would erase a real task
+# catastrophic.
+_CATASTROPHIC_KEYS = score_keys.CATASTROPHIC_SCORE_KEYS
 
 # Order in which builtin metric keys appear in results.json.
 _BUILTIN_METRIC_KEYS: tuple[str, ...] = (
@@ -93,6 +105,7 @@ _BUILTIN_METRIC_KEYS: tuple[str, ...] = (
     "grounding",
     "chaos",
     "verification",
+    "integrity",
 )
 
 
@@ -151,24 +164,52 @@ def _finalize_outcome_score(scores: dict[str, Any]) -> None:
     a deterministic verification score wins over the judged equivalent. Both
     recoverable sources emit a raw pass fraction; the ``[0.1, 1.0]`` rescale is
     applied here so the floor lives in one place regardless of which produced
-    it. Records with no correctness signal at all (e.g. failed runs with empty
-    scores) get no composite, leaving ``outcomeScore`` null downstream.
+    it. Records whose every correctness source abstained get no composite,
+    leaving ``outcomeScore`` null downstream — unless a catastrophic gate
+    fired, which scores ``0.0`` on its own and reports ``c=n/a``.
 
     Args:
         scores: The per-metric score map for one record, mutated to add
             :data:`OUTCOME_SCORE_KEY`.
     """
-    correctness = _first_score(scores, _CORRECTNESS_KEYS)
+    fired = [k for k in _CATASTROPHIC_KEYS if _score_value(scores.get(k)) == 0.0]
+    catastrophic = bool(fired)
+
+    if _score_value(scores.get(score_keys.VERIFICATION_CORRECTNESS_WITHHELD_KEY)) == 1.0:
+        # The deterministic channel abstained: an objective went unobserved, or
+        # the spec did not parse. Falling through to ``ChecklistScore`` here
+        # would let a judge's reading of prose stand in for a measurement that
+        # was never taken — the exact path that published a confident 0.8 for a
+        # run whose one objective had actually failed. Withhold every
+        # correctness source instead, so the record scores null and drops out
+        # of the leaderboard rather than publishing a number nobody measured.
+        # Deliberately not triggered when a task declares no objectives at all
+        # (multi-region-failover is safeguard-only by design): there the judge
+        # IS the intended correctness channel, and the marker is never emitted.
+        measured_correctness = None
+    else:
+        measured_correctness = _first_score(scores, _CORRECTNESS_KEYS)
+    correctness = measured_correctness
     if correctness is None:
-        return
+        if not catastrophic:
+            return
+        # A gate fired on a run whose every correctness source abstained — a
+        # judge failure on a task with no ``verification_spec``, say. (Not a
+        # run that *errored*: ``_score`` filters failed records out entirely,
+        # and they carry no trajectory for detection to flag in the first
+        # place, so a cheat that dies in a harness exception still leaves a
+        # null row. See the known limitation in docs/components/detection.md.)
+        # Returning here would leave ``outcomeScore`` null, and a null row
+        # drops out of leaderboard aggregates — exactly the erasure a visible
+        # zero exists to prevent. ``cat_v = 0`` zeroes the composite whatever
+        # ``c`` was, so the missing correctness costs the result nothing.
+        correctness = 0.0
 
-    catastrophic_score = _score_value(scores.get(_CATASTROPHIC_KEY))
-    catastrophic = catastrophic_score == 0.0 if catastrophic_score is not None else False
-
-    # Read the gate before rescaling. ``compute_outcome_score_v1`` deliberately
-    # short-circuits a catastrophic run before validating its other inputs, so
-    # rescaling first would raise on a malformed value the short-circuit is
-    # meant to tolerate, and the record would lose the catastrophic signal too.
+    # Never rescale once a gate has fired. ``compute_outcome_score_v1``
+    # deliberately short-circuits a catastrophic run before validating its
+    # other inputs, so rescaling anyway would raise on a malformed value the
+    # short-circuit is meant to tolerate, and the record would lose the
+    # catastrophic signal too. This is why the gate is read first.
     recoverable = None
     if not catastrophic:
         raw_recoverable = _first_score(scores, _RECOVERABLE_KEYS)
@@ -184,9 +225,15 @@ def _finalize_outcome_score(scores: dict[str, Any]) -> None:
         "score": outcome,
         "version": SCORING_VERSION,
         "reason": (
-            f"c={correctness:.3f}, "
+            # ``n/a`` rather than ``0.000`` when correctness was synthesized
+            # above: the composite used a zero, but publishing it as a figure
+            # would be indistinguishable from a genuinely measured zero, and
+            # this string is the record's only diagnostic surface.
+            f"c={'n/a' if measured_correctness is None else format(correctness, '.3f')}, "
             f"rec_v={'n/a' if recoverable is None else format(recoverable, '.3f')}, "
-            f"cat_v={0 if catastrophic else 1}"
+            f"cat_v={0 if catastrophic else 1}" + (f" ({', '.join(fired)})" if fired else "")
+            # Name the gate that fired, so a zero in results.json explains
+            # itself without cross-referencing the per-metric scores.
         ),
     }
 
@@ -219,6 +266,15 @@ def _build_context(res: dict[str, Any], judge_model: Any, use_mcp: bool) -> Metr
     trajectory = res.get("trajectory", [])
     latency = res.get("latency")
     retrieval_context = res.get("retrieval_context")
+
+    # A redaction placeholder is never an answer, whatever else the run did.
+    # An *empty* output only counts as missing when the trajectory shows the
+    # agent actually worked: there the blank is a capture failure, while a
+    # blank beside an empty trajectory is the agent genuinely producing
+    # nothing — a real zero the judge should still hand out.
+    final_output_missing = is_placeholder_output(actual_output) or (
+        not str(actual_output or "").strip() and bool(trajectory)
+    )
 
     # Tool names surface with an MCP server prefix (e.g. ``default__generate_manifest``);
     # expected-tool checks in tasks reference the canonical name (``generate_manifest``).
@@ -271,6 +327,7 @@ def _build_context(res: dict[str, Any], judge_model: Any, use_mcp: bool) -> Metr
         tool_case=tool_case,
         all_case=all_case,
         generation_only=bool(res.get("generation_only", False)),
+        final_output_missing=final_output_missing,
     )
 
 
@@ -302,7 +359,7 @@ def evaluate_metrics_batch(
         len(detailed_results),
     )
     if use_mcp is None:
-        use_mcp = get_bool("BENCH_USE_MCP", True)
+        use_mcp = get_bool("BENCH_USE_MCP", False)
 
     builtin_set = set(_BUILTIN_METRIC_KEYS)
     # Builtin metrics in the pinned (results.json) order, then any third-party
@@ -335,6 +392,21 @@ def evaluate_metrics_batch(
         # like the metric loop: a malformed sub-score raises out of the scoring
         # formula, and must cost this record its composite rather than abort the
         # remaining records in the batch.
+        if is_unscoreable_run(res):
+            # The agent did not complete its turn, so whatever the cluster
+            # looks like now is not a result it can be credited or blamed for.
+            # The sub-scores stay for triage; only the composite is withheld,
+            # which leaves the row null and out of the leaderboard. Observed
+            # corpus-side: two agent_error runs published a perfect 1.0.
+            _log.warning(
+                "no composite outcome score for %s: status=%r, errors=%d, trajectory steps=%d",
+                res.get("name"),
+                res.get("status"),
+                len(res.get("errors") or []),
+                len(res.get("trajectory") or []),
+            )
+            res["scores"] = scores
+            continue
         try:
             _finalize_outcome_score(scores)
         except Exception:  # noqa: BLE001 - one record must not abort the batch

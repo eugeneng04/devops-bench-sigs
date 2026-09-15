@@ -22,7 +22,7 @@ from typing import Any
 
 from devops_bench.core.config import get_env
 
-__all__ = ["ClusterInfo", "RunContext"]
+__all__ = ["ClusterInfo", "NetworkPlan", "RunContext"]
 
 _DEFAULT_KUBECONFIG = "~/.kube/config"
 
@@ -51,12 +51,18 @@ class ClusterInfo:
         project: Cloud project; None for local clusters.
         kubeconfig_path: Kubeconfig path; resolved from ``KUBECONFIG`` or
             ``~/.kube/config`` when not supplied.
+        agent_cloud_identity: Cloud identity (e.g. a service-account email)
+            provisioned by the task's stack for the *agent's own* cloud API
+            calls, or None when the task needs none. Sandboxed runs mint a
+            short-lived credential for this identity instead of handing the
+            container the operator's ambient one.
     """
 
     name: str
     location: str | None = None
     project: str | None = None
     kubeconfig_path: str = field(default_factory=_resolve_kubeconfig)
+    agent_cloud_identity: str | None = None
 
     @classmethod
     def from_dict(cls, info: dict[str, Any]) -> ClusterInfo:
@@ -64,7 +70,7 @@ class ClusterInfo:
 
         Args:
             info: Mapping with a required ``name`` and optional ``location``,
-                ``project``, and ``kubeconfig_path``.
+                ``project``, ``kubeconfig_path``, and ``agent_cloud_identity``.
 
         Returns:
             The constructed instance, with ``kubeconfig_path`` resolved when absent.
@@ -74,7 +80,51 @@ class ClusterInfo:
             location=info.get("location"),
             project=info.get("project"),
             kubeconfig_path=_resolve_kubeconfig(info.get("kubeconfig_path")),
+            agent_cloud_identity=info.get("agent_cloud_identity"),
         )
+
+
+@dataclass(frozen=True)
+class NetworkPlan:
+    """How a sandboxed container reaches this run's cluster apiserver.
+
+    This is the de-kinding seam. kind needs special knowledge (its Docker
+    network, a rewritten server URL), while a cloud cluster's endpoint already
+    means something from a bridge-networked container. Providers answer with
+    this plan via
+    :meth:`~devops_bench.providers.base.Provider.sandbox_network_plan`, so the
+    sandbox itself carries no per-provider knowledge.
+
+    It lives beside :class:`ClusterInfo` rather than in
+    :mod:`devops_bench.agents.sandbox` because both the provider layer and the
+    credential minting in :mod:`devops_bench.k8s.agent_credentials` name the
+    type, and having ``providers`` import from ``agents`` would invert the
+    layering.
+
+    Attributes:
+        docker_network: Docker network to join, or ``None`` for the default
+            bridge.
+        extra_hosts: Additional ``--add-host`` entries (``host:ip`` strings).
+            ``host.docker.internal:host-gateway`` is always added regardless,
+            so loopback-published endpoints stay reachable on Linux too.
+        rewrite_server: Replacement apiserver URL for the generated
+            kubeconfig, or ``None`` to keep the context's own server.
+        tls_server_name: Value for the kubeconfig's ``tls-server-name`` when
+            the rewritten endpoint's certificate carries a different SAN.
+        kubectl_context: kubectl context every credential read for this plan
+            is pinned to (``--context``). ``None`` falls back to the ambient
+            current-context — only acceptable when the caller has no cluster
+            identity of its own; the eval harness always pins, so a
+            current-context switched under it (an operator, a parallel
+            harness) can never hand the container another cluster's
+            credential.
+    """
+
+    docker_network: str | None = None
+    extra_hosts: tuple[str, ...] = ()
+    rewrite_server: str | None = None
+    tls_server_name: str | None = None
+    kubectl_context: str | None = None
 
 
 @dataclass

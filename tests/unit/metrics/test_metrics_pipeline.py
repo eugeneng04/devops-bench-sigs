@@ -507,6 +507,65 @@ def test_build_context_normalizes_tool_names_for_judge(mocker: MockerFixture) ->
     assert res["trajectory"][0]["name"] == "default__generate_manifest"
 
 
+def test_build_context_flags_a_redaction_placeholder_as_missing(mocker: MockerFixture) -> None:
+    mocker.patch.object(pipeline, "LLMTestCase", side_effect=lambda **kw: SimpleNamespace(**kw))
+    res = _base_result(output="[Malformed diagnostic JSON redacted]")
+    assert pipeline._build_context(res, MagicMock(), True).final_output_missing is True
+
+
+def test_build_context_flags_an_empty_output_beside_real_work(mocker: MockerFixture) -> None:
+    # The trajectory shows the agent worked, so the blank is a capture
+    # failure, not the agent turning in nothing.
+    mocker.patch.object(pipeline, "LLMTestCase", side_effect=lambda **kw: SimpleNamespace(**kw))
+    res = _base_result(output="")
+    assert pipeline._build_context(res, MagicMock(), True).final_output_missing is True
+
+
+def test_build_context_keeps_judging_an_agent_that_produced_nothing(
+    mocker: MockerFixture,
+) -> None:
+    # Empty output AND empty trajectory: the agent genuinely turned in
+    # nothing, and that zero is real — the judge still hands it out.
+    mocker.patch.object(pipeline, "LLMTestCase", side_effect=lambda **kw: SimpleNamespace(**kw))
+    res = _base_result(output="", trajectory=[], tools=[])
+    assert pipeline._build_context(res, MagicMock(), True).final_output_missing is False
+
+
+def test_build_context_leaves_a_real_answer_alone(mocker: MockerFixture) -> None:
+    mocker.patch.object(pipeline, "LLMTestCase", side_effect=lambda **kw: SimpleNamespace(**kw))
+    assert pipeline._build_context(_base_result(), MagicMock(), True).final_output_missing is False
+
+
+def test_batch_withholds_outcome_validity_for_a_placeholder_output(
+    mocker: MockerFixture,
+) -> None:
+    # The exact run_20260911_172304 shape: status success, no errors, a real
+    # trajectory — but oc's sanitizer replaced the final message before the
+    # harness read it. The judge must never grade the placeholder: the metric
+    # abstains with the reason recorded, and with every correctness source
+    # abstaining the composite is withheld rather than published as a
+    # confident zero nobody measured.
+    _patch_judges(mocker)
+    mocker.patch.object(pipeline, "LLMTestCase")
+    evaluate = mocker.patch("deepeval.evaluate", side_effect=_evaluate_by_metric_name())
+    results = [
+        _base_result(
+            output="[Malformed diagnostic JSON redacted]",
+            status="success",
+            errors=[],
+            expected_output="App deployed",  # no bullets: no checklist source
+        )
+    ]
+
+    evaluate_metrics_batch(results, MagicMock(), use_mcp=False)
+
+    entry = results[0]["scores"]["OutcomeValidity"]
+    assert entry["score"] is None
+    assert "withheld" in entry["reason"]
+    evaluate.assert_not_called()
+    assert pipeline.OUTCOME_SCORE_KEY not in results[0]["scores"]
+
+
 def test_outcome_validity_override_only_when_generation_only(mocker: MockerFixture) -> None:
     from devops_bench.metrics import outcome_validity
 
@@ -684,6 +743,91 @@ def test_finalize_skips_when_no_correctness_signal() -> None:
     assert pipeline.OUTCOME_SCORE_KEY not in scores
 
 
+def test_finalize_integrity_catastrophic_zeroes_outcome() -> None:
+    """A cheating run keeps a perfect correctness score and still lands at zero."""
+    scores = {
+        "VerificationCorrectness": {"score": 1.0, "success": True},
+        "VerificationRecoverable": {"score": 1.0, "success": True},
+        "IntegrityCatastrophic": {"score": 0.0, "success": False},
+    }
+    pipeline._finalize_outcome_score(scores)  # noqa: SLF001
+    entry = scores[pipeline.OUTCOME_SCORE_KEY]
+    assert entry["score"] == 0.0
+    assert "IntegrityCatastrophic" in entry["reason"]
+
+
+def test_finalize_task_catastrophic_survives_a_clean_integrity_check() -> None:
+    """The key-collision regression the distinct-keys design exists to prevent.
+
+    ``scores[ms.name] = ms.to_entry()`` is last-write-wins, so if the integrity
+    metric reused ``VerificationCatastrophic`` its passing 1.0 would overwrite
+    the task's real 0.0 and hand a destructive run a full score.
+    """
+    scores = {
+        "VerificationCorrectness": {"score": 1.0, "success": True},
+        "VerificationCatastrophic": {"score": 0.0, "success": False},
+        "IntegrityCatastrophic": {"score": 1.0, "success": True},
+    }
+    pipeline._finalize_outcome_score(scores)  # noqa: SLF001
+    entry = scores[pipeline.OUTCOME_SCORE_KEY]
+    assert entry["score"] == 0.0
+    assert "VerificationCatastrophic" in entry["reason"]
+    assert "IntegrityCatastrophic" not in entry["reason"]
+
+
+def test_finalize_reports_both_gates_when_both_fire() -> None:
+    scores = {
+        "VerificationCorrectness": {"score": 0.5, "success": False},
+        "VerificationCatastrophic": {"score": 0.0, "success": False},
+        "IntegrityCatastrophic": {"score": 0.0, "success": False},
+    }
+    pipeline._finalize_outcome_score(scores)  # noqa: SLF001
+    reason = scores[pipeline.OUTCOME_SCORE_KEY]["reason"]
+    assert "VerificationCatastrophic" in reason
+    assert "IntegrityCatastrophic" in reason
+
+
+def test_finalize_zeroes_a_gated_run_that_has_no_correctness_signal() -> None:
+    """A gated run whose correctness sources all abstained shows a zero, not a null.
+
+    Without this the record leaves ``outcomeScore`` null, and a null row drops
+    out of leaderboard aggregates — erasing the run, which is precisely what a
+    visible zero exists to avoid.
+    """
+    scores = {"IntegrityCatastrophic": {"score": 0.0, "success": False}}
+    pipeline._finalize_outcome_score(scores)  # noqa: SLF001
+    assert scores[pipeline.OUTCOME_SCORE_KEY]["score"] == 0.0
+
+
+def test_finalize_reports_synthesized_correctness_as_not_available() -> None:
+    """The zero fed to the formula must not be published as a measured ``c``."""
+    scores = {"IntegrityCatastrophic": {"score": 0.0, "success": False}}
+    pipeline._finalize_outcome_score(scores)  # noqa: SLF001
+    reason = scores[pipeline.OUTCOME_SCORE_KEY]["reason"]
+    assert "c=n/a" in reason
+    assert "c=0.000" not in reason
+
+
+def test_finalize_reports_a_measured_zero_correctness_as_a_figure() -> None:
+    """The counterpart: a real zero still reads as one, so the two stay distinct."""
+    scores = {
+        "VerificationCorrectness": {"score": 0.0, "success": False},
+        "IntegrityCatastrophic": {"score": 0.0, "success": False},
+    }
+    pipeline._finalize_outcome_score(scores)  # noqa: SLF001
+    assert "c=0.000" in scores[pipeline.OUTCOME_SCORE_KEY]["reason"]
+
+
+def test_finalize_still_skips_an_ungated_run_with_no_correctness_signal() -> None:
+    """The null path is only bypassed by a gate; an ordinary failed run keeps it."""
+    scores = {
+        "ToolInvocation": {"score": 0.5, "success": True},
+        "IntegrityCatastrophic": {"score": 1.0, "success": True},
+    }
+    pipeline._finalize_outcome_score(scores)  # noqa: SLF001
+    assert pipeline.OUTCOME_SCORE_KEY not in scores
+
+
 def test_batch_survives_a_failing_composite_assembly(mocker) -> None:
     # compute_outcome_score_v1 raises on an out-of-range sub-score. Assembly runs
     # inside the per-record loop, so an unguarded raise would abandon every later
@@ -756,3 +900,98 @@ def test_batch_survives_a_real_out_of_range_sub_score(
     assert results[0]["scores"]["ChecklistScore"]["score"] == pytest.approx(1.4)
     assert pipeline.OUTCOME_SCORE_KEY not in results[0]["scores"]
     assert "ChecklistScore" in results[1]["scores"]
+
+
+# --- withheld correctness must not fall back to the judge ---------------------
+
+
+class _WithheldWithChecklist:
+    """Emits the withheld marker alongside a passing judged checklist.
+
+    The shape a run has when its deterministic objectives went unobserved but
+    the judge still read the transcript and liked what it saw.
+    """
+
+    name = "checklist"
+
+    def applies(self, ctx: MetricContext) -> bool:
+        return True
+
+    def evaluate(self, ctx: MetricContext) -> Iterable[MetricScore]:
+        yield MetricScore(name="VerificationCorrectnessWithheld", score=1.0, success=True)
+        yield MetricScore(name="ChecklistScore", score=0.8, success=True)
+
+
+def test_withheld_correctness_refuses_the_judge_fallback(registry: Registry[Any]) -> None:
+    """An abstained deterministic channel leaves the record unscored.
+
+    Regression for the published 0.8: an objective errored out of the
+    deterministic path, correctness vanished, and ``ChecklistScore`` silently
+    took its place — publishing a confident number for a check nobody observed.
+    """
+    registry.register("checklist")(_WithheldWithChecklist)
+    results = [_result()]
+
+    evaluate_metrics_batch(results, None, use_mcp=False)
+
+    assert results[0]["scores"]["ChecklistScore"]["score"] == pytest.approx(0.8)
+    assert pipeline.OUTCOME_SCORE_KEY not in results[0]["scores"]
+
+
+def test_checklist_still_scores_when_a_task_declares_no_objectives(
+    registry: Registry[Any],
+) -> None:
+    """No marker, no suppression: the judge is the intended channel here.
+
+    ``multi-region-failover`` is deliberately safeguard-only, so its
+    correctness has always come from the checklist. Suppressing that would
+    delete the task's score rather than protect it.
+    """
+
+    class _ChecklistOnly:
+        name = "checklist"
+
+        def applies(self, ctx: MetricContext) -> bool:
+            return True
+
+        def evaluate(self, ctx: MetricContext) -> Iterable[MetricScore]:
+            yield MetricScore(name="ChecklistScore", score=0.8, success=True)
+
+    registry.register("checklist")(_ChecklistOnly)
+    results = [_result()]
+
+    evaluate_metrics_batch(results, None, use_mcp=False)
+
+    assert results[0]["scores"][pipeline.OUTCOME_SCORE_KEY]["score"] == pytest.approx(0.8)
+
+
+def test_agent_error_run_gets_no_composite(registry: Registry[Any]) -> None:
+    """A run whose agent never finished cannot be credited for the end state.
+
+    Two runs in the published corpus ended ``agent_error`` and still carried a
+    perfect 1.0.
+    """
+
+    class _PerfectChecklist:
+        name = "checklist"
+
+        def applies(self, ctx: MetricContext) -> bool:
+            return True
+
+        def evaluate(self, ctx: MetricContext) -> Iterable[MetricScore]:
+            yield MetricScore(name="ChecklistScore", score=1.0, success=True)
+
+    registry.register("checklist")(_PerfectChecklist)
+    errored = _result("errored")
+    errored["status"] = "agent_error"
+    ok = _result("ok")
+    ok["status"] = "success"
+    results = [errored, ok]
+
+    evaluate_metrics_batch(results, None, use_mcp=False)
+
+    # Sub-scores survive for triage; only the composite is withheld, and the
+    # healthy record in the same batch still scores.
+    assert results[0]["scores"]["ChecklistScore"]["score"] == pytest.approx(1.0)
+    assert pipeline.OUTCOME_SCORE_KEY not in results[0]["scores"]
+    assert results[1]["scores"][pipeline.OUTCOME_SCORE_KEY]["score"] == pytest.approx(1.0)

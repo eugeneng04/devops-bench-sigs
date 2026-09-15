@@ -55,8 +55,21 @@ PROJECT_ID="${PROJECT_ID:-}"
 CLUSTER_NAME="${CLUSTER_NAME:-eval}"
 GCP_LOCATION="${GCP_LOCATION:-us-central1-a}"
 AGENT_PROVIDER="${AGENT_PROVIDER:-google}"
+# The judge and the chaos driver are both pinned, and pinned to the SAME model
+# across every arm. Left unset, each falls back to the arm's own AGENT_MODEL:
+# the judge would then grade each model with itself (and silently score 0 on a
+# CLI-only alias that no API serves), and the chaos driver would try to plan the
+# load spike through the agent's endpoint. Both happened. The chaos fallback
+# killed the load spike in 8 of 8 optimize-scale runs, and nothing in the
+# artifacts recorded which judge had scored which arm.
 JUDGE_PROVIDER="${JUDGE_PROVIDER:-google}"
-JUDGE_MODEL="${JUDGE_MODEL:-gemini-3.1-pro}"
+JUDGE_MODEL="${JUDGE_MODEL:-gemini-3.1-pro-preview}"
+# Only optimize-scale declares a chaos_spec, and its GenerateLoadFault is
+# LLM-driven: the model plans and issues the fortio command. So this matters for
+# exactly one task, and gets it wrong expensively — a bad endpoint now fails the
+# run loudly (chaos_invalidated) instead of scoring a spike that never fired.
+CHAOS_PROVIDER="${CHAOS_PROVIDER:-google}"
+CHAOS_MODEL="${CHAOS_MODEL:-gemini-3.1-pro-preview}"
 MAX_PARALLEL="${MAX_PARALLEL:-3}"
 # Per-subprocess agent timeout. The 600s harness default is too low for
 # infra-bearing tasks (e.g. deploy-hello-app timed out); give matrix runs more
@@ -209,8 +222,44 @@ _pull_and_summarize() {
 # Resume/attach: set RESUME_STAMP=<stamp> (from an earlier run's output) to skip
 # launching and just re-poll + pull an existing remote run — for when the local
 # process died after the bastion runner was already launched.
+# Prove the judge and chaos models answer before provisioning anything. Both
+# fail late and expensively otherwise: a judge that 404s scores every checklist
+# 0 with no error in the log, and a chaos model that 404s only surfaces after
+# the task's infra is up and the agent has run. One call each, seconds, against
+# the same env the run will use.
+preflight_models() {
+  local rc=0
+  for pair in "judge:${JUDGE_PROVIDER}:${JUDGE_MODEL}" "chaos:${CHAOS_PROVIDER}:${CHAOS_MODEL}"; do
+    local role="${pair%%:*}" rest="${pair#*:}"
+    local provider="${rest%%:*}" model="${rest#*:}"
+    echo "==> preflight: ${role} model ${provider}/${model}"
+    if ! host_exec "cd '${REMOTE_REPO:-$PWD}' && uv run python -c \"
+import asyncio
+from devops_bench.models import get_model
+c = get_model(provider='${provider}', model_name='${model}')
+r = asyncio.run(c.generate_content([{'role': 'user', 'content': 'reply: ok'}], None, None))
+print('answered:', str(r)[:60])
+\"" ; then
+      echo "ERROR: ${role} model ${provider}/${model} did not answer." >&2
+      echo "       Unset or wrong, it falls back to the arm's AGENT_MODEL:" >&2
+      echo "       the judge would grade each model with itself, and the chaos" >&2
+      echo "       driver would fail the load spike after the run is paid for." >&2
+      rc=1
+    fi
+  done
+  return "${rc}"
+}
+
 matrix_dispatch() {
   local label="$1"
+
+  if [ "${SKIP_MODEL_PREFLIGHT:-0}" != "1" ] && [ -z "${RESUME_STAMP:-}" ]; then
+    preflight_models || {
+      echo "ERROR: aborting before provisioning. Fix the model config, or set" >&2
+      echo "       SKIP_MODEL_PREFLIGHT=1 to proceed anyway." >&2
+      return 2
+    }
+  fi
 
   if [ -n "${RESUME_STAMP:-}" ]; then
     STAMP="${RESUME_STAMP}"
@@ -288,6 +337,7 @@ matrix_dispatch() {
     echo "export PROJECT_ID='${PROJECT_ID}' CLUSTER_NAME='${CLUSTER_NAME}'"
     echo "export GCP_LOCATION='${GCP_LOCATION}'"
     echo "export AGENT_PROVIDER='${AGENT_PROVIDER}' JUDGE_PROVIDER='${JUDGE_PROVIDER}' JUDGE_MODEL='${JUDGE_MODEL}'"
+    echo "export CHAOS_PROVIDER='${CHAOS_PROVIDER}' CHAOS_MODEL='${CHAOS_MODEL}'"
     echo "export AGENT_TIMEOUT_SEC='${AGENT_TIMEOUT_SEC}'"
     echo "export BENCH_PARALLEL=true"
     echo 'run_one() {'

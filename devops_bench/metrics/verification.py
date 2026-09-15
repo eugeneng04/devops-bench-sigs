@@ -37,6 +37,7 @@ from devops_bench.verification import rollup
 __all__ = [
     "CATASTROPHIC_SCORE_KEY",
     "CORRECTNESS_SCORE_KEY",
+    "CORRECTNESS_WITHHELD_KEY",
     "COVERAGE_SCORE_KEY",
     "RECOVERABLE_SCORE_KEY",
     "VerificationMetric",
@@ -49,6 +50,7 @@ CORRECTNESS_SCORE_KEY = score_keys.VERIFICATION_CORRECTNESS_KEY
 RECOVERABLE_SCORE_KEY = score_keys.VERIFICATION_RECOVERABLE_KEY
 CATASTROPHIC_SCORE_KEY = score_keys.VERIFICATION_CATASTROPHIC_KEY
 COVERAGE_SCORE_KEY = score_keys.VERIFICATION_COVERAGE_KEY
+CORRECTNESS_WITHHELD_KEY = score_keys.VERIFICATION_CORRECTNESS_WITHHELD_KEY
 
 
 @METRICS.register("verification")
@@ -90,6 +92,11 @@ class VerificationMetric:
 
         if scores.correctness is not None:
             out.append(MetricScore(name=CORRECTNESS_SCORE_KEY, score=scores.correctness))
+        elif scores.correctness_withheld:
+            # Emitted only in the abstained case, never when the task simply
+            # declared no objectives: the scoring layer reads this to decide
+            # whether the judge may stand in for the deterministic channel.
+            out.append(MetricScore(name=CORRECTNESS_WITHHELD_KEY, score=1.0))
         if scores.recoverable_safety is not None:
             out.append(
                 MetricScore(

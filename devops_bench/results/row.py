@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 __all__ = ["SCHEMA_VERSION", "Manifest", "ResultRow"]
@@ -40,7 +40,8 @@ __all__ = ["SCHEMA_VERSION", "Manifest", "ResultRow"]
 #: breaking field change so a downstream ingest can detect a shape mismatch.
 #: v2 adds the scoring-framework v1 fields (``outcomeScore`` becomes the composite
 #: score; ``correctnessScore`` / ``recoverableSafetyScore`` / ``catastrophic`` /
-#: ``scoringVersion`` are added).
+#: ``scoringVersion`` are added). ``catastrophicKinds`` was added later within v2:
+#: additive with a default, so not a breaking change.
 SCHEMA_VERSION = 2
 
 # Frozen + camelCase aliases. ``populate_by_name`` keeps the snake_case
@@ -67,6 +68,14 @@ class Manifest(BaseModel):
             ``None`` when uncapped. "Timed out" and "used 90% of its budget"
             are both uninterpretable without it, and the budget is a run
             setting that no row can recover after the fact.
+        judge_model: The model that scored this run's judged metrics, as
+            resolved at scoring time. ``None`` when nothing judged ran.
+            Recorded because it is otherwise unrecoverable: the judge is chosen
+            from ``JUDGE_MODEL`` at scoring time, and when that is unset it
+            silently falls back to the agent's own model — so two arms can be
+            graded by different judges, or by themselves, with no trace in any
+            artifact. A whole 132-run corpus was published before anyone could
+            establish which judge scored which arm.
     """
 
     model_config = _MODEL_CONFIG
@@ -79,6 +88,7 @@ class Manifest(BaseModel):
     harness: str
     augmentation: list[str]
     timeout_sec: float | None = None
+    judge_model: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-serializable mapping written to ``manifest.json``."""
@@ -127,8 +137,19 @@ class ResultRow(BaseModel):
             scores, so this value will not reconcile by hand against
             ``outcome_score``. ``None`` when the task declared no recoverable
             safeguards.
-        catastrophic: Whether a catastrophic tripwire fired (``cat_v = 0``); such
-            a run has ``outcome_score = 0`` regardless of the other sub-scores.
+        catastrophic: Whether *any* catastrophic tripwire fired (``cat_v = 0``) —
+            a task safeguard or the benchmark-integrity gate; such a run has
+            ``outcome_score = 0`` regardless of the other sub-scores. Equals
+            ``bool(catastrophic_kinds)`` at write time only: a row written
+            before ``catastrophic_kinds`` existed re-validates (e.g. through
+            ``aggregate.rebatch_rows``) with a genuine ``True`` beside the
+            defaulted empty list, so never derive this flag from the list.
+        catastrophic_kinds: The score keys of the gates that fired, verbatim
+            (``"VerificationCatastrophic"`` for a task safeguard,
+            ``"IntegrityCatastrophic"`` for the benchmark-integrity gate). A
+            list because both gates can fire on one run; empty when none did —
+            or when the row predates this field, so an empty list is not
+            evidence of a clean run unless ``catastrophic`` is also ``False``.
         scoring_version: Scoring-framework version that produced ``outcome_score``
             (e.g. ``"v1"``); ``""`` for rows written before the framework landed.
         tool_score: Tool-invocation judge score in ``[0, 1]``, or ``None``.
@@ -191,6 +212,7 @@ class ResultRow(BaseModel):
     correctness_score: float | None = None
     recoverable_safety_score: float | None = None
     catastrophic: bool = False
+    catastrophic_kinds: list[str] = Field(default_factory=list)
     scoring_version: str = ""
     tool_score: float | None
     tool_calls: int | None = None

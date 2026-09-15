@@ -27,6 +27,18 @@ output "endpoint" {
   description = "Cluster control plane endpoint"
 }
 
+# Endpoint of the kind / GKE cluster only, deliberately NOT falling back to the
+# vcluster submodule the way `endpoint` does. A root `provider "kubernetes"`
+# block configured from `endpoint` depends on module.vcluster's resources, and
+# those resources are themselves served by that provider -- tofu rejects the
+# result as a cycle before anything is planned. Stacks that never use the
+# vcluster provider read this instead, keeping the ordering edge on the cluster
+# without the cycle.
+output "managed_endpoint" {
+  value       = var.infra_provider == "gcp" ? try(module.gke[0].endpoint, "") : try(module.kind[0].endpoint, "")
+  description = "Control plane endpoint for the kind/GKE providers (no vcluster fallback)"
+}
+
 output "cluster_ca_certificate" {
   value       = var.infra_provider == "gcp" ? try(module.gke[0].cluster_ca_certificate, "") : (var.infra_provider == "kind" ? try(module.kind[0].cluster_ca_certificate, "") : "")
   description = "Cluster CA certificate"

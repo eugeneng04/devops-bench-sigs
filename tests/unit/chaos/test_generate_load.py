@@ -27,6 +27,8 @@ from subprocess import CompletedProcess
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from devops_bench.chaos.base import ChaosResult
 from devops_bench.chaos.faults import generate_load as gl
 from devops_bench.chaos.faults.generate_load import (
@@ -456,3 +458,37 @@ def test_inject_port_forward_setup_failure_becomes_failed_result() -> None:
     assert result.success is False
     assert result.error is not None
     assert "kubectl missing" in result.error
+
+
+class TestLoadCommandTimeout:
+    """A spike must outlive its own ``-t``; everything else keeps the flat cap."""
+
+    def test_spike_timeout_covers_the_declared_duration(self):
+        # 300s is what optimize-scale declares. Under the old flat 40s ceiling
+        # fortio was killed mid-spike and the fault reported "load did not reach
+        # the workload", which reads as unreachable rather than cut short.
+        argv = ["fortio", "load", "-qps", "300", "-t", "300s", "-c", "2", "http://localhost:8080"]
+        assert gl._command_timeout(argv, is_load=True) > 300
+
+    def test_spike_timeout_is_bounded(self):
+        argv = ["fortio", "load", "-t", "24h", "http://localhost:8080"]
+        assert gl._command_timeout(argv, is_load=True) == gl._LOAD_TIMEOUT_CEILING_SEC
+
+    def test_non_load_command_keeps_the_flat_ceiling(self):
+        assert gl._command_timeout(["kubectl", "get", "pods"], is_load=False) == gl._COMMAND_TIMEOUT
+
+    def test_unparsable_duration_falls_back_rather_than_guessing(self):
+        argv = ["fortio", "load", "-t", "banana", "http://localhost:8080"]
+        assert gl._command_timeout(argv, is_load=True) == gl._COMMAND_TIMEOUT
+
+    def test_load_without_a_duration_flag_keeps_the_flat_ceiling(self):
+        assert gl._command_timeout(["fortio", "load", "http://x"], is_load=True) == (
+            gl._COMMAND_TIMEOUT
+        )
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [("300s", 300.0), ("5m", 300.0), ("1h30m", 5400.0), ("250ms", 0.25), ("nope", None)],
+    )
+    def test_go_duration_parsing(self, value, expected):
+        assert gl._go_duration_seconds(value) == expected

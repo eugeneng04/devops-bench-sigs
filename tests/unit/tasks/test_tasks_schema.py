@@ -223,7 +223,9 @@ def test_to_dict_roundtrip_fields():
         "recoverable_safety",
         "infrastructure",
         "documentation",
+        "agent_pod_security",
         "validated",
+        "requires_unsandboxed",
     }
 
 
@@ -244,6 +246,22 @@ def test_validated_roundtrips_in_to_dict():
     assert Task.from_dict({"name": "n", "validated": True}).to_dict()["validated"] is True
 
 
+def test_requires_unsandboxed_defaults_false():
+    assert Task.from_dict({"name": "n"}, name_default="d").requires_unsandboxed is False
+
+
+def test_requires_unsandboxed_parsed_from_spec():
+    # from_dict builds an explicit field mapping and Task ignores unknown keys,
+    # so a key absent from that mapping is dropped silently; this pins the wiring.
+    assert Task.from_dict({"name": "n", "requires_unsandboxed": True}).requires_unsandboxed is True
+
+
+def test_requires_unsandboxed_empty_block_coalesces_false():
+    # An empty YAML block (``requires_unsandboxed:`` with no value) parses to None.
+    task = Task.from_dict({"name": "n", "requires_unsandboxed": None})
+    assert task.requires_unsandboxed is False
+
+
 def test_safety_checklists_empty_block_coalesces_to_empty_list():
     # An empty ``recoverable_safety:`` / ``catastrophic:`` block parses to None.
     # Both entry points must coalesce it: from_dict, and direct
@@ -251,3 +269,32 @@ def test_safety_checklists_empty_block_coalesces_to_empty_list():
     assert Task.from_dict({"name": "n", "recoverable_safety": None}).recoverable_safety == []
     direct = Task.model_validate({"name": "n", "recoverable_safety": None, "catastrophic": None})
     assert direct.recoverable_safety == []
+
+
+def test_agent_pod_security_defaults_to_baseline():
+    """Pod security is on unless a task says otherwise, so an author who never
+    heard of the key still gets the control."""
+    assert Task.from_dict({"name": "n"}).agent_pod_security == "baseline"
+
+
+def test_agent_pod_security_round_trips_an_opt_out():
+    task = Task.from_dict({"name": "n", "agent_pod_security": "privileged"})
+    assert task.agent_pod_security == "privileged"
+    assert task.to_dict()["agent_pod_security"] == "privileged"
+
+
+@pytest.mark.parametrize("value", ["Privileged", "privleged", "restricted", "none"])
+def test_unknown_agent_pod_security_is_rejected_at_load_time(value):
+    """An unrecognised level falls through to enforcement, so accepting it would
+    silently ignore the author's opt-out and fail the task somewhere far from
+    the cause."""
+    with pytest.raises(ValidationError):
+        Task.from_dict({"name": "n", "agent_pod_security": value})
+
+
+def test_empty_agent_pod_security_coalesces_to_the_default():
+    """``agent_pod_security:`` with no value parses to None; that must mean the
+    default rather than silently disabling enforcement."""
+    assert Task.from_dict({"name": "n", "agent_pod_security": None}).agent_pod_security == (
+        "baseline"
+    )

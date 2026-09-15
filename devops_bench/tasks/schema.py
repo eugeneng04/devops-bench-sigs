@@ -14,7 +14,7 @@
 
 """Typed schema for benchmark task contracts."""
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -129,9 +129,24 @@ class Task(BaseModel):
             declared deterministically in ``verification_spec`` instead.
         infrastructure: Deployer and stack settings for the task environment.
         documentation: Documentation entries, each with per-constraint criticality.
+        agent_pod_security: Pod-security level enforced on the namespaces a
+            sandboxed agent can reach: ``"baseline"`` (the default) or
+            ``"privileged"`` to opt this task out entirely. Any other value is
+            a validation error rather than a silent fall-back to the default.
+            Only set ``"privileged"`` for a task whose own subject matter is
+            privileged workloads -- it removes the control that denies the
+            privileged-pod and hostPath escape.
         validated: Whether the task has been vetted as correct and is eligible to
             promote to the leaderboard. Defaults to ``False`` so an unvetted task
             never counts until explicitly marked.
+        requires_unsandboxed: Opt this task out of the agent sandbox even when
+            the run asks for one. For a task whose objective *is* the credential
+            the sandbox withholds: ``secret-rotation`` drives Secret Manager
+            through Application Default Credentials, and ADC is exactly what the
+            boundary strips, so a sandboxed run cannot do the task at all.
+            Declared on the task rather than passed per-run so the exemption
+            travels with the thing that needs it and is visible to anyone
+            reading the spec.
     """
 
     model_config = _STRICT
@@ -147,7 +162,12 @@ class Task(BaseModel):
     recoverable_safety: list[str] = Field(default_factory=list)
     infrastructure: dict[str, Any] = Field(default_factory=dict)
     documentation: list[DocumentationEntry] = Field(default_factory=list)
+    # Closed set rather than a bare ``str``: an unrecognised level falls
+    # through to enforcement, so a typo would silently ignore the author's
+    # opt-out and fail the task somewhere far from the cause.
+    agent_pod_security: Literal["baseline", "privileged"] = "baseline"
     validated: bool = False
+    requires_unsandboxed: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -170,7 +190,9 @@ class Task(BaseModel):
                 "recoverable_safety": [],
                 "infrastructure": {},
                 "documentation": [],
+                "agent_pod_security": "baseline",
                 "validated": False,
+                "requires_unsandboxed": False,
             },
         )
 
@@ -208,7 +230,9 @@ class Task(BaseModel):
         recoverable_safety = raw.get("recoverable_safety", [])
         infrastructure = raw.get("infrastructure", {})
         documentation = raw.get("documentation", [])
+        agent_pod_security = raw.get("agent_pod_security", "baseline")
         validated = raw.get("validated", False)
+        requires_unsandboxed = raw.get("requires_unsandboxed", False)
 
         return cls.model_validate(
             {
@@ -225,7 +249,13 @@ class Task(BaseModel):
                 "recoverable_safety": ([] if recoverable_safety is None else recoverable_safety),
                 "infrastructure": {} if infrastructure is None else infrastructure,
                 "documentation": [] if documentation is None else documentation,
+                "agent_pod_security": (
+                    "baseline" if agent_pod_security is None else _text(str(agent_pod_security))
+                ),
                 "validated": False if validated is None else validated,
+                "requires_unsandboxed": (
+                    False if requires_unsandboxed is None else requires_unsandboxed
+                ),
             }
         )
 

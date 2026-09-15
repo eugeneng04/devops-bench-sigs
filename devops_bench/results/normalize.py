@@ -27,10 +27,10 @@ from collections.abc import Iterable, Mapping
 from typing import Any, NamedTuple
 
 from devops_bench.core import score_keys
+from devops_bench.core.run_status import is_unscoreable_run
 from devops_bench.results.row import Manifest, ResultRow
 
 __all__ = [
-    "CATASTROPHIC_SCORE_KEY",
     "OUTCOME_SCORE_KEY",
     "TOOL_SCORE_KEY",
     "NormalizedTokens",
@@ -64,7 +64,13 @@ _RECOVERABLE_KEYS = (
     score_keys.VERIFICATION_RECOVERABLE_KEY,
     score_keys.JUDGED_RECOVERABLE_KEY,
 )
-CATASTROPHIC_SCORE_KEY = score_keys.VERIFICATION_CATASTROPHIC_KEY
+# Every key that hard gates the outcome. Shared with ``metrics.pipeline``
+# rather than mirrored, unlike the two chains above: the row's ``catastrophic``
+# flag has to agree with the zero the pipeline already applied to
+# ``outcomeScore``, and a comment is a weaker guarantee of that than one
+# definition. The keys that fired are surfaced verbatim as the row's
+# ``catastrophicKinds``, so the key name doubles as the failure type.
+_CATASTROPHIC_KEYS = score_keys.CATASTROPHIC_SCORE_KEYS
 
 # Token usage aliases per provider, in lookup priority. The canonical keys
 # (``input`` / ``cached`` / ``reasoning`` / ``output``; see
@@ -80,6 +86,12 @@ _OUTPUT_TOKEN_KEYS = (
     "completion_tokens",
     "output_tokens",
 )
+# ``cacheRead`` / ``cacheWrite`` / ``reasoningTokens`` are what the CLI
+# harnesses actually emit. Without them every openclaw row normalized its cache
+# buckets to None while ``total`` survived (spelled the same either way), so the
+# published board showed a cached-token figure for the API-shaped arms and a
+# blank for all 94 openclaw rows — which reads as "openclaw does not cache"
+# rather than "the number was dropped on ingest".
 _CACHED_TOKEN_KEYS = (
     "cached",
     "cacheRead",
@@ -87,7 +99,12 @@ _CACHED_TOKEN_KEYS = (
     "cached_content_token_count",
 )
 _CACHE_WRITE_TOKEN_KEYS = ("cache_write", "cacheWrite", "cache_creation_input_tokens")
-_REASONING_TOKEN_KEYS = ("reasoning", "thoughts_token_count", "reasoning_tokens")
+_REASONING_TOKEN_KEYS = (
+    "reasoning",
+    "reasoningTokens",
+    "thoughts_token_count",
+    "reasoning_tokens",
+)
 _TOTAL_TOKEN_KEYS = ("total", "totalTokens", "total_tokens", "total_token_count")
 
 # Runs of characters outside ``[a-z0-9]`` collapse to a single ``-``. Mirrors the
@@ -178,6 +195,35 @@ def _first_token(tokens: Mapping[str, Any], keys: tuple[str, ...]) -> int | None
             if coerced is not None:
                 return coerced
     return None
+
+
+def _correctness_unpublishable(scores: Mapping[str, Any] | None, record: Mapping[str, Any]) -> bool:
+    """Whether this row must publish no ``correctnessScore`` at all.
+
+    The row carries its own copy of the correctness preference chain, so
+    suppressing the judge fallback in the composite is not enough: the
+    dashboard averages ``correctnessScore`` across every row, including rows
+    whose ``outcomeScore`` is null. Without this, a run that withheld its
+    composite still contributes a judge-derived correctness to the published
+    column — the exact number the withholding exists to keep out.
+
+    Two cases, matching the scoring layer:
+
+    * the deterministic channel abstained (an objective errored, or the spec
+      failed to parse), and
+    * the agent never finished its turn, so the end state is not attributable
+      to it.
+
+    Args:
+        scores: The record's ``scores`` mapping.
+        record: The full record, read for its run ``status``.
+
+    Returns:
+        ``True`` when the row must report ``None`` for correctness.
+    """
+    if extract_score(scores, score_keys.VERIFICATION_CORRECTNESS_WITHHELD_KEY) == 1.0:
+        return True
+    return is_unscoreable_run(record)
 
 
 class NormalizedTokens(NamedTuple):
@@ -367,8 +413,20 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
     for record in records:
         scores = record.get("scores")
         tokens = normalize_tokens(record.get("tokens"))
-        correctness = _first_score(scores, _CORRECTNESS_KEYS)
-        catastrophic_score = extract_score(scores, CATASTROPHIC_SCORE_KEY)
+        unattributable = is_unscoreable_run(record)
+        correctness = (
+            None
+            if _correctness_unpublishable(scores, record)
+            else _first_score(scores, _CORRECTNESS_KEYS)
+        )
+        # A composite the current pipeline would never produce must not survive
+        # in a row either. For a run scored by this build the key is simply
+        # absent, so this is a no-op; it matters when rebuilding rows from an
+        # artifact an older pipeline scored, where a run whose agent never
+        # finished still carries a stored OutcomeScore. Without this the
+        # rebuilt row contradicts itself: correctness withheld, composite 1.0.
+        outcome = None if unattributable else extract_score(scores, OUTCOME_SCORE_KEY)
+        catastrophic_kinds = [k for k in _CATASTROPHIC_KEYS if extract_score(scores, k) == 0.0]
         tool_calls, tool_errors = count_tool_calls(record.get("trajectory"), record.get("errors"))
         # A reported 0 is a parse miss, not a run that never called the model.
         turns = _coerce_int(record.get("model_turns")) or None
@@ -383,10 +441,11 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 task_folder=record.get("folder", "") or "",
                 task_name=record.get("name", "") or "",
                 iteration=0,
-                outcome_score=extract_score(scores, OUTCOME_SCORE_KEY),
+                outcome_score=outcome,
                 correctness_score=correctness,
                 recoverable_safety_score=_first_score(scores, _RECOVERABLE_KEYS),
-                catastrophic=catastrophic_score == 0.0,
+                catastrophic=bool(catastrophic_kinds),
+                catastrophic_kinds=catastrophic_kinds,
                 scoring_version=_scoring_version(scores),
                 tool_score=extract_score(scores, TOOL_SCORE_KEY),
                 tool_calls=tool_calls,

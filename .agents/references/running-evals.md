@@ -76,12 +76,29 @@ Pick one mode:
   key rather than guessing.
 
 **Judge.** The wrapper defaults `JUDGE_PROVIDER=google` and
-`JUDGE_MODEL=gemini-3.1-pro`; on the ambient-credentials backend the default id
-must be overridden to its `-preview` variant
-(`JUDGE_MODEL=gemini-3.1-pro-preview`). If judge calls return 404 or silently
-fail, work the `404 Publisher model` row in
+`JUDGE_MODEL=gemini-3.1-pro-preview` — the id the API-key endpoint publishes,
+because that is the path the bastion actually uses. Vertex publishes the id
+without the suffix, so a Vertex-backed run overrides it to `gemini-3.1-pro`.
+Getting this wrong used to be silent; `preflight_models` now makes one call to
+the judge and the chaos driver before anything is provisioned, so a bad id
+fails in seconds instead of after a whole matrix. If judge calls return 404 or
+silently fail, work the `404 Publisher model` row in
 [known_issues.md](../../docs/appendix/known_issues.md) — it carries the full
 fix (the location and model-id requirements).
+
+**Chaos driver.** `CHAOS_MODEL` needs the same treatment, and it is easy to
+miss because the judge and the chaos driver do not resolve models the same way.
+The judge reaches Vertex, where `gemini-3.1-pro` exists; the chaos driver goes
+through the API key, whose endpoint publishes only `gemini-3.1-pro-preview` and
+answers `gemini-3.1-pro` with `404 ... is not found for API version v1beta`. A
+judge that works is therefore no evidence that chaos will.
+
+The failure does not look like a bad model id. The fault never injects, the run
+is recorded `verification_status: chaos_invalidated`, and correctness is
+withheld — which reads as "the spike did not land" rather than "the driver
+could not call a model". Only `optimize-scale` declares a chaos spec, so it is
+the only task that shows it. Check `chaos_report.error` in `results.json`
+before treating an invalidated spike as an infrastructure problem.
 
 ---
 

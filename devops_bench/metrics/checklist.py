@@ -127,6 +127,7 @@ class ChecklistMetric:
 
         out: list[MetricScore] = []
         passed = 0
+        unjudged = 0
         total = len(dynamic_metrics)
         for m in dynamic_metrics:
             try:
@@ -136,15 +137,29 @@ class ChecklistMetric:
                     if ms.success:
                         passed += 1
             except Exception as e:  # noqa: BLE001 - keep scoring the rest
+                unjudged += 1
                 _log.error("Error evaluating metric %s: %s", m.name, e)
 
-        ratio = passed / total if total > 0 else 0.0
+        # A check the judge could not evaluate is not a check the agent failed,
+        # so unjudged items leave the denominator. When nothing could be judged
+        # there is no opinion to publish at all: abstain, so the composite
+        # withholds instead of reporting a zero as if it had been measured.
+        judged = total - unjudged
+        if total > 0 and judged == 0:
+            _log.error(
+                "the judge evaluated none of %d checklist item(s); withholding ChecklistScore",
+                total,
+            )
+            return out
+
+        ratio = passed / judged if judged > 0 else 0.0
+        suffix = f" ({unjudged} could not be judged)" if unjudged else ""
         out.append(
             MetricScore(
                 name="ChecklistScore",
                 score=ratio,
-                success=ratio >= CHECKLIST_THRESHOLD if total > 0 else False,
-                reason=f"Passed {passed} out of {total} checks.",
+                success=ratio >= CHECKLIST_THRESHOLD if judged > 0 else False,
+                reason=f"Passed {passed} out of {judged} evaluated checks{suffix}.",
             )
         )
         return out

@@ -16,6 +16,8 @@ For the concepts (harness vs model, capabilities, configuration), read
 | Implement `_execute(self, prompt, workspace_path=None) -> AgentResult` | your new module |
 | Register with `@AGENTS.register("<key>")` | your new module |
 | Add the module to `_BUILTIN_AGENT_MODULES` | `devops_bench/evalharness/default.py` |
+| Route agent-owned subprocesses through `run_agent_cmd`, then set `supports_sandbox = True` | your new module |
+| Ship a sandbox image for your CLI | `docker/Dockerfile.<name>` |
 
 ## Steps
 
@@ -106,7 +108,40 @@ For a CLI agent, don't re-implement capability plumbing. Reuse the helpers in
 > and the openclaw agent exports its skills dir). Wire the path/env through in
 > your harness, or the staged MCP servers and skills won't be picked up.
 
-### 7. Select it
+### 7. Put it behind the sandbox seam
+
+A harness that shells out must also work inside the agent sandbox (see
+`docs/proposals/agent-sandboxing.md` for why the boundary exists).
+The seam is one method, and the migration is mechanical:
+
+- Call `self.run_agent_cmd(argv, ..., host_run=run)` for every **agent-owned**
+  subprocess — the agent binary itself and anything executed on the agent's
+  behalf during its turn. With sandboxing off this is byte-for-byte the direct
+  `run(...)` call it replaces; with it on, the same argv executes inside the
+  run's container. Host-side plumbing deliberately stays on direct `run(...)`:
+  pre-run probes (a `--version` check), config lookups whose *result* crosses
+  as a value, and post-run artifact reads from the workspace bind mount.
+- Set `supports_sandbox = True` once every agent-owned call goes through the
+  seam. The default is `False`, and the base `run()` **refuses** to start an
+  unmigrated harness while `BENCH_AGENT_SANDBOX` is set — failing loud beats
+  silently running the agent on the host.
+- Translate any host path that crosses the boundary — in argv or in the env
+  overlay — with `sandbox.container_path(self.config.sandbox.workspace, path)`,
+  and keep the host spelling for everything you read back after the run: the
+  workspace is a bind mount, so both spellings name the same bytes. See
+  antigravity's `--gemini_dir` flag and openclaw's `OPENCLAW_STATE_DIR` for
+  the idiom.
+- The environment crosses **by value** through a deny filter: build your
+  overlay explicitly and pass it as `extra_env`. Never rely on inherited
+  `os.environ` — the container does not get it — and `HOME` / `KUBECONFIG` /
+  `PATH` are container-owned and never cross.
+- Ship `docker/Dockerfile.<name>` carrying the shared tool floor (kubectl,
+  helm, jq, git, ripgrep) with your CLI version-pinned and installed under
+  **the exact binary name the harness invokes** — inside the boundary the
+  image, not the host, resolves `argv[0]`, and package bin names do not always
+  match (npm installs openclaw's CLI as `openclaw`; the harness invokes `oc`).
+
+### 8. Select it
 
 Pick your harness with `BENCH_AGENT_TYPE=<key>` (or `--agent-type <key>`). No
 other code changes are required — the registry resolves it at run time.

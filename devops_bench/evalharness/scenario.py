@@ -38,7 +38,7 @@ from devops_bench.chaos.faults.generate_load import (
     _ENV_TARGET_NAMESPACE,
     _LOCAL_PORT,
 )
-from devops_bench.core import get_logger
+from devops_bench.core import ConfigError, get_int, get_logger
 from devops_bench.core.context import RunContext
 from devops_bench.k8s import get_resource, poll_until
 from devops_bench.verification import VerificationEntry, VerifierAgent
@@ -52,17 +52,58 @@ __all__ = [
 
 _log = get_logger("evalharness.scenario")
 
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Parse a positive integer override from the environment.
+
+    Args:
+        name: Variable to read.
+        default: Returned when the variable is unset or blank.
+
+    Returns:
+        The parsed integer.
+
+    Raises:
+        ConfigError: If the value is set but not a valid integer, or if it
+            is not strictly positive.
+    """
+    value = get_int(name, default)
+    if value is None:
+        # Unreachable: get_int only returns None when default is None, and
+        # this function always passes a non-None default.
+        return default
+    if value <= 0:
+        raise ConfigError(f"environment variable {name!r} must be a positive integer: {value!r}")
+    return value
+
+
 # Per-entry budget for a converging entry: how long a single entry's (possibly
 # nested) checks may poll before giving up. Assert-mode entries ignore this,
 # since single_shot always evaluates once with a zero budget regardless.
-VERIFICATION_TIMEOUT_SEC = 120
+#
+# WHAT THIS BUDGET IS ACTUALLY FOR. Verification only ever runs AFTER the agent
+# has exited, so the only thing still changing the cluster is Kubernetes' own
+# controllers finishing whatever the agent's last action started. That is usually
+# seconds: a rollout completing, endpoints populating, a pod going Ready. But not
+# always: image pulls, PVC binding, and rollouts that have to pull can legitimately
+# take much longer, so the default stays at 120.
+#
+# The total budget below matters more than this per-entry timeout. It bounds the
+# whole pass, and if early entries consume it the later ones are starved and
+# report "evaluation did not complete before the deadline" without having
+# meaningfully run, which reads as a failed check rather than as an unmeasured one.
+#
+# Both are overridable via BENCH_VERIFY_TIMEOUT_SEC and BENCH_VERIFY_TOTAL_BUDGET_SEC
+# for tuning without a code change. A malformed or non-positive override is
+# rejected at import with a ConfigError naming the variable.
+VERIFICATION_TIMEOUT_SEC = _positive_int_env("BENCH_VERIFY_TIMEOUT_SEC", 120)
 
 # Total wall-clock budget for the whole post-run verification pass, across
 # every entry. Without a cap, a task with many failing converge objectives
-# burns entries x VERIFICATION_TIMEOUT_SEC (12 entries x 120s is 22+ minutes);
-# this bounds the pass as a whole. Assert-mode entries still always run, since
-# a safeguard that goes unchecked defeats the point of having it.
-VERIFICATION_TOTAL_BUDGET_SEC = 600
+# burns entries x VERIFICATION_TIMEOUT_SEC; this bounds the pass as a whole.
+# Assert-mode entries still always run, since a safeguard that goes unchecked
+# defeats the point of having it.
+VERIFICATION_TOTAL_BUDGET_SEC = _positive_int_env("BENCH_VERIFY_TOTAL_BUDGET_SEC", 600)
 
 # Seconds to wait for the target Service's external LoadBalancer IP to be
 # assigned by the cloud provider's load balancer controller. LB provisioning
@@ -167,6 +208,11 @@ class ScenarioManager:
     ) -> None:
         """Inject the planned fault, then gather verification metrics.
 
+        Verification runs only when the fault actually landed. A failed
+        injection records why in ``chaos_report["verification"]`` and leaves
+        ``perf_report`` empty, so neither the check nor the derived performance
+        numbers claim an outcome for a disruption that never happened.
+
         Args:
             spec: A typed :class:`ChaosSpec` carrying the trigger, action, and
                 opaque ``verify:`` key to resolve.
@@ -199,6 +245,16 @@ class ScenarioManager:
             # it via the fault, so without this it stalls for the full
             # ``_CHAOS_ACTIVE_WAIT_SEC`` timeout before proceeding.
             self.chaos_active_event.set()
+            return
+
+        if not chaos_result.success:
+            # The planned disruption never landed, so there is nothing to
+            # verify. Running the check anyway measures an undisturbed cluster,
+            # which reads as a pass for a fault that did not happen — and the
+            # derived perf numbers would report 100% uptime under a load spike
+            # that never fired. Record the injection failure in the
+            # verification slot instead and leave ``perf_report`` empty.
+            self._record_injection_failure(spec, chaos_result)
             return
 
         if self._aborted.is_set():
@@ -236,6 +292,35 @@ class ScenarioManager:
                     "success": False,
                     "reason": f"Verification exception: {exc}",
                 }
+
+    def _record_injection_failure(self, spec: ChaosSpec, result: ChaosResult) -> None:
+        """Stamp an un-injected disruption into the report's verification slot.
+
+        Mirrors the typed :class:`~devops_bench.verification.VerificationResult`
+        dump shape used by the resolved-entry path, so downstream consumers need
+        no special-case parse — but with ``status: "error"``. The check was
+        never *observed*, which is not the same as observing it false. This is
+        the run record only; the scored report is handled separately, by the
+        harness reading ``chaos_report["status"]`` after the drain.
+
+        Args:
+            spec: The chaos spec whose injection failed.
+            result: The unsuccessful :class:`~devops_bench.chaos.ChaosResult`.
+        """
+        detail = result.error or result.output or "no detail reported"
+        reason = (
+            f"planned disruption {spec.name!r} was never injected ({detail}); "
+            "the referenced verification was not run"
+        )
+        _log.error("%s", reason)
+        with self._report_lock:
+            self.result_holder["chaos_report"]["verification"] = {
+                "success": False,
+                "status": "error",
+                "reason": reason,
+                "name": spec.verify or spec.name,
+                "injection_failed": True,
+            }
 
     def _inject_chaos(self, spec: ChaosSpec, ctx: RunContext) -> ChaosResult:
         """Wait on the trigger, then drive ``action.inject`` with the target env.

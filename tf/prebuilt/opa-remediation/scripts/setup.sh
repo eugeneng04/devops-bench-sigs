@@ -229,6 +229,12 @@ rm -rf "${WORK}"
 # Point the bare repo's HEAD at main so a plain `git clone` checks it out.
 git -c safe.bareRepository=all -C "${REPO_PATH}" symbolic-ref HEAD refs/heads/main
 
+# The agent may not be the user that provisioned. Seeding as root into a 0700
+# home, or as one uid while the agent runs as another, leaves the repo present
+# but unreadable — the agent then reconstructs an equivalent repo from live
+# cluster state and is graded on that instead.
+chmod -R a+rX "${REPO_PATH}" 2>/dev/null || true
+chmod a+x "$(dirname "${REPO_PATH}")" 2>/dev/null || true
 
 echo "==> Setup complete."
 echo "    Kyverno is auditing; violations will surface in PolicyReports:"

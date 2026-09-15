@@ -260,15 +260,46 @@ class TFDeployer(Deployer):
         self.provider.ensure_account_credentials()
         run(["tofu", "init", "-input=false"], cwd=self.work_dir, capture=False)
 
+        state_flags = self._state_flags()
         cmd = [
             "tofu",
             "apply",
             "-auto-approve",
             "-input=false",
-            *self._state_flags(),
+            *state_flags,
             *self._var_flags(),
         ]
         run(cmd, cwd=self.work_dir, capture=False)
+        self._restrict_state_permissions(state_flags)
+
+    @staticmethod
+    def _restrict_state_permissions(state_flags: list[str]) -> None:
+        """Take the state file down to owner-only after a successful apply.
+
+        The state is not just bookkeeping: a stack that seeds a task fixture
+        through a ``local_file`` resource stores that file's **full content**
+        in state. The spot-rebalancing rightsizing report lands there, and two
+        agents recovered the byte-exact report from a world-readable
+        ``terraform.tfstate`` after failing to find it at the path their prompt
+        named. It is the same class of exposure ``tf/prebuilt`` is already 0700
+        against, on a file nobody thought of as fixture material.
+
+        Best effort by design: a permissions failure must not fail a stack that
+        came up correctly, so it is logged and swallowed.
+
+        Args:
+            state_flags: The ``-state <path>`` flags used for the apply; empty
+                when OpenTofu keeps its default in-directory state.
+        """
+        if len(state_flags) < 2:
+            return
+        state_path = Path(state_flags[1])
+        for path in (state_path, state_path.with_suffix(".tfstate.backup")):
+            try:
+                if path.exists():
+                    path.chmod(0o600)
+            except OSError as exc:
+                _log.warning("could not restrict permissions on %s: %s", path, exc)
 
     def down(self) -> None:
         """Tear down the OpenTofu stack and run provider cleanup.

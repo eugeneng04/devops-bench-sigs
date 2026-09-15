@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
-from devops_bench.core import ClusterInfo, Registry
+from devops_bench.core import ClusterInfo, NetworkPlan, Registry
 
 __all__ = ["PROVIDERS", "Provider", "ResolveContext"]
 
@@ -102,6 +102,60 @@ class Provider(ABC):
         Returns:
             A new mapping with provider defaults filled in where not already set.
         """
+
+    def sandbox_network_plan(self, cluster_info: ClusterInfo) -> NetworkPlan:
+        """Describe how a sandboxed agent container reaches this cluster.
+
+        The agent-under-test can be run inside a container (see
+        :mod:`devops_bench.agents.sandbox`), and from in there the operator's
+        kubeconfig server URL is not automatically meaningful: a local cluster
+        typically publishes its apiserver on host loopback, which resolves to
+        the container itself. Only the provider knows whether its endpoint
+        already routes and, if not, what to substitute.
+
+        The default suits any cluster whose endpoint is reachable from an
+        ordinary bridge-networked container — every cloud provider, and a
+        vcluster exposed on a routable address. The sandbox additionally
+        rewrites a *loopback* server to ``host.docker.internal`` on top of
+        whatever is returned here, so a provider only overrides this when it
+        needs something that generic step cannot infer: a Docker network to
+        join, an in-network hostname, or a context pin.
+
+        Args:
+            cluster_info: The provisioned cluster to reach.
+
+        Returns:
+            The :class:`~devops_bench.core.NetworkPlan` for this cluster.
+        """
+        del cluster_info
+        return NetworkPlan()
+
+    def sandbox_cloud_credential_env(self, cluster_info: ClusterInfo) -> dict[str, str]:
+        """Mint the sandboxed agent's cloud-API credential, as env to inject.
+
+        Some tasks require cloud API calls beyond ``kubectl`` — adding a
+        Secret Manager secret version, resizing a node pool. The sandbox
+        strips the operator's ambient cloud identity by design, so those
+        calls need their own credential: a short-lived token for the narrow,
+        run-unique identity the task's stack provisioned and recorded on
+        ``cluster_info.agent_cloud_identity``.
+
+        The default is the correct answer for every task that names no such
+        identity: nothing crosses. A provider overrides this to mint for its
+        own cloud, and must fail loud when the identity is named but a
+        credential cannot be produced — an agent silently missing the
+        credential its task depends on gets graded on the wrong failure.
+
+        Args:
+            cluster_info: The provisioned cluster, carrying the agent's cloud
+                identity when the task's stack declared one.
+
+        Returns:
+            Environment variables to inject into the sandboxed agent
+            container; empty when the task declared no cloud identity.
+        """
+        del cluster_info
+        return {}
 
     def cleanup(
         self,

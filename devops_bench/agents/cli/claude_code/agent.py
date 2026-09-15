@@ -282,7 +282,17 @@ class ClaudeCodeAgent(AgentHarness):
     ``True`` for orchestrator-side capability negotiation (the Protocols are
     structural).
 
+    **Credentials.** The model credential crosses the sandbox boundary by value
+    in the env overlay (an API key, or the Vertex routing vars); the operator's
+    ADC and gcloud config never do — the deny filter drops them. A Vertex-routed
+    arm therefore needs a keyed credential to run sandboxed, since ADC is
+    exactly what the boundary withholds.
     """
+
+    # Every agent-owned subprocess here goes through run_agent_cmd. The
+    # ``--version`` probe stays a direct host call on purpose: it runs before
+    # any sandbox exists, to decide whether the binary is usable at all.
+    supports_sandbox = True
 
     def __init__(self, config: AgentConfig | None = None) -> None:
         AgentHarness.__init__(self, config)
@@ -345,13 +355,17 @@ class ClaudeCodeAgent(AgentHarness):
                 timed_out = False
                 started = time.monotonic()
                 try:
-                    completed = run(
+                    # Through the sandbox seam: containerised when
+                    # ``config.sandbox`` is set, byte-identical to the previous
+                    # direct ``run(...)`` otherwise.
+                    completed = self.run_agent_cmd(
                         argv,
                         extra_env=env_overlay,
                         cwd=workdir,
                         check=False,
                         timeout=self.config.timeout_sec,
                         input=_CLOSED_STDIN,
+                        host_run=run,
                     )
                 except SubprocessError as exc:
                     # Report a timeout as one rather than as an exit -1 that

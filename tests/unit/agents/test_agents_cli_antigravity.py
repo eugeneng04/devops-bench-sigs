@@ -17,17 +17,20 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sqlite3
 from types import SimpleNamespace
 from unittest import mock
+
+import pytest
 
 from devops_bench.agents import capabilities
 from devops_bench.agents import config as agents_config
 from devops_bench.agents.cli.antigravity import agent as agy_mod
 from devops_bench.agents.cli.antigravity import parsing
 from devops_bench.core import subprocess as devops_subprocess
-from devops_bench.core.errors import SubprocessError
+from devops_bench.core.errors import ConfigError, SubprocessError
 
 
 def _jsonl(*records: dict) -> str:
@@ -300,7 +303,7 @@ def test_parse_transcript_jsonl_marks_trailing_pending_calls_as_interrupted():
 def test_build_settings_renders_mcp_and_model():
     mcp = capabilities.McpBinding(name="gke", command=("gke-mcp", "run"))
     settings = agy_mod._build_settings(
-        (mcp,), "google/gemini-3.5-flash", "my-project", "us-east1", skills_enabled=True
+        (mcp,), "gemini-3.5-flash", "my-project", "us-east1", skills_enabled=True
     )
 
     assert settings["experimental"]["skills"] is True
@@ -316,7 +319,7 @@ def test_build_settings_renders_mcp_and_model():
 
 
 def test_build_settings_omits_skills_block_when_disabled():
-    settings = agy_mod._build_settings((), "google/gemini-3.5-flash")
+    settings = agy_mod._build_settings((), "gemini-3.5-flash")
 
     assert "experimental" not in settings
     # No mcp servers, project, or location either: only modelConfigs remains.
@@ -334,17 +337,74 @@ def test_build_env_sets_auth_and_presets():
     assert env["GEMINI_CLI_TRUST_WORKSPACE"] == "true"
     assert env["GEMINI_API_KEY"] == "secret-key"
     assert env["GOOGLE_API_KEY"] == "secret-key"
-    assert env["GEMINI_MODEL"] == "gemini-3.5-flash"
     assert env["OTEL_SDK_DISABLED"] == "true"
 
 
-def test_build_env_resolves_provider_qualified_model_name():
-    # GEMINI_MODEL must match the bare id used by --model= and modelConfigs,
-    # not the raw "provider/model" form.
+def test_build_env_does_not_set_gemini_model():
+    # GEMINI_MODEL is a Gemini CLI variable that agy ignores: setting it
+    # suggests a lever that does not exist. The model travels on --model.
     config = agents_config.AgentConfig(model="google/gemini-3.5-flash")
     env = agy_mod._build_env(config)
 
-    assert env["GEMINI_MODEL"] == "gemini-3.5-flash"
+    assert "GEMINI_MODEL" not in env
+
+
+class TestResolveModelName:
+    """agy takes an untiered slug plus --effort, and rejects Vertex spellings."""
+
+    def test_strips_provider_prefix_and_preview_suffix(self):
+        # What the matrix actually sends: one AGENT_MODEL shared with the
+        # judge, spelled for Vertex, which requires the -preview agy rejects.
+        assert agy_mod._resolve_model_name("google/gemini-3.1-pro-preview") == (
+            "gemini-3.1-pro",
+            "high",
+        )
+
+    def test_supplies_default_tier_when_id_names_none(self):
+        # agy has no untiered form; a bare slug is refused outright.
+        assert agy_mod._resolve_model_name("gemini-3.8-flash") == ("gemini-3.8-flash", "high")
+
+    def test_splits_a_tier_spelled_into_the_slug(self):
+        assert agy_mod._resolve_model_name("gemini-3.8-flash-medium") == (
+            "gemini-3.8-flash",
+            "medium",
+        )
+
+    def test_display_name_keeps_its_own_tier_and_takes_no_effort_flag(self):
+        # agy errors when --effort accompanies a parenthesised tier, so the
+        # resolver must report None rather than the default.
+        assert agy_mod._resolve_model_name("Gemini 3.1 Pro (Low)") == (
+            "Gemini 3.1 Pro (Low)",
+            None,
+        )
+
+    def test_display_name_tier_match_is_case_insensitive(self):
+        assert agy_mod._resolve_model_name("GEMINI 3.1 PRO (HIGH)") == (
+            "GEMINI 3.1 PRO (HIGH)",
+            None,
+        )
+
+
+class TestDefaultEffort:
+    """The tier is a scoring variable, so it is explicit and validated."""
+
+    def test_defaults_to_high(self, monkeypatch):
+        monkeypatch.delenv(agy_mod._EFFORT_ENV, raising=False)
+
+        assert agy_mod._default_effort() == "high"
+
+    def test_env_override_wins(self, monkeypatch):
+        monkeypatch.setenv(agy_mod._EFFORT_ENV, "Low")
+
+        assert agy_mod._default_effort() == "low"
+
+    def test_unknown_tier_is_rejected(self, monkeypatch):
+        # Fail on the typo, not seconds later on agy's own startup error in
+        # the middle of a scored arm.
+        monkeypatch.setenv(agy_mod._EFFORT_ENV, "maximum")
+
+        with pytest.raises(ConfigError, match="maximum"):
+            agy_mod._default_effort()
 
 
 @mock.patch.object(pathlib.Path, "home")
@@ -400,6 +460,100 @@ def test_agy_cli_agent_execute_flow(mock_run, mock_home, tmp_path):
     assert "--dangerously-skip-permissions" in args
     assert "--prompt=run task" in args
     assert any(a.startswith("--gemini_dir=") for a in args)
+
+
+@mock.patch.object(pathlib.Path, "home")
+def test_agy_cli_agent_sandboxed_argv_uses_container_spellings(mock_home, tmp_path, monkeypatch):
+    """Sandboxed, argv[0] must be the image's agy, never a host path.
+
+    _resolve_binary answers with a host spelling (config.target, or the
+    ~/.local/bin fallback when the operator has agy installed), and argv
+    crosses the boundary verbatim — so without the _CONTAINER_AGY_BIN swap
+    the container execs a path that only exists on the host. Same idiom as
+    openclaw's oc swap; --gemini_dir gets the same treatment.
+    """
+    from devops_bench.agents import sandbox as sandbox_mod
+
+    mock_home.return_value = tmp_path
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    config = agents_config.AgentConfig(
+        target="/bin/agy",
+        model="gemini-3.5-flash",
+        capabilities=capabilities.AllCapabilities(),
+        sandbox=sandbox_mod.SandboxSpec(image="img", workspace=str(workspace)),
+    )
+    agent = agy_mod.AgyCliAgent(config)
+
+    captured: dict[str, list[str]] = {}
+
+    def fake_run_agent_cmd(cmd, **kwargs):
+        captured["argv"] = [str(a) for a in cmd]
+        _write_sample_transcript(pathlib.Path(kwargs["cwd"]))
+        return SimpleNamespace(args=list(cmd), returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(agent, "run_agent_cmd", fake_run_agent_cmd)
+
+    result = agent._execute("run task", workspace_path=workspace)
+
+    argv = captured["argv"]
+    assert argv[0] == "agy"
+    assert "/bin/agy" not in argv
+    assert f"--gemini_dir={sandbox_mod.CONTAINER_WORKSPACE}/.gemini" in argv
+    assert result.errors == []
+
+
+@mock.patch.object(agy_mod, "_get_gcloud_location", return_value=None)
+@mock.patch.object(pathlib.Path, "home")
+@mock.patch.object(devops_subprocess, "run")
+def test_agy_cli_agent_execute_defaults_the_location_to_global(
+    mock_run, mock_home, _mock_gcloud_location, tmp_path
+):
+    # Nothing in the env chain and no gcloud default: the run must land on
+    # "global", not a region — the -preview model ids 404 on regional endpoints.
+    mock_home.return_value = tmp_path
+    mock_run.return_value = SimpleNamespace(args=["agy"], returncode=0, stdout="", stderr="")
+    mock_run.side_effect = lambda *args, **kwargs: (
+        _write_sample_transcript(kwargs.get("cwd") or tmp_path),
+        mock_run.return_value,
+    )[1]
+
+    config = agents_config.AgentConfig(target="/bin/agy", model="gemini-3.5-flash")
+    with mock.patch.dict(os.environ, {}, clear=True):
+        agy_mod.AgyCliAgent(config)._execute("run task")
+
+    overlay = mock_run.call_args.kwargs["extra_env"]
+    assert overlay["GOOGLE_CLOUD_LOCATION"] == "global"
+    assert overlay["GCP_LOCATION"] == "global"
+
+
+@mock.patch.object(agy_mod, "_get_gcloud_location", return_value="us-west9")
+@mock.patch.object(pathlib.Path, "home")
+@mock.patch.object(devops_subprocess, "run")
+def test_agy_cli_agent_execute_ignores_the_cluster_zone_for_routing(
+    mock_run, mock_home, mock_gcloud_location, tmp_path
+):
+    # GCP_LOCATION is the deployers' cluster *zone* and is not read for routing;
+    # the Vertex-specific spelling decides. The overlay still *writes* the zone
+    # spelling for agy's own GCP tooling, now carrying the routed location.
+    mock_home.return_value = tmp_path
+    mock_run.return_value = SimpleNamespace(args=["agy"], returncode=0, stdout="", stderr="")
+    mock_run.side_effect = lambda *args, **kwargs: (
+        _write_sample_transcript(kwargs.get("cwd") or tmp_path),
+        mock_run.return_value,
+    )[1]
+
+    config = agents_config.AgentConfig(target="/bin/agy", model="gemini-3.5-flash")
+    env = {"GCP_LOCATION": "us-central1-a", "GCP_VERTEX_LOCATION": "europe-west4"}
+    with mock.patch.dict(os.environ, env, clear=True):
+        agy_mod.AgyCliAgent(config)._execute("run task")
+
+    overlay = mock_run.call_args.kwargs["extra_env"]
+    assert overlay["GOOGLE_CLOUD_LOCATION"] == "europe-west4"
+    assert overlay["GCP_LOCATION"] == "europe-west4"
+    # A configured host must not pay for the gcloud subprocess at all.
+    mock_gcloud_location.assert_not_called()
 
 
 def _write_sample_transcript(

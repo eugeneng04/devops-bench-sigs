@@ -33,8 +33,14 @@ import pytest
 from devops_bench.chaos import ChaosResult, ChaosSpec
 from devops_bench.chaos.faults.generate_load import GenerateLoadFault
 from devops_bench.chaos.triggers.time_delay import TimeTrigger
+from devops_bench.core import ConfigError
 from devops_bench.core.context import RunContext
-from devops_bench.evalharness.scenario import ScenarioManager, pick_free_port
+from devops_bench.evalharness.scenario import (
+    VERIFICATION_TIMEOUT_SEC,
+    ScenarioManager,
+    _positive_int_env,
+    pick_free_port,
+)
 from devops_bench.verification import VerificationResult, VerifierAgent
 from devops_bench.verification.base import VERIFIERS, BaseVerifier
 from devops_bench.verification.spec import parse_entries
@@ -242,7 +248,7 @@ def test_scenario_resolves_verify_against_mapping() -> None:
     # ``check`` node) flowed straight to the VerifierAgent: the lookup is O(1),
     # never imports verification on the chaos side, and the entry's resolved
     # mode (converge vs assert) governs the check.
-    mock_run_entry.assert_called_once_with(verification_entry, timeout_sec=120)
+    mock_run_entry.assert_called_once_with(verification_entry, timeout_sec=VERIFICATION_TIMEOUT_SEC)
 
     chaos_report, perf_report = manager.get_reports()
     assert chaos_report["verification"]["success"] is True
@@ -628,6 +634,41 @@ def test_scenario_skips_lb_resolution_for_local_cluster() -> None:
     assert captured["env"][_ENV_TARGET_NAMESPACE] == "ns"
 
 
+def test_positive_int_env_parses_valid_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BENCH_VERIFY_TIMEOUT_SEC", "45")
+    assert _positive_int_env("BENCH_VERIFY_TIMEOUT_SEC", 120) == 45
+
+
+def test_positive_int_env_unset_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BENCH_VERIFY_TIMEOUT_SEC", raising=False)
+    assert _positive_int_env("BENCH_VERIFY_TIMEOUT_SEC", 120) == 120
+
+
+def test_positive_int_env_unset_falls_back_to_default_for_total_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("BENCH_VERIFY_TOTAL_BUDGET_SEC", raising=False)
+    assert _positive_int_env("BENCH_VERIFY_TOTAL_BUDGET_SEC", 600) == 600
+
+
+def test_positive_int_env_non_numeric_raises_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BENCH_VERIFY_TIMEOUT_SEC", "not-a-number")
+    with pytest.raises(ConfigError, match="BENCH_VERIFY_TIMEOUT_SEC"):
+        _positive_int_env("BENCH_VERIFY_TIMEOUT_SEC", 120)
+
+
+def test_positive_int_env_zero_raises_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BENCH_VERIFY_TOTAL_BUDGET_SEC", "0")
+    with pytest.raises(ConfigError, match="BENCH_VERIFY_TOTAL_BUDGET_SEC"):
+        _positive_int_env("BENCH_VERIFY_TOTAL_BUDGET_SEC", 600)
+
+
+def test_positive_int_env_negative_raises_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BENCH_VERIFY_TIMEOUT_SEC", "-5")
+    with pytest.raises(ConfigError, match="BENCH_VERIFY_TIMEOUT_SEC"):
+        _positive_int_env("BENCH_VERIFY_TIMEOUT_SEC", 120)
+
+
 @pytest.fixture(autouse=True)
 def _no_real_kubectl(monkeypatch: pytest.MonkeyPatch) -> None:
     """Guard against this file accidentally shelling out to ``kubectl``.
@@ -643,3 +684,50 @@ def _no_real_kubectl(monkeypatch: pytest.MonkeyPatch) -> None:
         raise RuntimeError("test attempted to spawn a real kubectl process")
 
     monkeypatch.setattr("devops_bench.k8s.kubectl.subprocess.Popen", _boom)
+
+
+def test_failed_injection_skips_verification_and_leaves_perf_empty() -> None:
+    """A disruption that never landed verifies nothing and reports no perf numbers.
+
+    The manager used to run the referenced check anyway. With no load actually
+    applied, the check observes a quiescent cluster and passes — recording a
+    satisfied objective, plus a derived 100% uptime and 1.0 efficiency, for a
+    spike that never fired. Nothing to disrupt means nothing to verify.
+    """
+    spec = _build_spec(verify_key="planned-verify")
+
+    def failing_inject(self, ctx, event):
+        return ChaosResult(
+            success=False,
+            injected_fault=self.type,
+            elapsed_time=0.0,
+            error="fortio not found",
+        )
+
+    with (
+        patch.object(TimeTrigger, "wait", lambda self, ctx: None),
+        patch.object(GenerateLoadFault, "inject", failing_inject),
+        patch.object(VerifierAgent, "run_entry") as mock_run_entry,
+    ):
+        manager = ScenarioManager(
+            target_deployment="dep",
+            namespace="ns",
+            verification_mapping={"planned-verify": SimpleNamespace()},
+            skip_port_forward=True,
+        )
+        manager.run_chaos_and_verification(spec, _build_ctx())
+
+    mock_run_entry.assert_not_called()
+
+    chaos_report, perf_report = manager.get_reports()
+    assert chaos_report["status"] == "failed"
+    verification = chaos_report["verification"]
+    assert verification["success"] is False
+    # "error", not "fail": the check was never observed, and the agent is not
+    # the reason the disruption did not land.
+    assert verification["status"] == "error"
+    assert verification["injection_failed"] is True
+    assert verification["name"] == "planned-verify"
+    assert "fortio not found" in verification["reason"]
+    # No vacuous 100% uptime / 1.0 efficiency for a spike that never fired.
+    assert perf_report == {}

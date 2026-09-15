@@ -28,6 +28,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shlex
 import textwrap
 import threading
@@ -57,8 +58,28 @@ _log = get_logger("chaos.generate_load")
 # active. The harness watches the shared event to coordinate measurements.
 _LOAD_MARKER = "fortio load"
 
-# Wall-clock ceiling for a single chaos command.
+# Wall-clock ceiling for a single chaos command that is not a load spike.
 _COMMAND_TIMEOUT = 40
+
+# A load spike has to outlive its own ``-t`` duration, so its ceiling is derived
+# from the command rather than fixed. The flat 40s ceiling silently killed every
+# spike a task declared for longer than that: optimize-scale asks for 300s
+# deliberately (so the spike is still running when verification starts), fortio
+# was SIGKILLed at 40s, the fault recorded exit -1, and the run was scored
+# ``chaos_invalidated`` with the reason "load did not reach the workload" — which
+# reads as unreachable rather than cut short.
+_LOAD_TIMEOUT_SLACK_SEC = 60
+_LOAD_TIMEOUT_CEILING_SEC = 900
+
+# Ceiling on the tool output handed back to the chaos model. fortio logs a line
+# per request, so a 300s spike at 300 qps returns on the order of 90k lines --
+# more than the model's whole context window, and the call fails with
+# "input token count exceeds the maximum". Nothing in the spike's own log is
+# load-bearing: the summary the model reasons about is the tail. This became
+# reachable only once spikes stopped being killed at 40s, which is why the
+# uncapped return went unnoticed.
+_MAX_TOOL_OUTPUT_CHARS = 20_000
+_HEAD_CHARS = 4_000
 
 # The workload's in-cluster (remote) port for chaos load generation, and the
 # default local side of the port-forward. Parallel runs override only the local
@@ -83,6 +104,41 @@ _ENV_LOCAL_PORT = "CHAOS_LOCAL_PORT"
 # limits) just before the spike, triggering a rolling update; without this wait
 # the port-forward can race a not-yet-Ready pod and exit early (code 1).
 _TARGET_READY_TIMEOUT_SEC = 120
+
+
+def _go_duration_seconds(value: str) -> float | None:
+    """Parse a Go-style duration (``300s``, ``5m``, ``1h30m``) into seconds.
+
+    fortio takes its ``-t`` in Go's format. Returns ``None`` for anything not
+    understood, so the caller falls back to the fixed ceiling rather than
+    inventing a budget from a value it misread.
+    """
+    parts = re.findall(r"([0-9]*\.?[0-9]+)\s*(ms|h|m|s)", value.strip())
+    if not parts:
+        return None
+    unit = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+    total = 0.0
+    for amount, suffix in parts:
+        total += float(amount) * unit[suffix]
+    return total or None
+
+
+def _command_timeout(argv: list[str], *, is_load: bool) -> float:
+    """Wall-clock ceiling for this command.
+
+    A load spike gets its declared duration plus slack (bounded), so the
+    generator is never killed mid-spike. Everything else keeps the flat
+    ceiling.
+    """
+    if not is_load:
+        return _COMMAND_TIMEOUT
+    for index, token in enumerate(argv):
+        if token == "-t" and index + 1 < len(argv):
+            declared = _go_duration_seconds(argv[index + 1])
+            if declared is None:
+                break
+            return min(declared + _LOAD_TIMEOUT_SLACK_SEC, _LOAD_TIMEOUT_CEILING_SEC)
+    return _COMMAND_TIMEOUT
 
 
 def build_system_instruction(target_url: str = _DEFAULT_TARGET_URL) -> str:
@@ -141,6 +197,27 @@ RUN_COMMAND_TOOL = SimpleNamespace(
 # TODO(#33): replace the free-form command tool with structured
 # qps / duration / concurrency parameters and a code-owned fortio argv pinned
 # to the target URL, so the model never chooses the executable or the target.
+
+
+def _clamp_tool_output(text: str) -> str:
+    """Bound a tool's output so one chatty command cannot exhaust the context.
+
+    Keeps the head (the command's own echo of what it is doing) and, weighted
+    heavier, the tail (fortio's summary), with an explicit marker in between so
+    the model is told the middle was dropped rather than silently shown a
+    truncated log.
+    """
+    if len(text) <= _MAX_TOOL_OUTPUT_CHARS:
+        return text
+    tail_chars = _MAX_TOOL_OUTPUT_CHARS - _HEAD_CHARS
+    dropped = len(text) - _MAX_TOOL_OUTPUT_CHARS
+    return (
+        text[:_HEAD_CHARS]
+        + f"\n\n... [{dropped} characters elided by the harness: a load generator "
+        f"logs per request, and the summary below is what matters] ...\n\n" + text[-tail_chars:]
+    )
+
+
 def run_chaos_command(
     command: str,
     chaos_active_event: threading.Event | None = None,
@@ -199,14 +276,15 @@ def run_chaos_command(
             _log.info("load spike detected; signaling harness via chaos event")
             chaos_active_event.set()
 
-        completed = run(argv, check=False, timeout=_COMMAND_TIMEOUT)
+        completed = run(argv, check=False, timeout=_command_timeout(argv, is_load=is_load))
         if is_load and load_result is not None:
             # Record the spike's real exit status so the fault can fail closed:
             # a non-zero fortio exit means it could not reach the workload.
             load_result["attempted"] = True
             load_result["returncode"] = completed.returncode
             load_result["ok"] = completed.returncode == 0
-        return f"Stdout:\n{completed.stdout}\nStderr:\n{completed.stderr}"
+        combined = f"Stdout:\n{completed.stdout}\nStderr:\n{completed.stderr}"
+        return _clamp_tool_output(combined)
     except Exception as exc:  # noqa: BLE001 - surface any failure back to the LLM
         if is_load and load_result is not None:
             load_result["attempted"] = True

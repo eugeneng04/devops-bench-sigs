@@ -45,6 +45,7 @@ from devops_bench.agents.cli.openclaw.agent import (
     _oc_model_id,
 )
 from devops_bench.agents.cli.openclaw.parsing import _pick_session_key, _strip_ansi
+from devops_bench.agents.sandbox import SandboxSpec
 from devops_bench.core.errors import ConfigError, SubprocessError
 
 
@@ -390,6 +391,81 @@ def test_parse_trajectory_export_output_falls_back_to_assistant_message() -> Non
     assert export.output == "done."
 
 
+def test_parse_trajectory_export_placeholder_final_text_falls_back() -> None:
+    """A redacted final answer engages the assistant.message fallback.
+
+    The live shape from run_20260911_172304: oc's sanitizer stored
+    ``[Malformed diagnostic JSON redacted]`` over the final message in its own
+    sqlite before the harness read it. The placeholder must not become the
+    graded output when the real text still rides on an assistant.message.
+    """
+    blob = _events(
+        {
+            "type": "assistant.message",
+            "data": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Deployed hello-app; 3/3 pods Ready."}],
+                }
+            },
+        },
+        {
+            "type": "model.completed",
+            "data": {
+                "usage": {"input": 1, "output": 2},
+                "assistantTexts": ["[Malformed diagnostic JSON redacted]"],
+            },
+        },
+    )
+    export = parse_trajectory_export(blob)
+    assert export.errors == []
+    assert export.output == "Deployed hello-app; 3/3 pods Ready."
+
+
+def test_parse_trajectory_export_placeholder_does_not_clobber_an_earlier_turn() -> None:
+    """A redacted last turn leaves the previous turn's real assistantTexts standing."""
+    blob = _events(
+        {"type": "model.completed", "data": {"assistantTexts": ["Applying the manifest now."]}},
+        {
+            "type": "model.completed",
+            "data": {"assistantTexts": ["[Oversized diagnostic JSON redacted]"]},
+        },
+    )
+    assert parse_trajectory_export(blob).output == "Applying the manifest now."
+
+
+def test_parse_trajectory_export_placeholder_assistant_message_is_not_recovered() -> None:
+    """The fallback skips redacted assistant.messages instead of returning them.
+
+    When every source is a placeholder the parser returns ``""``, which is the
+    shape the scoring layer's missing-answer rule keys on — better an empty
+    output than a judge grading the sanitizer's stand-in.
+    """
+    blob = _events(
+        {
+            "type": "assistant.message",
+            "data": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "[Malformed diagnostic JSON redacted]"}],
+                }
+            },
+        },
+        {
+            "type": "model.completed",
+            "data": {"assistantTexts": ["[Malformed diagnostic JSON redacted]"]},
+        },
+    )
+    assert parse_trajectory_export(blob).output == ""
+
+
+def test_parse_trajectory_export_answer_quoting_a_placeholder_is_kept() -> None:
+    """Only a whole-string placeholder is dropped; an answer about one survives."""
+    text = "Retried after seeing '[Malformed diagnostic JSON redacted]' in the log; done."
+    blob = _events({"type": "model.completed", "data": {"assistantTexts": [text]}})
+    assert parse_trajectory_export(blob).output == text
+
+
 def test_parse_trajectory_export_surfaces_decode_errors() -> None:
     blob = "{not json}\n" + json.dumps(_tool_call("1", "x", {})) + "\n"
     export = parse_trajectory_export(blob)
@@ -632,6 +708,121 @@ def test_execute_falls_back_to_stdout_when_bundle_has_no_answer(
 
     result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("p")
     assert result.output == "bare stdout answer"
+
+
+def test_oc_version_probe_parses_a_prerelease_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ``__wrapped__`` bypasses the @cache so the fake run is actually hit.
+    monkeypatch.setattr(
+        oc_mod, "run", lambda argv, **kw: _make_subprocess_result("2026.9.1-beta.1\n", "", 0)
+    )
+    assert oc_mod._host_oc_version.__wrapped__("oc") == "2026.9.1-beta.1"
+    assert oc_mod._image_oc_version.__wrapped__("img") == "2026.9.1-beta.1"
+
+
+def _raise_oserror(argv, **kw):
+    raise OSError("docker not installed")
+
+
+def test_oc_version_probe_is_inconclusive_on_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A wrapper without a --version surface, or a docker failure, must yield
+    # None (probe inconclusive) rather than raising — refusing to run on a
+    # failed probe would be worse than the risk it guards.
+    monkeypatch.setattr(
+        oc_mod, "run", lambda argv, **kw: _make_subprocess_result("no version here", "", 1)
+    )
+    assert oc_mod._host_oc_version.__wrapped__("oc-a") is None
+    monkeypatch.setattr(oc_mod, "run", _raise_oserror)
+    assert oc_mod._image_oc_version.__wrapped__("img-a") is None
+
+
+def test_oc_version_skew_names_both_versions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(oc_mod, "_host_oc_version", lambda b: "2026.8.2")
+    monkeypatch.setattr(oc_mod, "_image_oc_version", lambda i: "2026.9.1-beta.1")
+    skew = oc_mod._oc_version_skew("oc", "img")
+    assert skew is not None
+    assert "2026.8.2" in skew
+    assert "2026.9.1-beta.1" in skew
+
+
+def test_oc_version_skew_silent_on_match_or_inconclusive_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(oc_mod, "_host_oc_version", lambda b: "2026.9.1-beta.1")
+    monkeypatch.setattr(oc_mod, "_image_oc_version", lambda i: "2026.9.1-beta.1")
+    assert oc_mod._oc_version_skew("oc", "img") is None
+    monkeypatch.setattr(oc_mod, "_host_oc_version", lambda b: None)
+    assert oc_mod._oc_version_skew("oc", "img") is None
+
+
+def test_execute_fails_fast_on_sandboxed_version_skew(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A skewed host/image oc pair errors before the agent turn ever launches.
+
+    The live failure this guards: the run itself succeeded, but the post-run
+    export refused the container-written session store ("written by version
+    2026.9.1-beta.1, but this command is running 2026.8.2"), burning a full
+    cluster spin-up to produce an empty trajectory stamped success.
+    """
+    monkeypatch.setattr(oc_mod, "_oc_version_skew", lambda b, i: "oc version skew: boom")
+
+    def never_run(argv, **kw):
+        raise AssertionError("the agent turn must not launch on a skewed pair")
+
+    monkeypatch.setattr(oc_mod, "run", never_run)
+    agent = OpenClawAgent(
+        AgentConfig(target=str(tmp_path / "oc"), sandbox=SandboxSpec(image="img"))
+    )
+    result = agent._execute("p")
+    assert result.has_errors()
+    assert any("version skew" in e for e in result.errors)
+    assert result.trajectory == []
+
+
+def test_execute_unsandboxed_skips_the_version_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def never_probe(b, i):
+        raise AssertionError("no sandbox image, so nothing to compare against")
+
+    monkeypatch.setattr(oc_mod, "_oc_version_skew", never_probe)
+    _install_oc_run(
+        monkeypatch,
+        lambda *a, **k: _make_subprocess_result("OK\n", "", 0),
+        _bundle_writer(SAMPLE_EVENTS),
+    )
+    result = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("p")
+    assert result.errors == []
+
+
+def test_execute_keeps_the_export_bundle_in_a_harness_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The raw events.jsonl survives the run when the harness owns the workspace.
+
+    Exported into the run workdir (not a throwaway temp dir), the bundle's
+    lifetime follows the workspace's, and the harness's existing workspace
+    diff carries it into the run's generated_files. The first observed
+    oc-side redaction could not be root-caused because the bundle had died
+    with the temp dir this replaces.
+    """
+    _install_oc_run(
+        monkeypatch,
+        lambda *a, **k: _make_subprocess_result("OK\n", "", 0),
+        _bundle_writer(SAMPLE_EVENTS),
+    )
+    workspace = tmp_path / "run-ws"
+    workspace.mkdir()
+
+    agent = OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), timeout_sec=30.0))
+    result = agent._execute("audit pods", workspace_path=workspace)
+
+    assert result.output == "All pods healthy."
+    bundles = list((workspace / ".openclaw" / "trajectory-exports").rglob("events.jsonl"))
+    assert len(bundles) == 1
+    assert json.loads(bundles[0].read_text().splitlines()[0])["type"] == "tool.call"
 
 
 def test_execute_records_when_sessions_returns_no_rows(
@@ -913,19 +1104,11 @@ def test_execute_does_not_prepend_rules_when_empty(
 def test_build_openclaw_config_wraps_servers_under_mcp() -> None:
     """A launchable binding renders under the ``mcp.servers`` config path."""
     cfg = _build_openclaw_config(AgentConfig(), (McpBinding(name="gke", command=("gke-mcp",)),))
-    assert cfg == {"mcp": {"servers": {"gke": {"command": "gke-mcp"}}}}
-
-
-def test_build_openclaw_config_empty_without_launchable_server_or_override() -> None:
-    """No MCP binding and a catalog-known model → empty config (caller skips)."""
-    assert _build_openclaw_config(AgentConfig(), ()) == {}
-    assert (
-        _build_openclaw_config(
-            AgentConfig(model="gemini-3.1-pro-preview"),
-            (McpBinding(name="b", command=(), tools=("t",)),),
-        )
-        == {}
-    )
+    assert cfg == {
+        "mcp": {"servers": {"gke": {"command": "gke-mcp"}}},
+        "tools": {"codeMode": False, "deny": ["sessions_spawn", "sessions_yield"]},
+        "memory": {"search": {"enabled": False}},
+    }
 
 
 def test_build_openclaw_config_merges_mcp_and_model_override() -> None:
@@ -1064,33 +1247,11 @@ def test_execute_writes_mcp_servers_into_isolated_config(
     )
     OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"), capabilities=caps)).run("p")
     assert captured["cfg_path"], "OPENCLAW_CONFIG_PATH must be set when MCP is bound"
-    assert captured["config"] == {"mcp": {"servers": {"gke": {"command": "gke-mcp"}}}}
-
-
-def test_execute_writes_no_config_when_no_launchable_server(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """No command-bearing MCP binding and a catalog-known model → no isolated
-    config, env var unset."""
-    captured: dict = {}
-
-    def fake_bash(cmd, **kwargs):
-        env = kwargs.get("extra_env") or {}
-        captured["has_cfg"] = "OPENCLAW_CONFIG_PATH" in env
-        return _make_subprocess_result(stdout="ok", returncode=0)
-
-    _install_oc_run(monkeypatch, fake_bash, _empty_sessions_run)
-    caps = AllCapabilities(
-        mcp_servers=(McpBinding(name="builtin", command=(), tools=("alpha",)),),
-    )
-    OpenClawAgent(
-        AgentConfig(
-            target=str(tmp_path / "oc"),
-            model="gemini-3.1-pro-preview",
-            capabilities=caps,
-        )
-    ).run("p")
-    assert captured["has_cfg"] is False
+    assert captured["config"] == {
+        "mcp": {"servers": {"gke": {"command": "gke-mcp"}}},
+        "tools": {"codeMode": False, "deny": ["sessions_spawn", "sessions_yield"]},
+        "memory": {"search": {"enabled": False}},
+    }
 
 
 def test_execute_writes_model_override_config_without_mcp(
@@ -1226,3 +1387,379 @@ def test_execute_cleans_up_temp_working_dir_after_run(
     OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("p")
     assert captured["cwd"] is not None
     assert not os.path.exists(captured["cwd"])
+
+
+def test_build_openclaw_config_carries_only_code_mode_without_launchable_server_or_override() -> (
+    None
+):
+    """No MCP binding and a catalog-known model → only ``tools.codeMode``/``deny``."""
+    expected = {
+        "tools": {"codeMode": False, "deny": ["sessions_spawn", "sessions_yield"]},
+        "memory": {"search": {"enabled": False}},
+    }
+    assert _build_openclaw_config(AgentConfig(), ()) == expected
+    assert (
+        _build_openclaw_config(
+            AgentConfig(model="gemini-3.1-pro-preview"),
+            (McpBinding(name="b", command=(), tools=("t",)),),
+        )
+        == expected
+    )
+
+
+def test_build_openclaw_config_defaults_code_mode_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("BENCH_OPENCLAW_CODE_MODE", raising=False)
+    payload = _build_openclaw_config(AgentConfig(), ())
+    assert payload["tools"]["codeMode"] is False
+
+
+def test_build_openclaw_config_honors_code_mode_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BENCH_OPENCLAW_CODE_MODE", "1")
+    payload = _build_openclaw_config(AgentConfig(), ())
+    assert payload["tools"]["codeMode"] is True
+
+
+def test_build_openclaw_config_denies_delegation_tools() -> None:
+    """sessions_spawn/sessions_yield are denied regardless of provider: the bench
+    always runs embedded (``oc agent --local``), so a delegated subagent's
+    completion never arrives and the run would end having done no work."""
+    cfg = _build_openclaw_config(AgentConfig(), ())
+    assert set(cfg["tools"]["deny"]) == {"sessions_spawn", "sessions_yield"}
+
+
+def test_build_openclaw_config_deny_does_not_clobber_code_mode() -> None:
+    """The deny list coexists with ``tools.codeMode``; neither overwrites the other."""
+    cfg = _build_openclaw_config(AgentConfig(), ())
+    assert cfg["tools"] == {
+        "codeMode": False,
+        "deny": ["sessions_spawn", "sessions_yield"],
+    }
+
+
+def test_build_openclaw_config_pins_openai_to_builtin_agent_runtime() -> None:
+    """openai provider gets an explicit agentRuntime so oc skips the codex route."""
+    cfg = _build_openclaw_config(AgentConfig(model="gpt-5.6-sol", provider="openai"), ())
+    assert cfg["models"]["providers"]["openai"]["agentRuntime"] == {"id": "openclaw"}
+
+
+def test_build_openclaw_config_omits_agent_runtime_for_non_openai_provider() -> None:
+    """A gemini/google-vertex config gets no agentRuntime override; it's inert today."""
+    cfg = _build_openclaw_config(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"), ())
+    assert "models" not in cfg or "openai" not in cfg["models"].get("providers", {})
+
+
+def test_build_openclaw_config_agent_runtime_does_not_clobber_model_override() -> None:
+    """The openai agentRuntime merge coexists with a catalog override for another provider."""
+    cfg = _build_openclaw_config(AgentConfig(model="gemini-3.5-flash", provider="google"), ())
+    assert cfg["models"]["providers"]["google"]["models"] == [
+        {"id": "gemini-3.5-flash", "name": "gemini-3.5-flash"}
+    ]
+    assert "openai" not in cfg["models"]["providers"]
+
+
+def test_build_openclaw_config_pins_openai_runtime_for_full_model_id() -> None:
+    """A full ``openai/...`` id selects the openai runtime with no explicit
+    provider set. Reading ``config.provider`` alone resolves to the default
+    provider, drops the pin, and lets oc route the run to the absent codex
+    runtime."""
+    cfg = _build_openclaw_config(AgentConfig(model="openai/gpt-5.6-sol"), ())
+    assert cfg["models"]["providers"]["openai"]["agentRuntime"] == {"id": "openclaw"}
+
+
+# ---------------------------------------------------------------------------
+# Model catalog override: models oc doesn't ship by default get registered in
+# the per-run isolated config, for both google-genai and google-vertex.
+# ---------------------------------------------------------------------------
+
+
+def test_build_openclaw_config_disables_memory_search() -> None:
+    """openclaw 2026.8.x enables memory search by default, which both calls an
+    OpenAI embeddings endpoint the run never selected and lets one run recall a
+    previous run of the same task. A benchmark run must be stateless."""
+    payload = _build_openclaw_config(AgentConfig(), ())
+    assert payload["memory"] == {"search": {"enabled": False}}
+
+
+def test_execute_writes_code_mode_config_when_no_launchable_server(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No command-bearing MCP binding and a catalog-known model → the isolated
+    config still carries ``tools.codeMode``, so the env var is still set."""
+    captured: dict = {}
+
+    def fake_bash(cmd: str, **kwargs: Any) -> SimpleNamespace:
+        env = kwargs.get("extra_env") or {}
+        cfg_path = env.get("OPENCLAW_CONFIG_PATH")
+        captured["cfg_path"] = cfg_path
+        captured["config"] = (
+            json.loads(Path(cfg_path).read_text()) if cfg_path and Path(cfg_path).exists() else None
+        )
+        return _make_subprocess_result(stdout="ok", returncode=0)
+
+    _install_oc_run(monkeypatch, fake_bash, _empty_sessions_run)
+    caps = AllCapabilities(
+        mcp_servers=(McpBinding(name="builtin", command=(), tools=("alpha",)),),
+    )
+    OpenClawAgent(
+        AgentConfig(
+            target=str(tmp_path / "oc"),
+            model="gemini-3.1-pro-preview",
+            capabilities=caps,
+        )
+    ).run("p")
+    assert captured["cfg_path"]
+    assert captured["config"] == {
+        "tools": {"codeMode": False, "deny": ["sessions_spawn", "sessions_yield"]},
+        "memory": {"search": {"enabled": False}},
+    }
+
+
+def test_native_openai_key_crosses_explicit_overlay(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    assert _build_env(AgentConfig(provider="openai"))["OPENAI_API_KEY"] == "test-key"
+
+
+@pytest.mark.parametrize(
+    "model,provider",
+    [("gemini-3.7-flash", "google-vertex"), ("claude-sonnet-5", "anthropic-vertex")],
+)
+def test_fleet_models_registered(model: str, provider: str) -> None:
+    assert (
+        _build_model_override(AgentConfig(model=model, provider=provider))["models"]["providers"][
+            provider
+        ]["models"][0]["id"]
+        == model
+    )
+
+
+def test_vertex_auth_profile_seeded_for_headless_run() -> None:
+    command = oc_mod._build_local_command(
+        AgentConfig(provider="anthropic-vertex"), "hi", "operator", "oc"
+    )
+    assert "models auth paste-api-key --provider anthropic-vertex --agent operator" in command
+    assert oc_mod._VERTEX_CREDENTIALS_MARKER in command
+
+
+def test_vertex_auth_profile_seeded_for_keyless_google_vertex() -> None:
+    # oc's per-agent auth store gates every provider, not just the plugin one:
+    # a keyless google-vertex run aborts with the same ProviderAuthError until
+    # the marker profile exists.
+    command = oc_mod._build_local_command(
+        AgentConfig(provider="google-vertex"), "hi", "operator", "oc"
+    )
+    assert "models auth paste-api-key --provider google-vertex --agent operator" in command
+
+
+def test_vertex_auth_profile_skipped_for_a_keyed_run() -> None:
+    # A real key is already in the config oc reads; seeding the marker on top
+    # would shadow it.
+    command = oc_mod._build_local_command(
+        AgentConfig(provider="google-vertex", api_key="k"), "hi", "operator", "oc"
+    )
+    assert "paste-api-key" not in command
+
+
+def test_vertex_auth_profile_skipped_for_a_non_vertex_provider() -> None:
+    command = oc_mod._build_local_command(AgentConfig(provider="google"), "hi", "operator", "oc")
+    assert "paste-api-key" not in command
+
+
+def test_sandbox_vertex_overlay_uses_metadata_without_host_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/private/host.json")
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", lambda spec, *, project=None: {})
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="anthropic-vertex"), tmp_path)
+    assert overlay["GOOGLE_CLOUD_PROJECT"] == "test-project"
+    assert overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] == "1"
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in overlay
+    assert (tmp_path / "node-fetch-shim" / "register.mjs").is_file()
+
+
+def test_sandbox_provider_env_vertex_injects_the_metadata_emulator_vars(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Inside the sandbox there is no ADC and the real metadata endpoint is
+    # blocked, so the backend's mint-and-inject recipe supplies the credential.
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
+    seen: dict = {}
+
+    def fake_recipe(spec, *, project=None):
+        seen["backend"] = spec.backend
+        seen["project"] = project
+        return {
+            "GCE_METADATA_HOST": "host.docker.internal:41235",
+            "GCE_METADATA_IP": "host.docker.internal:41235",
+            "METADATA_SERVER_DETECTION": "assume-present",
+        }
+
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", fake_recipe)
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="google-vertex"), tmp_path)
+
+    assert seen == {"backend": "vertex", "project": "proj-a"}
+    assert overlay["GCE_METADATA_HOST"] == "host.docker.internal:41235"
+    assert overlay["GCE_METADATA_IP"] == "host.docker.internal:41235"
+    assert overlay["METADATA_SERVER_DETECTION"] == "assume-present"
+    # The recipe rides alongside the routing vars, it does not replace them.
+    assert overlay["GOOGLE_CLOUD_PROJECT"] == "proj-a"
+
+
+def test_sandbox_provider_env_anthropic_vertex_gets_the_recipe_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # anthropic-vertex shares the vertex backend, and the project falls back to
+    # the GCP_PROJECT_ID spelling the forwarding block reads.
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.setenv("GCP_PROJECT_ID", "proj-b")
+    seen: dict = {}
+
+    def fake_recipe(spec, *, project=None):
+        seen["backend"] = spec.backend
+        seen["project"] = project
+        return {"GCE_METADATA_HOST": "host.docker.internal:41235"}
+
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", fake_recipe)
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="anthropic-vertex"), tmp_path)
+
+    assert seen == {"backend": "vertex", "project": "proj-b"}
+    assert overlay["GCE_METADATA_HOST"] == "host.docker.internal:41235"
+    assert overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] == "1"
+
+
+def test_sandbox_provider_env_non_vertex_asks_for_no_model_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A key-based provider carries its own credential across the boundary.
+    monkeypatch.setattr(
+        oc_mod,
+        "sandbox_credential_env",
+        lambda *a, **k: pytest.fail("sandbox_credential_env called for a key-based provider"),
+    )
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="google"), tmp_path)
+    assert not {"GCE_METADATA_HOST", "GCE_METADATA_IP", "METADATA_SERVER_DETECTION"} & set(overlay)
+
+
+def test_sandbox_provider_env_keyed_vertex_skips_the_recipe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A sandboxed google-vertex run with an explicit key was a working
+    # configuration before the recipe existed (the key rides
+    # GOOGLE_CLOUD_API_KEY via _build_env); it must not start requiring
+    # BENCH_VERTEX_SANDBOX_SA.
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
+    monkeypatch.setattr(
+        oc_mod,
+        "sandbox_credential_env",
+        lambda *a, **k: pytest.fail("sandbox_credential_env called for a keyed run"),
+    )
+    overlay = oc_mod._sandbox_provider_env(
+        AgentConfig(provider="google-vertex", api_key="k"), tmp_path
+    )
+    assert not {"GCE_METADATA_HOST", "GCE_METADATA_IP", "METADATA_SERVER_DETECTION"} & set(overlay)
+
+
+def test_sandbox_provider_env_vertex_defaults_the_location(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # oc aborts with "Vertex AI requires a location" when neither spelling is
+    # set on the host, which forwarding alone cannot fix.
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.delenv("GCP_VERTEX_LOCATION", raising=False)
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", lambda spec, *, project=None: {})
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="google-vertex"), tmp_path)
+    assert overlay["GOOGLE_CLOUD_LOCATION"] == "global"
+
+
+def test_sandbox_provider_env_vertex_keeps_an_explicit_location(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Assigning unconditionally is not a clobber: vertex_location() reads
+    # GOOGLE_CLOUD_LOCATION first, so a forwarded value resolves to itself.
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "us-east5")
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", lambda spec, *, project=None: {})
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="google-vertex"), tmp_path)
+    assert overlay["GOOGLE_CLOUD_LOCATION"] == "us-east5"
+
+
+def test_sandbox_provider_env_vertex_reads_the_alternate_location_spelling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.setenv("GCP_VERTEX_LOCATION", "europe-west4")
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", lambda spec, *, project=None: {})
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="google-vertex"), tmp_path)
+    assert overlay["GOOGLE_CLOUD_LOCATION"] == "europe-west4"
+
+
+def test_sandbox_provider_env_keyed_vertex_still_gets_a_location(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The location is a routing fact, not a credential: a keyed run needs it
+    # just as much, and skips only the emulator recipe.
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.delenv("GCP_VERTEX_LOCATION", raising=False)
+    overlay = oc_mod._sandbox_provider_env(
+        AgentConfig(provider="google-vertex", api_key="k"), tmp_path
+    )
+    assert overlay["GOOGLE_CLOUD_LOCATION"] == "global"
+
+
+def test_sandbox_provider_env_non_vertex_invents_no_location(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A google-genai run resolves its endpoint from the API key, not a region.
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.delenv("GCP_VERTEX_LOCATION", raising=False)
+    overlay = oc_mod._sandbox_provider_env(AgentConfig(provider="google"), tmp_path)
+    assert "GOOGLE_CLOUD_LOCATION" not in overlay
+
+
+def test_execute_unsandboxed_vertex_asks_for_no_model_credential(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Flag off keeps its own credentials: the host process has ADC of its own,
+    # so the recipe is not consulted and no emulator is started. (The auth
+    # profile *is* seeded on this path -- oc's store gates it there too -- see
+    # test_vertex_auth_profile_seeded_for_keyless_google_vertex.)
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
+    monkeypatch.setattr(
+        oc_mod,
+        "sandbox_credential_env",
+        lambda *a, **k: pytest.fail("sandbox_credential_env called on an unsandboxed run"),
+    )
+    captured: dict = {}
+
+    def fake_bash(cmd, **kwargs):
+        captured["env"] = kwargs.get("extra_env") or {}
+        return _make_subprocess_result(stdout="ok", returncode=0)
+
+    _install_oc_run(monkeypatch, fake_bash, _empty_sessions_run)
+    cfg = AgentConfig(target=str(tmp_path / "oc"), provider="google-vertex")
+    OpenClawAgent(cfg).run("p")
+    assert not {"GCE_METADATA_HOST", "GCE_METADATA_IP", "METADATA_SERVER_DETECTION"} & set(
+        captured["env"]
+    )
+
+
+@pytest.mark.parametrize(
+    "model,provider,transport",
+    [
+        ("gemini-3.8-flash", "google", "google-generative-ai"),
+        ("gemini-3.8-flash", "google-vertex", "google-vertex"),
+        ("claude-fable-5-1", "anthropic-vertex", "anthropic-messages"),
+    ],
+)
+def test_latest_models_have_per_run_catalog_and_transport(
+    model: str, provider: str, transport: str
+) -> None:
+    override = _build_model_override(AgentConfig(model=model, provider=provider))
+    entry = override["models"]["providers"][provider]
+    assert entry["models"] == [{"id": model, "name": model}]
+    assert entry["api"] == transport
+    assert override["agents"]["defaults"]["models"] == {f"{provider}/{model}": {}}
