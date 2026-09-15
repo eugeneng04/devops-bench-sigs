@@ -191,6 +191,7 @@ def test_build_rows_success_record():
         "correctnessScore": None,
         "recoverableSafetyScore": None,
         "catastrophic": False,
+        "catastrophicKinds": [],
         "scoringVersion": "",
         "toolScore": 0.7,
         "latencySec": 42.5,
@@ -244,6 +245,7 @@ def test_build_rows_flags_catastrophic_and_zeroed_outcome() -> None:
     d = build_rows([record], _manifest())[0].to_dict()
 
     assert d["catastrophic"] is True
+    assert d["catastrophicKinds"] == ["VerificationCatastrophic"]
     assert d["outcomeScore"] == 0.0
     assert d["correctnessScore"] == 1.0
 
@@ -270,7 +272,28 @@ def test_build_rows_flags_an_integrity_catastrophic() -> None:
     d = build_rows([record], _manifest())[0].to_dict()
 
     assert d["catastrophic"] is True
+    assert d["catastrophicKinds"] == ["IntegrityCatastrophic"]
     assert d["outcomeScore"] == 0.0
+
+
+def test_build_rows_lists_both_kinds_when_both_gates_fire() -> None:
+    # ``catastrophicKinds`` is a list precisely because the gates are not
+    # mutually exclusive: one run can trip a task safeguard *and* cheat.
+    record = {
+        "name": "Nuked prod and read the answer key",
+        "folder": "task_x",
+        "status": "success",
+        "scores": {
+            "OutcomeScore": {"score": 0.0, "version": "v1", "reason": "cat_v=0"},
+            "VerificationCatastrophic": {"score": 0.0, "success": False, "reason": "1 fired"},
+            "IntegrityCatastrophic": {"score": 0.0, "success": False, "reason": "flagged"},
+        },
+    }
+
+    d = build_rows([record], _manifest())[0].to_dict()
+
+    assert d["catastrophic"] is True
+    assert d["catastrophicKinds"] == ["VerificationCatastrophic", "IntegrityCatastrophic"]
 
 
 def test_build_rows_correctness_falls_back_to_outcome_validity() -> None:
@@ -336,8 +359,9 @@ def test_result_row_keys_match_typescript_interface():
 
     NOTE: the scoring-framework v1 fields (``correctnessScore`` /
     ``recoverableSafetyScore`` / ``catastrophic`` / ``scoringVersion``, and the
-    ``outcomeScore`` re-semantics) are produced here first; the TS interface and
-    the ingest validators are updated in the frontend-phase rollout.
+    ``outcomeScore`` re-semantics) and ``catastrophicKinds`` are produced here
+    first; the TS interface and the ingest validators are updated in the
+    frontend-phase rollout.
     """
     ts_result_row_fields = {
         "setupId",
@@ -354,6 +378,7 @@ def test_result_row_keys_match_typescript_interface():
         "correctnessScore",
         "recoverableSafetyScore",
         "catastrophic",
+        "catastrophicKinds",
         "scoringVersion",
         "toolScore",
         "latencySec",
