@@ -45,7 +45,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from devops_bench.agents.result import ToolCall, empty_tokens
-from devops_bench.agents.shared.telemetry import ParsedRun, note_model
+from devops_bench.agents.shared.telemetry import ParsedRun, int_or_none, note_model
 from devops_bench.agents.shared.timing import merged_span_sec, parse_event_time
 
 __all__: list[str] = ["parse_event_stream"]
@@ -59,11 +59,6 @@ _USAGE_FIELDS: dict[str, str] = {
     "thoughts_token_count": "reasoning",
     "total_token_count": "total",
 }
-
-
-def _int_or_none(value: object) -> int | None:
-    """Coerce to ``int``, rejecting ``bool`` (a JSON ``true`` is not a count)."""
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _parts(event: Mapping[str, Any]) -> list[Any]:
@@ -131,7 +126,7 @@ def _accumulate_usage(usage: Any, sums: dict[str, int], seen: set[str]) -> None:
     if not isinstance(usage, Mapping):
         return
     for field, slot in _USAGE_FIELDS.items():
-        count = _int_or_none(usage.get(field))
+        count = int_or_none(usage.get(field))
         if count is None:
             continue
         sums[slot] = sums.get(slot, 0) + count

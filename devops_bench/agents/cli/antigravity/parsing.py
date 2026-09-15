@@ -288,14 +288,8 @@ def _parse_old_session_jsonl(jsonl_text: str) -> tuple[str, list[dict], dict, li
     return output, [call.to_dict() for call in trajectory], aggregated_tokens, errors
 
 
-# Harness-local until the unified token schema lands: input = non-cached prompt,
-# cached = cache reads, output excludes reasoning, total = sum of all buckets.
-_TOKEN_BUCKETS = ("input", "cached", "cache_write", "reasoning", "output", "total")
-
-
-def empty_tokens() -> dict:
-    """Return the canonical token dict with every bucket ``None`` (unavailable)."""
-    return dict.fromkeys(_TOKEN_BUCKETS, None)
+#: Re-exported so a new canonical bucket reaches this harness for free.
+empty_tokens = agents_result.empty_tokens
 
 
 # --- Token usage from the conversation DB ----------------------------------

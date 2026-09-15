@@ -34,6 +34,8 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
+from devops_bench.agents.result import TerminalReason
+
 __all__ = ["SCHEMA_VERSION", "Manifest", "ResultRow"]
 
 #: Version of the ``rows.json`` / ``manifest.json`` contract. Bump on any
@@ -218,7 +220,7 @@ class ResultRow(BaseModel):
     cache_write_tokens: int | None = None
     total_tokens: int | None = None
     status: str
-    terminal_reason: str = ""
+    terminal_reason: TerminalReason = ""
     timeout_sec: float | None = None
     validated: bool = False
 

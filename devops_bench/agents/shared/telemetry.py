@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import dataclasses
 
-__all__ = ["ParsedRun", "note_model"]
+from devops_bench.agents.result import AgentResult, TerminalReason
+
+__all__ = ["ParsedRun", "int_or_none", "note_model"]
 
 
 @dataclasses.dataclass(slots=True)
@@ -59,7 +61,43 @@ class ParsedRun:
     tool_wait_sec: float | None = None
     served_models: list[str] = dataclasses.field(default_factory=list)
     model_turns: int | None = None
-    terminal_reason: str = ""
+    terminal_reason: TerminalReason = ""
+
+    def to_result(
+        self,
+        *,
+        latency: float,
+        terminal_reason: TerminalReason,
+        output: str | None = None,
+        errors: list[str] | None = None,
+        metadata: dict | None = None,
+    ) -> AgentResult:
+        """Carry this run's telemetry onto an :class:`AgentResult`.
+
+        Every harness ends its ``run`` this way, so a new telemetry column is
+        wired through once here instead of once per harness. ``output``,
+        ``errors`` and ``metadata`` override the parsed values with what the
+        harness resolved -- a fallback answer, its own errors, the exit code --
+        and the rest is passed through unchanged. ``terminal_reason`` is always
+        the harness's call: only it knows whether it killed the process.
+        """
+        return AgentResult(
+            output=self.output if output is None else output,
+            trajectory=self.trajectory,
+            tokens=self.tokens,
+            latency=latency,
+            errors=self.errors if errors is None else errors,
+            terminal_reason=terminal_reason,
+            tool_wait_sec=self.tool_wait_sec,
+            served_models=self.served_models,
+            model_turns=self.model_turns,
+            metadata=metadata or {},
+        )
+
+
+def int_or_none(value: object) -> int | None:
+    """Coerce to ``int``, rejecting ``bool`` (a JSON ``true`` is not a count)."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def note_model(served_models: list[str], value: object) -> None:

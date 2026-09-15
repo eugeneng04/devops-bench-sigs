@@ -26,20 +26,11 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 
-from devops_bench.agents.result import ToolCall, empty_tokens
-from devops_bench.agents.shared.telemetry import ParsedRun, note_model
+from devops_bench.agents.result import TerminalReason, ToolCall, empty_tokens
+from devops_bench.agents.shared.telemetry import ParsedRun, int_or_none, note_model
 from devops_bench.agents.shared.timing import merged_span_sec, parse_event_time
 
 __all__ = ["parse_stream_json"]
-
-
-def _int_or_none(val: object) -> int | None:
-    """Return ``val`` if it is a real ``int`` (``bool`` rejected), else ``None``.
-
-    Mirrors ``results/normalize._coerce_int``'s bool rejection so a stray JSON
-    ``true`` in a usage field never surfaces as a token count.
-    """
-    return val if isinstance(val, int) and not isinstance(val, bool) else None
 
 
 # Claude Code echoes the full body of every tool result into the stream, so an
@@ -218,7 +209,7 @@ def parse_stream_json(stdout: str) -> ParsedRun:
     trajectory: list[ToolCall] = []
     spans: list[tuple[float, float]] = []
     served_models: list[str] = []
-    terminal_reason = ""
+    terminal_reason: TerminalReason = ""
 
     for event, error in _iter_events(stdout):
         if error is not None:
@@ -396,7 +387,7 @@ def _has_usage(usage: dict) -> bool:
     counts from one that reported nothing, so the accumulator fallback only
     fires in the latter case.
     """
-    return any(_int_or_none(usage.get(key)) is not None for key in _USAGE_KEYS)
+    return any(int_or_none(usage.get(key)) is not None for key in _USAGE_KEYS)
 
 
 # ``output_tokens`` is deliberately absent from the accumulator. The per-turn
@@ -419,7 +410,7 @@ def _add_usage(acc: dict, usage: object) -> None:
     if not isinstance(usage, dict):
         return
     for key in _ACC_USAGE_KEYS:
-        val = _int_or_none(usage.get(key))
+        val = int_or_none(usage.get(key))
         if val is not None:
             acc[key] = acc.get(key, 0) + val
 
@@ -441,15 +432,15 @@ def _usage_tokens(usage: dict) -> dict[str, int | None]:
     verbatim — an absent total beats one that undercounts the whole output side.
     """
     tokens = empty_tokens()
-    output = _int_or_none(usage.get("output_tokens"))
+    output = int_or_none(usage.get("output_tokens"))
     details = usage.get("output_tokens_details")
-    reasoning = _int_or_none(details.get("thinking_tokens")) if isinstance(details, dict) else None
+    reasoning = int_or_none(details.get("thinking_tokens")) if isinstance(details, dict) else None
     if output is not None and reasoning is not None:
         output = max(0, output - reasoning)
     tokens.update(
-        input=_int_or_none(usage.get("input_tokens")),
-        cached=_int_or_none(usage.get("cache_read_input_tokens")),
-        cache_write=_int_or_none(usage.get("cache_creation_input_tokens")),
+        input=int_or_none(usage.get("input_tokens")),
+        cached=int_or_none(usage.get("cache_read_input_tokens")),
+        cache_write=int_or_none(usage.get("cache_creation_input_tokens")),
         reasoning=reasoning,
         output=output,
     )

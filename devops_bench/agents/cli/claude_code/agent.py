@@ -400,12 +400,8 @@ class ClaudeCodeAgent(AgentHarness):
             errors.append(reason)
             metadata["returncode"] = returncode
             output = output or f"Error: {reason}"
-        return AgentResult(
-            output=output,
-            trajectory=parsed.trajectory,
-            tokens=parsed.tokens,
+        return parsed.to_result(
             latency=agent_sec,
-            errors=errors,
             # The timeout is the harness's own doing and outranks whatever the
             # killed process managed to write. Otherwise the stream's terminal
             # event wins: it is more specific than the exit code, and the CLI
@@ -417,8 +413,7 @@ class ClaudeCodeAgent(AgentHarness):
                 if timed_out
                 else parsed.terminal_reason or ("error" if returncode != 0 else "completed")
             ),
-            tool_wait_sec=parsed.tool_wait_sec,
-            served_models=parsed.served_models,
-            model_turns=parsed.model_turns,
+            output=output,
+            errors=errors,
             metadata=metadata,
         )
