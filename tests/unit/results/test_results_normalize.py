@@ -14,6 +14,8 @@
 
 """Tests for the harness-to-dashboard result normalizer."""
 
+import pytest
+
 from devops_bench.results import (
     SCHEMA_VERSION,
     Manifest,
@@ -135,12 +137,9 @@ def test_normalize_tokens_float_coerced_to_int():
 
 
 def test_normalize_tokens_openclaw_camel_case_cache_keys() -> None:
-    """OpenClaw spells its cache buckets in camelCase; they must not be dropped.
-
-    Verbatim from a live ``oc`` run. Before the aliases existed, ``cacheRead``
-    matched nothing, so ``cached`` read as ``None`` and the buckets summed to
-    26385 against a reported total of 50773 — 48% of the run's billed tokens
-    invisible on every OpenClaw row.
+    """Verbatim from a live ``oc`` run. Before the camelCase aliases existed,
+    ``cacheRead`` matched nothing and the buckets summed to 26385 against a
+    reported total of 50773 — 48% of the billed tokens invisible on every row.
     """
     tokens = {"input": 26362, "output": 23, "cacheRead": 24388, "total": 50773}
     normalized = normalize_tokens(tokens)
@@ -149,11 +148,9 @@ def test_normalize_tokens_openclaw_camel_case_cache_keys() -> None:
 
 
 def test_normalize_tokens_openclaw_cache_write_and_total_tokens() -> None:
-    """``cacheWrite`` and ``totalTokens`` are the other two OpenClaw spellings.
-
-    ``@openclaw/ai``'s ``parseChunkUsage`` builds every adapter's usage as
+    """``@openclaw/ai``'s ``parseChunkUsage`` builds every adapter's usage as
     ``{input, output, cacheRead, cacheWrite, totalTokens}``, with ``input``
-    already net of both cache buckets — so all four buckets add up to the total.
+    already net of both cache buckets — so the four add up to the total.
     """
     tokens = {
         "input": 100,
@@ -176,10 +173,8 @@ def test_normalize_tokens_snake_case_wins_over_camel_case() -> None:
 
 
 def test_normalize_tokens_openclaw_cost_breakdown_is_not_read_as_tokens() -> None:
-    """OpenClaw nests a float ``cost`` map beside the counts; it must be ignored.
-
-    The nested map repeats the bucket names, so a flattening lookup would read
-    dollars as tokens.
+    """OpenClaw nests a float ``cost`` map that repeats the bucket names beside the
+    counts, so a flattening lookup would read dollars as tokens.
     """
     tokens = {
         "input": 100,
@@ -280,21 +275,17 @@ def test_build_rows_success_record():
 
 
 def test_build_rows_defaults_terminal_reason_for_records_that_omit_it() -> None:
-    """Records written before the field existed read as unreported, not clean.
-
-    ``""`` must not collapse to ``"completed"`` — an old row cannot claim the
-    agent finished on its own when nothing recorded that it did.
+    """``""`` must not collapse to ``"completed"``: a record written before the
+    field existed cannot claim the agent finished on its own.
     """
     rows = build_rows([{"name": "n", "folder": "f", "status": "success"}], _manifest())
     assert rows[0].terminal_reason == ""
 
 
 def test_build_rows_carries_a_cut_off_run_through_as_success() -> None:
-    """A cut-off run still reads ``status: "success"`` — that is the point.
-
-    The record status describes the harness, not the agent, so
-    ``terminal_reason`` is the only thing separating "the harness killed it"
-    from "it answered badly".
+    """A cut-off run still reads ``status: "success"``: that status describes the
+    harness, not the agent, so ``terminal_reason`` is the only thing separating
+    "the harness killed it" from "it answered badly".
     """
     record = {"name": "n", "folder": "f", "status": "success", "terminal_reason": "timeout"}
     row = build_rows([record], _manifest())[0]
@@ -513,11 +504,9 @@ def test_manifest_to_dict_keys():
 
 
 def test_build_rows_carries_the_run_timeout_onto_every_row():
-    """The wall-clock budget rides on the row, not just the manifest.
-
-    Ingest uploads ``rows.json`` alone and never reads ``manifest.json``, so a
-    run-level setting that stays on the manifest never reaches the dashboard.
-    Without it, "timed out" cannot be told from "finished with room to spare".
+    """Ingest uploads ``rows.json`` alone and never reads ``manifest.json``, so a
+    budget left on the manifest never reaches the dashboard — and without it
+    "timed out" cannot be told from "finished with room to spare".
     """
     manifest = _manifest().model_copy(update={"timeout_sec": 900.0})
     rows = build_rows(
@@ -586,94 +575,66 @@ def test_build_rows_carries_cache_write() -> None:
 # --- tool-call counts ---
 
 
-def test_count_tool_calls_counts_entries_and_failures() -> None:
-    trajectory = [
-        {"name": "a", "status": "completed"},
-        {"name": "b", "status": "error"},
-        {"name": "c", "status": "interrupted"},
-        {"name": "d", "status": "completed"},
-    ]
-    assert count_tool_calls(trajectory) == (4, 1)
+@pytest.mark.parametrize(
+    ("trajectory", "errors", "expected"),
+    [
+        pytest.param(
+            [
+                {"name": "a", "status": "completed"},
+                {"name": "b", "status": "error"},
+                {"name": "c", "status": "interrupted"},
+                {"name": "d", "status": "completed"},
+            ],
+            None,
+            (4, 1),
+            id="only-error-is-a-failure",
+        ),
+        pytest.param([{"name": "a", "status": "called"}], None, (1, 0), id="called-is-unresolved"),
+        pytest.param(None, None, (None, None), id="no-trajectory"),
+        pytest.param([], None, (None, None), id="empty-and-unqualified"),
+        pytest.param("not a list", None, (None, None), id="not-a-list"),
+        pytest.param([], [], (0, 0), id="empty-with-no-errors-is-a-real-zero"),
+        pytest.param([], ["oc export-trajectory exited 1"], (None, None), id="empty-with-errors"),
+        pytest.param(
+            [
+                {"name": "a", "status": "completed"},
+                {"role": "assistant", "text": "thinking about it"},
+                {"name": "b", "status": "error"},
+            ],
+            None,
+            (2, 1),
+            id="text-turns-are-not-calls",
+        ),
+        pytest.param(
+            [{"name": "a", "status": "error"}, "junk", None], None, (1, 1), id="skips-malformed"
+        ),
+        pytest.param(["junk", None], None, (None, None), id="all-malformed"),
+    ],
+)
+def test_count_tool_calls(trajectory: object, errors: object, expected: tuple) -> None:
+    """Counting rules for ``toolCalls`` / ``toolErrors``, and when they are unknown.
 
+    ``called`` and ``interrupted`` are the same condition under two names -- the
+    parser never saw the call resolve -- and only antigravity uses the latter, so
+    counting either would make ``toolErrors`` incomparable across the harness
+    dimension the dashboard groups by. Only entries carrying a ``name`` count: an
+    API agent interleaves text turns with tool calls, and a malformed entry must
+    lose a count rather than raise.
 
-def test_count_tool_calls_counts_only_error_as_a_failure() -> None:
-    """``called`` and ``interrupted`` are the same condition under two names.
-
-    Both mean the parser never saw the call resolve. Only the antigravity
-    parser labels it ``interrupted``; four others leave the identical case as
-    ``called``, so counting it would make ``toolErrors`` incomparable across
-    the harness dimension the dashboard groups by.
+    An empty result is ``None`` unless ``errors`` proves the run was captured.
+    Every path that loses a transcript says so there -- the openclaw exporter
+    appends its failure, a timeout appends its own -- so an empty trajectory
+    beside an error means "not captured", while one beside a clean ``errors``
+    list is a real zero that belongs in the dashboard average. A confident ``0``
+    in the first case sinks that average on exactly the corrupted records the
+    skip exists to survive.
     """
-    assert count_tool_calls([{"name": "a", "status": "interrupted"}]) == (1, 0)
-    assert count_tool_calls([{"name": "a", "status": "called"}]) == (1, 0)
-
-
-def test_count_tool_calls_reports_none_when_no_trajectory_was_captured() -> None:
-    """A trajectory export can fail, and 0 would read as "made no calls".
-
-    Mirrors ``model_turns``, which uses ``None`` for the same situation. With no
-    ``errors`` argument the caller cannot say which case an empty list is, so it
-    stays unknown.
-    """
-    assert count_tool_calls(None) == (None, None)
-    assert count_tool_calls([]) == (None, None)
-    assert count_tool_calls("not a list") == (None, None)
-
-
-def test_count_tool_calls_reports_a_clean_run_that_called_no_tool_as_zero() -> None:
-    """An empty trajectory with no errors is a fact, not missing telemetry.
-
-    A run can answer from the model alone. Reporting ``None`` there drops it out
-    of the dashboard average instead of recording the zero it earned.
-    """
-    assert count_tool_calls([], []) == (0, 0)
-
-
-def test_count_tool_calls_reports_none_when_an_empty_trajectory_came_with_errors() -> None:
-    """Every path that loses a transcript says so in ``errors``.
-
-    The openclaw exporter appends its failure, a timeout appends its own, and a
-    failed record carries the exception — so an error next to an empty
-    trajectory means "not captured", never "called no tools".
-    """
-    assert count_tool_calls([], ["oc export-trajectory exited 1"]) == (None, None)
-
-
-def test_count_tool_calls_ignores_interleaved_text_turns() -> None:
-    """``AgentResult`` lets an API agent interleave text turns with tool calls.
-
-    A text turn is a mapping too, so counting entries rather than tool calls
-    would inflate ``toolCalls`` on exactly the harness the column is meant to
-    compare against the CLI ones.
-    """
-    trajectory = [
-        {"name": "a", "status": "completed"},
-        {"role": "assistant", "text": "thinking about it"},
-        {"name": "b", "status": "error"},
-    ]
-    assert count_tool_calls(trajectory) == (2, 1)
-
-
-def test_count_tool_calls_skips_malformed_entries() -> None:
-    """A malformed entry should lose a count, not raise and kill the run."""
-    assert count_tool_calls([{"name": "a", "status": "error"}, "junk", None]) == (1, 1)
-
-
-def test_count_tool_calls_reports_none_when_every_entry_is_malformed() -> None:
-    """All-junk is the "not captured" case, not a run that made zero calls.
-
-    Skipping non-mappings can empty the list, and a confident 0 there would sink
-    a dashboard average on exactly the corrupted records the skip exists to
-    survive.
-    """
-    assert count_tool_calls(["junk", None]) == (None, None)
+    assert count_tool_calls(trajectory, errors) == expected
 
 
 def test_build_rows_counts_tools_from_the_trajectory() -> None:
-    """The trajectory is too large to aggregate over at dashboard time.
-
-    Two models with the same score and the same wall clock can differ severalfold
-    in how much work they did to get there; nothing on the row said so.
+    """The trajectory is too large to aggregate at dashboard time, yet two models
+    with the same score and wall clock can differ severalfold in work done.
     """
     record = {
         "name": "n",
@@ -695,11 +656,9 @@ def test_build_rows_reports_none_tool_counts_for_a_record_with_no_trajectory() -
 
 
 def test_build_rows_carries_model_turns_separately_from_tool_calls() -> None:
-    """One model turn can issue several tool calls, so the counts diverge.
-
-    Seen live in an openclaw run: a single ``assistant.message`` carried two
-    ``toolCall`` entries. Input tokens grow with turns, not with tool calls, so
-    a cost-per-turn read off ``toolCalls`` would be wrong by that factor.
+    """Seen live: one openclaw ``assistant.message`` carried two ``toolCall``
+    entries. Input tokens grow with turns, not calls, so a cost-per-turn read
+    off ``toolCalls`` would be wrong by that factor.
     """
     record = {
         "name": "n",
@@ -713,10 +672,8 @@ def test_build_rows_carries_model_turns_separately_from_tool_calls() -> None:
 
 
 def test_build_rows_joins_served_models_so_a_failover_stays_visible() -> None:
-    """``model`` is the requested id; a failover means it is not what ran.
-
-    Collapsing to the first entry would hide exactly the case the field exists
-    for, so both are kept.
+    """``model`` is the requested id, so a failover means it is not what ran;
+    collapsing to the first entry hides the case the field exists for.
     """
 
     def served(value):
@@ -731,11 +688,9 @@ def test_build_rows_joins_served_models_so_a_failover_stays_visible() -> None:
 
 
 def test_build_rows_keeps_a_zero_tool_wait_but_drops_a_missing_one() -> None:
-    """Unlike a count, zero seconds inside tools is a real reading.
-
-    Tools that return within the transcript's millisecond resolution genuinely
-    measured ~0, so that must stay on the row; a harness that reports no
-    timings at all must not be averaged in as if it were instantaneous.
+    """Tools returning inside the transcript's millisecond resolution genuinely
+    measured ~0, so that stays on the row; a harness reporting no timings at all
+    must not be averaged in as if it were instantaneous.
     """
 
     def wait(record_extra):
@@ -754,11 +709,9 @@ def test_build_rows_keeps_a_zero_tool_wait_but_drops_a_missing_one() -> None:
 
 
 def test_build_rows_reports_unusable_model_turns_as_none() -> None:
-    """Zero, a bool, or a non-int all mean unmeasured, not "took no turns".
-
-    A record that produced output cannot have taken zero round-trips, and
-    ``True`` is an ``int`` in Python, so both would otherwise land on the row
-    as a real count and drag a dashboard average down.
+    """Zero, a bool and a non-int all mean unmeasured: a record that produced
+    output cannot have taken zero round-trips, and ``True`` is an ``int``, so
+    both would otherwise land on the row as a real count.
     """
 
     def turns(value):

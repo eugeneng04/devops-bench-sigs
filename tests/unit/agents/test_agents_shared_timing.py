@@ -57,11 +57,8 @@ def test_parse_event_time_returns_none_for_anything_unusable() -> None:
 
 
 def test_merged_span_sec_counts_concurrent_calls_once() -> None:
-    """A batch of calls dispatched together did not take the sum of its parts.
-
-    Seen live: one openclaw message issued two tool calls stamped at the same
-    millisecond. Summing them would report more time inside tools than the run
-    itself took.
+    """Seen live: one openclaw message issued two calls stamped at the same
+    millisecond. Summing them reports more time inside tools than the run took.
     """
     assert merged_span_sec([(0.0, 2.0), (0.5, 1.5)]) == 2.0
     assert merged_span_sec([(0.0, 2.0), (1.0, 3.0)]) == 3.0
@@ -77,11 +74,9 @@ def test_merged_span_sec_is_order_independent() -> None:
 
 
 def test_merged_span_sec_reports_none_when_nothing_was_timed() -> None:
-    """No timings is not the same as zero time inside tools.
-
-    ``0.0`` is a real reading — tools that returned within the transcript's
-    resolution — so a run with no usable stamps must stay out of an average
-    rather than pull it toward zero.
+    """``0.0`` is a real reading — tools that returned inside the transcript's
+    resolution — so an unstamped run stays out of an average rather than pulling
+    it toward zero.
     """
     assert merged_span_sec([]) is None
     assert merged_span_sec([(2.0, 1.0)]) is None  # clock skew, dropped

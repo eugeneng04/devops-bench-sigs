@@ -137,12 +137,9 @@ def test_parse_trajectory_export_sums_usage_across_turns() -> None:
 
 
 def test_parse_trajectory_export_sums_cache_write_from_per_call_events() -> None:
-    """``cacheWrite`` lives only on ``assistant.message``, not ``model.completed``.
-
-    Shape taken from a live export: the per-call usages sum to the
-    ``model.completed`` total for every bucket except ``cacheWrite``, which the
-    rollup drops. Cache writes are priced above input on Anthropic, so losing
-    the bucket understates what an openclaw run was billed.
+    """Live export shape: per-call usages sum to the ``model.completed`` total for
+    every bucket except ``cacheWrite``, which the rollup drops. Cache writes are
+    priced above input on Anthropic, so the loss understates what was billed.
     """
     blob = _events(
         {
@@ -190,10 +187,8 @@ def test_parse_trajectory_export_sums_cache_write_from_per_call_events() -> None
 
 
 def test_parse_trajectory_export_omits_cache_write_when_unreported() -> None:
-    """No ``cacheWrite`` anywhere means the key is absent, so the row reads None.
-
-    An older openclaw whose events carry no per-call usage must not be recorded
-    as having written zero cache tokens.
+    """An older openclaw whose events carry no per-call usage must not be recorded
+    as having written zero cache tokens, so the key stays absent.
     """
     blob = _events(
         {"type": "assistant.message", "data": {"message": {"content": []}}},
@@ -203,12 +198,9 @@ def test_parse_trajectory_export_omits_cache_write_when_unreported() -> None:
 
 
 def test_parse_trajectory_export_counts_model_turns_not_tool_calls() -> None:
-    """One ``assistant.message`` can issue several tool calls, so the two differ.
-
-    Shape taken from a live openclaw run whose single message carried two
-    ``toolCall`` entries. Reporting ``len(trajectory)`` as turns would say three
-    round-trips happened where the provider was called twice, which is the
-    number input tokens actually grow with.
+    """Live shape: one message carried two ``toolCall`` entries. Reporting
+    ``len(trajectory)`` as turns claims three round-trips where the provider was
+    called twice, which is the number input tokens actually grow with.
     """
     blob = _events(
         {"type": "assistant.message", "data": {"message": {"content": []}}},
@@ -225,11 +217,8 @@ def test_parse_trajectory_export_counts_model_turns_not_tool_calls() -> None:
 
 
 def test_parse_trajectory_export_leaves_model_turns_none_without_messages() -> None:
-    """No ``assistant.message`` events means unmeasured, not zero turns.
-
-    An export that produced output cannot have taken zero round-trips, so ``0``
-    would be a parse miss dressed up as a fact and would drag a dashboard
-    average down.
+    """An export that produced output cannot have taken zero round-trips, so ``0``
+    here is a parse miss dressed up as a fact.
     """
     blob = _events(
         {"type": "model.completed", "data": {"usage": {"input": 5}, "assistantTexts": ["done"]}},
@@ -238,10 +227,8 @@ def test_parse_trajectory_export_leaves_model_turns_none_without_messages() -> N
 
 
 def test_parse_trajectory_export_records_every_model_that_answered() -> None:
-    """openclaw fails over mid-run, so the requested model can be the wrong label.
-
-    Two distinct ids across the run is the failover itself; both are kept, in
-    first-seen order, and a repeat is not counted twice.
+    """openclaw fails over mid-run, so two distinct ids across a run *is* the
+    failover: both are kept in first-seen order, and a repeat is not counted twice.
     """
     blob = _events(
         {"type": "assistant.message", "data": {"message": {"model": "gemini-3-flash-preview"}}},
@@ -258,11 +245,8 @@ def test_parse_trajectory_export_leaves_served_models_empty_when_unreported() ->
 
 
 def test_parse_trajectory_export_times_tools_and_merges_concurrent_calls() -> None:
-    """Two calls issued in one message overlap, so their spans count once.
-
-    Timestamps taken from a live export: both ``tool.call`` events landed on the
-    same millisecond. Summing the two durations would say the run spent longer
-    in tools than it ran for.
+    """Live timestamps: both ``tool.call`` events landed on the same millisecond,
+    so summing their durations says the run spent longer in tools than it ran for.
     """
     blob = _events(
         {**_tool_call("1", "a", {}), "ts": "2026-08-24T17:44:45.862Z"},
@@ -280,11 +264,9 @@ def test_parse_trajectory_export_leaves_tool_wait_none_without_timestamps() -> N
 
 
 def test_parse_trajectory_export_coerces_a_null_tool_name() -> None:
-    """A null name must not cost the call its row in the telemetry counts.
-
-    ``dict.get(key, default)`` returns ``None`` when the key is present holding
-    null, and ``count_tool_calls`` skips any entry whose name is not a ``str`` —
-    so an export like this dropped a failed call and reported zero tool errors.
+    """``dict.get(key, default)`` returns ``None`` for a key present holding null,
+    and ``count_tool_calls`` skips a non-``str`` name — so an export like this
+    dropped a failed call and reported zero tool errors.
     """
     blob = _events(
         {"type": "tool.call", "data": {"toolCallId": "1", "name": None, "arguments": {}}},
@@ -308,11 +290,9 @@ def test_parse_trajectory_export_sums_nested_cost_breakdown() -> None:
 
 
 def test_parse_trajectory_export_keeps_cache_write_inside_a_nested_cost_block() -> None:
-    """The top-level ``cacheWrite`` handling must not reach into the cost breakdown.
-
-    The token bucket is settled against the per-call events, but cost dollars
-    have no second source -- dropping them would leave the itemized costs short
-    of their own total.
+    """The token bucket is settled against the per-call events, but cost dollars
+    have no second source, so dropping them leaves the itemized costs short of
+    their own total.
     """
     blob = _events(
         {
@@ -331,10 +311,8 @@ def test_parse_trajectory_export_keeps_cache_write_inside_a_nested_cost_block() 
 
 
 def test_parse_trajectory_export_does_not_double_count_a_reported_cache_write() -> None:
-    """A rollup reporting ``cacheWrite`` already counted it in ``total``.
-
-    Folding the per-call sum on top would report a total larger than the sum of
-    its own buckets.
+    """A rollup reporting ``cacheWrite`` already counted it in ``total``, so folding
+    the per-call sum on top reports a total larger than its own buckets.
     """
     blob = _events(
         {
@@ -363,10 +341,9 @@ def test_parse_trajectory_export_keeps_a_cache_write_only_the_rollup_reported() 
 
 
 def test_parse_trajectory_export_matches_reused_tool_ids_in_emission_order() -> None:
-    """Two live calls can share an id; the second must not overwrite the first.
-
-    Overwriting pairs the first call's result with the second call's start,
-    reporting a tool wait shorter than the run and inventing an orphan error.
+    """Two live calls can share an id. Overwriting pairs the first call's result
+    with the second call's start, reporting a tool wait shorter than the run and
+    inventing an orphan error.
     """
     blob = _events(
         {**_tool_call("x", "a", {}), "ts": "2026-08-24T17:57:28.000Z"},
@@ -701,11 +678,9 @@ def test_execute_records_bash_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path:
 def test_execute_recovers_telemetry_from_a_timed_out_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A killed agent turn still exported its session; the row keeps that telemetry.
-
-    The budget ends the turn, not the session on disk, and export-trajectory is
-    a separate subprocess. Nulling the trajectory here would blank the counters
-    on exactly the rows where "how far did it get" is the question.
+    """The budget ends the turn, not the session on disk, and export-trajectory is a
+    separate subprocess — so nulling the trajectory blanks the counters on exactly
+    the rows where "how far did it get" is the question.
     """
 
     def fake_bash(cmd, **kwargs):
@@ -770,10 +745,8 @@ def _install_fake_clock(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
 def test_latency_excludes_the_trajectory_export(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The reported latency is the agent turn, not the turn plus our export.
-
-    Exporting the trajectory afterwards is harness work; billing it to the
-    agent makes openclaw look slower than a harness that has no export step.
+    """Exporting the trajectory afterwards is harness work; billing it to the agent
+    makes openclaw look slower than a harness with no export step.
     """
     clock = _install_fake_clock(monkeypatch)
 

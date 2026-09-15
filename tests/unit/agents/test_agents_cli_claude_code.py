@@ -703,103 +703,91 @@ def test_block_text_preserves_non_text_blocks() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_parse_stream_json_maps_a_completed_run_to_completed() -> None:
-    blob = _stream(
-        {"type": "result", "subtype": "success", "terminal_reason": "completed", "result": "ok"}
-    )
-    assert parse_stream_json(blob).terminal_reason == "completed"
+@pytest.mark.parametrize(
+    ("event", "reason", "errors"),
+    [
+        pytest.param(
+            {"subtype": "success", "terminal_reason": "completed", "result": "ok"},
+            "completed",
+            [],
+            id="clean-finish",
+        ),
+        pytest.param(
+            {"subtype": "error_during_execution", "terminal_reason": "model_error", "result": ""},
+            "error",
+            ["stream-json result terminal_reason: model_error"],
+            id="failure-reason-buckets-to-error",
+        ),
+        pytest.param(
+            {
+                "subtype": "error_max_turns",
+                "terminal_reason": "max_turns",
+                "is_error": True,
+                "result": "",
+            },
+            "completed",
+            ["stream-json result terminal_reason: max_turns"],
+            id="turn-cap-is-not-a-failure",
+        ),
+        pytest.param(
+            {"subtype": "error_max_turns", "result": ""},
+            "completed",
+            ["stream-json result error: error_max_turns"],
+            id="turn-cap-from-the-subtype-alone",
+        ),
+        pytest.param(
+            {
+                "subtype": "success",
+                "is_error": True,
+                "api_error_status": 404,
+                "terminal_reason": "api_error",
+                "result": "The model x is not available.",
+            },
+            "error",
+            ["stream-json result terminal_reason: api_error (api status 404)"],
+            id="reason-outranks-a-success-subtype",
+        ),
+        pytest.param(
+            {"subtype": "success", "terminal_reason": "hook_stopped", "result": "partial"},
+            "error",
+            ["stream-json result terminal_reason: hook_stopped"],
+            id="reason-alone-with-no-failure-flag",
+        ),
+        pytest.param(
+            {"subtype": "success", "result": "ok"}, "completed", [], id="flags-only-clean"
+        ),
+        pytest.param(
+            {"subtype": "success", "is_error": True, "result": "no"},
+            "error",
+            ["stream-json result flagged is_error"],
+            id="flags-only-failed",
+        ),
+    ],
+)
+def test_parse_stream_json_buckets_the_clis_terminal_reasons(
+    event: dict, reason: str, errors: list[str]
+) -> None:
+    """The CLI's reason vocabulary is far wider than the bench's four values.
 
+    A failure reason buckets to ``error`` with the specific reason kept on
+    ``errors`` rather than dropped. A turn cap is the exception: ``TERMINAL_REASONS``
+    puts it in ``completed`` so an efficiency ceiling does not read as a capability
+    failure, and the sibling harnesses land there because their cap is invisible
+    from outside the process -- Claude Code can see its cap, so it has to be mapped
+    there deliberately or the two report opposite values for the same event.
 
-def test_parse_stream_json_buckets_a_cli_specific_reason_as_error() -> None:
-    """The CLI's reason vocabulary is far wider than the bench's four values, so
-    a failure reason buckets to ``error`` — with the specific reason kept on
-    ``errors`` rather than dropped."""
-    blob = _stream(
-        {
-            "type": "result",
-            "subtype": "error_during_execution",
-            "terminal_reason": "model_error",
-            "result": "",
-        }
-    )
-    parsed = parse_stream_json(blob)
-    assert parsed.terminal_reason == "error"
-    assert parsed.errors == ["stream-json result terminal_reason: model_error"]
-
-
-def test_parse_stream_json_scores_a_turn_capped_run_as_completed() -> None:
-    """``TERMINAL_REASONS`` puts a turn cap in ``completed`` so an efficiency
-    ceiling does not read as a capability failure, and the sibling harnesses
-    land there because their cap is invisible from outside the process. Claude
-    Code can see its cap, so it has to be mapped there deliberately or the two
-    harnesses report opposite values for the same event."""
-    blob = _stream(
-        {
-            "type": "result",
-            "subtype": "error_max_turns",
-            "terminal_reason": "max_turns",
-            "is_error": True,
-            "result": "",
-        }
-    )
-    parsed = parse_stream_json(blob)
-    assert parsed.terminal_reason == "completed"
-    # The cap itself is not lost — it just is not a failure.
-    assert parsed.errors == ["stream-json result terminal_reason: max_turns"]
-
-
-def test_parse_stream_json_scores_a_turn_cap_as_completed_without_a_cli_reason() -> None:
-    """A binary predating ``terminal_reason`` shows the cap only in the subtype;
-    it must not land in a different bucket than the same run on a newer one."""
-    blob = _stream({"type": "result", "subtype": "error_max_turns", "result": ""})
-    parsed = parse_stream_json(blob)
-    assert parsed.terminal_reason == "completed"
-    assert parsed.errors == ["stream-json result error: error_max_turns"]
-
-
-def test_parse_stream_json_keeps_the_cli_reason_when_a_failure_flag_also_fired() -> None:
-    """Every reason the CLI itself classifies as an error (``api_error``,
-    ``prompt_too_long``, ``blocking_limit``) arrives as ``subtype: "success"``
-    with ``is_error`` set, so a mapping that only reads the flags would record
-    an anonymous failure for the whole reachable failure vocabulary."""
-    blob = _stream(
-        {
-            "type": "result",
-            "subtype": "success",
-            "is_error": True,
-            "api_error_status": 404,
-            "terminal_reason": "api_error",
-            "result": "The model x is not available.",
-        }
-    )
-    parsed = parse_stream_json(blob)
-    assert parsed.terminal_reason == "error"
-    assert parsed.errors == ["stream-json result terminal_reason: api_error (api status 404)"]
-
-
-def test_parse_stream_json_buckets_a_stopped_short_reason_without_failure_flags() -> None:
-    """A loop the CLI does not itself flag (``hook_stopped``, ``aborted_tools``)
-    sets neither ``is_error`` nor an ``error_*`` subtype; the reason alone must
-    still mark the run as failed."""
-    blob = _stream(
-        {
-            "type": "result",
-            "subtype": "success",
-            "terminal_reason": "hook_stopped",
-            "result": "partial",
-        }
-    )
-    parsed = parse_stream_json(blob)
-    assert parsed.terminal_reason == "error"
-    assert parsed.errors == ["stream-json result terminal_reason: hook_stopped"]
-
-
-def test_parse_stream_json_resolves_reason_from_flags_when_the_cli_omits_it() -> None:
-    """``terminal_reason`` is optional on the event; older binaries omit it."""
-    ok = _stream({"type": "result", "subtype": "success", "result": "ok"})
-    bad = _stream({"type": "result", "subtype": "success", "is_error": True, "result": "no"})
-    assert parse_stream_json(ok).terminal_reason == "completed"
-    assert parse_stream_json(bad).terminal_reason == "error"
+    The reason outranks the flags. Every reason the CLI itself classifies as an
+    error (``api_error``, ``prompt_too_long``, ``blocking_limit``) arrives as
+    ``subtype: "success"`` with ``is_error`` set, so reading only the flags would
+    record an anonymous failure for the whole reachable failure vocabulary; and a
+    loop the CLI does not flag at all (``hook_stopped``, ``aborted_tools``) sets
+    neither, so the reason alone must still mark the run failed. ``terminal_reason``
+    is optional -- older binaries show a cap only in the subtype, and must not land
+    in a different bucket than the same run on a newer one.
+    """
+    parsed = parse_stream_json(_stream({"type": "result", **event}))
+    assert parsed.terminal_reason == reason
+    assert parsed.errors == errors
 
 
 def test_parse_stream_json_leaves_reason_unset_without_a_terminal_event() -> None:
