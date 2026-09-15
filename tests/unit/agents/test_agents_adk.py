@@ -325,11 +325,9 @@ def test_parse_event_stream_times_a_tool_call_from_its_event_timestamps() -> Non
 
 
 def test_parse_event_stream_counts_concurrent_tool_calls_once() -> None:
-    """One model turn can dispatch several calls; summing them exceeds the run.
-
-    ADK yields both responses of a parallel batch as separate events, so the
-    two spans overlap. Added together they report 4s of tool time for a batch
-    that took 3s of wall clock.
+    """ADK yields both responses of a parallel batch as separate events, so the
+    spans overlap: added together they report 4s of tool time for a batch that
+    took 3s of wall clock.
     """
     batch = {
         "content": {
@@ -359,10 +357,8 @@ def test_parse_event_stream_reports_no_tool_wait_without_timestamps() -> None:
 
 
 def test_parse_event_stream_does_not_time_an_orphan_response() -> None:
-    """A response matching no call has no start, so it must not invent a span.
-
-    Pairing it with the previous call's start would report the gap between two
-    unrelated events as tool time.
+    """An orphan response has no start, and pairing it with the previous call's
+    would report the gap between two unrelated events as tool time.
     """
     orphan = {**RESPONSE_EVENT, "timestamp": 2000.0}
 
@@ -373,10 +369,9 @@ def test_parse_event_stream_does_not_time_an_orphan_response() -> None:
 
 
 def test_parse_event_stream_keeps_id_less_call_starts_in_step() -> None:
-    """An untimed id-less call must not hand its slot to the next response.
-
-    Without a placeholder in the queue, ``b``'s response would pair with the
-    *timed* ``b`` call start and report the whole two-call stretch as one span.
+    """Without a placeholder in the queue for the untimed id-less call, ``b``'s
+    response pairs with the *timed* ``b`` start and reports the whole two-call
+    stretch as one span.
     """
     call_a = {"content": {"role": "model", "parts": [{"function_call": {"name": "a", "args": {}}}]}}
     call_b = {
@@ -400,10 +395,9 @@ def test_parse_event_stream_keeps_id_less_call_starts_in_step() -> None:
 
 
 def test_parse_event_stream_matches_reused_call_ids_in_emission_order() -> None:
-    """Two live calls can share an id; the second must not overwrite the first.
-
-    Overwriting pairs the first call's result with the second call's start,
-    reporting a tool wait shorter than the run and inventing an orphan error.
+    """Two live calls can share an id. Overwriting pairs the first call's result
+    with the second call's start, reporting a tool wait shorter than the run and
+    inventing an orphan error.
     """
     call_a = {
         "content": {"role": "model", "parts": [{"function_call": {"id": "x", "name": "a"}}]},
@@ -1019,12 +1013,10 @@ class InnerTimeoutRunner(SlowClosingRunner):
 def test_drive_reports_an_inner_timeout_as_an_error_not_the_budget(
     monkeypatch: pytest.MonkeyPatch, budget: float | None
 ) -> None:
-    """A provider socket timeout is a capability failure, not an efficiency ceiling.
-
-    ``socket.timeout`` has been a ``TimeoutError`` since 3.10, so the handler
-    that catches the budget expiring also sees every provider read timeout. With
-    no budget at all ``wait_for`` is never entered, yet the handler still fires —
-    labelling it ``timeout`` stamps a row whose ``timeoutSec`` is ``null``.
+    """``socket.timeout`` has been a ``TimeoutError`` since 3.10, so the handler for
+    the budget expiring also sees every provider read timeout — and with no budget
+    at all it still fires, stamping ``timeout`` on a row whose ``timeoutSec`` is
+    ``null``.
     """
     import google.adk.runners as adk_runners
 

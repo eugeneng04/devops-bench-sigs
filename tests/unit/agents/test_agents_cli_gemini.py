@@ -106,11 +106,9 @@ def test_parse_stream_json_emits_canonical_trajectory() -> None:
 
 
 def test_parse_stream_json_records_the_model_the_cli_resolved_to() -> None:
-    """The requested id can be an alias, so the row must carry what answered.
-
-    Both sources are read: ``init.model`` names the resolved id up front, and
-    ``result.stats.models`` is keyed per model so a mid-run switch appears as a
-    second key. A repeat across the two is not counted twice.
+    """The requested id can be an alias, so both sources are read: ``init.model``
+    names the resolved id up front and ``result.stats.models`` is keyed per model,
+    so a mid-run switch appears as a second key. A repeat is not counted twice.
     """
     blob = "\n".join(
         json.dumps(e)
@@ -136,10 +134,8 @@ def test_parse_stream_json_leaves_served_models_empty_when_unreported() -> None:
 
 
 def test_parse_stream_json_does_not_record_auto_as_a_served_model() -> None:
-    """``auto`` is the router mode; the models it picked are in ``stats``.
-
-    Captured live: ``init.model`` was ``auto`` and one prompt was served by
-    ``gemini-3.1-flash-lite`` and ``gemini-3.5-flash`` together.
+    """``auto`` is the router mode, not a model. Captured live: one prompt was served
+    by ``gemini-3.1-flash-lite`` and ``gemini-3.5-flash`` together.
     """
     blob = _stream(
         {"type": "init", "model": "auto"},
@@ -153,10 +149,8 @@ def test_parse_stream_json_does_not_record_auto_as_a_served_model() -> None:
 
 
 def test_parse_stream_json_coerces_a_null_tool_name() -> None:
-    """A null name must not cost the call its row in the telemetry counts.
-
-    ``count_tool_calls`` skips any entry whose name is not a ``str``, so a
-    stream like this dropped the call and reported zero tool errors.
+    """``count_tool_calls`` skips any entry whose name is not a ``str``, so a stream
+    like this dropped the call and reported zero tool errors.
     """
     blob = _stream({"type": "tool_use", "tool_id": "1", "tool_name": None, "name": None})
     parsed = parse_stream_json(blob)
@@ -165,11 +159,9 @@ def test_parse_stream_json_coerces_a_null_tool_name() -> None:
 
 
 def test_parse_stream_json_keeps_the_first_terminal_results_payload() -> None:
-    """A later degenerate ``result`` must not wipe the counts or repeat the answer.
-
-    The CLI can emit a second terminal event carrying an empty ``stats`` block;
-    overwriting on it lost every token bucket, and appending its ``output``
-    again returned the answer twice.
+    """The CLI can emit a second terminal event carrying an empty ``stats`` block:
+    overwriting on it lost every token bucket, and appending its ``output`` again
+    returned the answer twice.
     """
     blob = _stream(
         {"type": "result", "output": "the answer", "stats": {"input_tokens": 100}},
@@ -181,11 +173,9 @@ def test_parse_stream_json_keeps_the_first_terminal_results_payload() -> None:
 
 
 def test_parse_stream_json_segments_model_turns_between_tool_batches() -> None:
-    """Shape captured live: one turn issues both reads, a second answers.
-
-    ``result.stats`` carries no request count, and the CLI marks assistant
-    ``message`` events ``delta: true`` — two chunks for one answer — so
-    counting either events or tool calls would overcount.
+    """Live shape: one turn issues both reads, a second answers. ``result.stats``
+    carries no request count and assistant ``message`` events are ``delta: true``
+    chunks, so counting either events or tool calls overcounts.
     """
     blob = _stream(
         {"type": "init", "model": "auto"},
@@ -214,10 +204,8 @@ def test_parse_stream_json_reports_no_model_turns_for_an_empty_stream() -> None:
 
 
 def test_parse_stream_json_times_tools_and_merges_concurrent_calls() -> None:
-    """Overlapping calls count once, so tool wait can never exceed the run.
-
-    Timestamp shape taken from a live ``stream-json`` capture; every event
-    carries one, which the plan had assumed was API-only telemetry.
+    """Overlapping calls count once, so tool wait can never exceed the run. Live
+    ``stream-json`` shape: every event carries a timestamp.
     """
     blob = "\n".join(
         json.dumps(e)
@@ -264,10 +252,9 @@ def test_parse_stream_json_leaves_tool_wait_none_without_timestamps() -> None:
 
 
 def test_parse_stream_json_matches_reused_tool_ids_in_emission_order() -> None:
-    """Two live calls can share an id; the second must not overwrite the first.
-
-    Overwriting pairs the first call's result with the second call's start,
-    reporting a tool wait shorter than the run and inventing an orphan error.
+    """Two live calls can share an id. Overwriting pairs the first call's result
+    with the second call's start, reporting a tool wait shorter than the run and
+    inventing an orphan error.
     """
     blob = "\n".join(
         json.dumps(e)
@@ -594,10 +581,8 @@ def test_execute_handles_subprocess_error(monkeypatch: pytest.MonkeyPatch) -> No
 def test_execute_reports_a_timeout_apart_from_a_subprocess_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both arrive as SubprocessError with returncode -1; only the flag differs.
-
-    A model that ran out of wall clock and one whose CLI crashed are the same
-    row otherwise, and they mean opposite things about the model.
+    """Both arrive as SubprocessError with returncode -1 and only ``timed_out``
+    differs, yet they mean opposite things about the model.
     """
 
     def fake_run(argv, **kwargs):
@@ -610,11 +595,9 @@ def test_execute_reports_a_timeout_apart_from_a_subprocess_failure(
 def test_execute_recovers_partial_telemetry_from_a_timed_out_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """stdout written before the kill is a valid prefix of the event stream.
-
-    Discarding it blanks the counters on exactly the rows where how far the run
-    got is the question, and leaves gemini's timeout rows incomparable with the
-    other two CLI harnesses, which both recover partial telemetry.
+    """stdout written before the kill is a valid prefix of the event stream, so
+    discarding it blanks the counters on the rows where "how far did it get" is
+    the question and leaves gemini incomparable with the other two CLI harnesses.
     """
     partial = _stream(
         {"type": "tool_use", "id": "c1", "name": "list_pods", "input": {}},

@@ -94,10 +94,8 @@ def test_agent_result_errored_classmethod_populates_errors() -> None:
 
 
 def test_agent_result_errored_can_report_a_timeout_instead() -> None:
-    """A run the harness cut off at its budget is not the agent failing.
-
-    Both populate ``errors``, so ``errors`` alone cannot tell a slow model from
-    a broken one.
+    """A cut-off run is not the agent failing, and both populate ``errors``, so
+    ``errors`` alone cannot tell a slow model from a broken one.
     """
     result = AgentResult.errored("timed out after 600s", terminal_reason="timeout")
     assert result.terminal_reason == "timeout"
