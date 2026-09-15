@@ -507,6 +507,65 @@ def test_build_context_normalizes_tool_names_for_judge(mocker: MockerFixture) ->
     assert res["trajectory"][0]["name"] == "default__generate_manifest"
 
 
+def test_build_context_flags_a_redaction_placeholder_as_missing(mocker: MockerFixture) -> None:
+    mocker.patch.object(pipeline, "LLMTestCase", side_effect=lambda **kw: SimpleNamespace(**kw))
+    res = _base_result(output="[Malformed diagnostic JSON redacted]")
+    assert pipeline._build_context(res, MagicMock(), True).final_output_missing is True
+
+
+def test_build_context_flags_an_empty_output_beside_real_work(mocker: MockerFixture) -> None:
+    # The trajectory shows the agent worked, so the blank is a capture
+    # failure, not the agent turning in nothing.
+    mocker.patch.object(pipeline, "LLMTestCase", side_effect=lambda **kw: SimpleNamespace(**kw))
+    res = _base_result(output="")
+    assert pipeline._build_context(res, MagicMock(), True).final_output_missing is True
+
+
+def test_build_context_keeps_judging_an_agent_that_produced_nothing(
+    mocker: MockerFixture,
+) -> None:
+    # Empty output AND empty trajectory: the agent genuinely turned in
+    # nothing, and that zero is real — the judge still hands it out.
+    mocker.patch.object(pipeline, "LLMTestCase", side_effect=lambda **kw: SimpleNamespace(**kw))
+    res = _base_result(output="", trajectory=[], tools=[])
+    assert pipeline._build_context(res, MagicMock(), True).final_output_missing is False
+
+
+def test_build_context_leaves_a_real_answer_alone(mocker: MockerFixture) -> None:
+    mocker.patch.object(pipeline, "LLMTestCase", side_effect=lambda **kw: SimpleNamespace(**kw))
+    assert pipeline._build_context(_base_result(), MagicMock(), True).final_output_missing is False
+
+
+def test_batch_withholds_outcome_validity_for_a_placeholder_output(
+    mocker: MockerFixture,
+) -> None:
+    # The exact run_20260911_172304 shape: status success, no errors, a real
+    # trajectory — but oc's sanitizer replaced the final message before the
+    # harness read it. The judge must never grade the placeholder: the metric
+    # abstains with the reason recorded, and with every correctness source
+    # abstaining the composite is withheld rather than published as a
+    # confident zero nobody measured.
+    _patch_judges(mocker)
+    mocker.patch.object(pipeline, "LLMTestCase")
+    evaluate = mocker.patch("deepeval.evaluate", side_effect=_evaluate_by_metric_name())
+    results = [
+        _base_result(
+            output="[Malformed diagnostic JSON redacted]",
+            status="success",
+            errors=[],
+            expected_output="App deployed",  # no bullets: no checklist source
+        )
+    ]
+
+    evaluate_metrics_batch(results, MagicMock(), use_mcp=False)
+
+    entry = results[0]["scores"]["OutcomeValidity"]
+    assert entry["score"] is None
+    assert "withheld" in entry["reason"]
+    evaluate.assert_not_called()
+    assert pipeline.OUTCOME_SCORE_KEY not in results[0]["scores"]
+
+
 def test_outcome_validity_override_only_when_generation_only(mocker: MockerFixture) -> None:
     from devops_bench.metrics import outcome_validity
 
