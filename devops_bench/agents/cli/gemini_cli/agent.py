@@ -259,11 +259,8 @@ class GeminiCliAgent(AgentHarness):
                     timeout=self.config.timeout_sec,
                 )
             except SubprocessError as exc:
-                # The stream-json written before the kill is a valid prefix of
-                # the event stream, so the trajectory and tokens the run did
-                # manage are still parseable. Recovering them keeps a timed-out
-                # gemini row comparable with openclaw's and antigravity's,
-                # which also recover partial telemetry.
+                # The stream-json written before the kill is a valid prefix, so
+                # the trajectory and tokens the run managed are still parseable.
                 partial = parse_stream_json(exc.stdout or "")
                 return partial.to_result(
                     latency=time.monotonic() - started,

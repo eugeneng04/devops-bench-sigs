@@ -494,10 +494,9 @@ def _drive(
         timeout_sec: Wall-clock budget, or ``None`` for no limit.
 
     Returns:
-        An ``(events, errors, terminal_reason)`` tuple, where the reason is one
-        of :data:`~devops_bench.agents.result.TERMINAL_REASONS`. The budget
-        expiring and the run failing both leave a partial trajectory, so the
-        errors list alone cannot tell them apart.
+        An ``(events, errors, terminal_reason)`` tuple. The budget expiring and
+        the run failing both leave a partial trajectory, so the errors list
+        alone cannot tell them apart.
     """
     from google.adk.runners import InMemoryRunner
     from google.genai import types
@@ -529,10 +528,9 @@ def _drive(
             else:
                 await asyncio.wait_for(_consume(), timeout=timeout_sec)
         except TimeoutError as exc:
-            # ``wait_for`` can only raise once the deadline has passed, and never
-            # with ``timeout=None`` — an earlier one came from inside the run
-            # (socket.timeout is a TimeoutError since 3.10), which is a failure,
-            # not an efficiency ceiling.
+            # ``wait_for`` only raises once the deadline has passed; an earlier
+            # one came from inside the run (socket.timeout is a TimeoutError),
+            # which is a failure, not an efficiency ceiling.
             if timeout_sec is not None and time.monotonic() - start >= timeout_sec:
                 errors.append(f"ADK run exceeded the {timeout_sec}s budget")
                 reason = "timeout"
@@ -643,7 +641,7 @@ class AdkAgent(base.AgentHarness):
             metadata["workspace"] = str(workspace_path)
         # Latency brackets the agent run alone: resolving the target and
         # preparing the tree is harness setup, and folding it in would make an
-        # ADK row's latency mean something different from a CLI row's.
+        # ADK row's latency incomparable with a CLI row's.
         started = time.monotonic()
         with _in_workspace(workspace_path):
             events, run_errors, terminal_reason = _drive(prepared, prompt, self.config.timeout_sec)

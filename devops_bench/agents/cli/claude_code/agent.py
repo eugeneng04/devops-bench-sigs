@@ -402,12 +402,10 @@ class ClaudeCodeAgent(AgentHarness):
             output = output or f"Error: {reason}"
         return parsed.to_result(
             latency=agent_sec,
-            # The timeout is the harness's own doing and outranks whatever the
-            # killed process managed to write. Otherwise the stream's terminal
-            # event wins: it is more specific than the exit code, and the CLI
-            # exits 1 on a turn cap that the parser resolves to ``completed``.
-            # The exit code governs only a stream that never reached its
-            # terminal event -- a truncated pipe or a binary that died early.
+            # A timeout is the harness's own doing and outranks whatever the
+            # killed process wrote. Otherwise the stream's terminal event wins:
+            # the CLI exits 1 on a turn cap the parser resolves to ``completed``.
+            # The exit code governs only a stream that never reached that event.
             terminal_reason=(
                 "timeout"
                 if timed_out

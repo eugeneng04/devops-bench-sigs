@@ -71,17 +71,10 @@ def _accumulate_usage(acc: dict, usage: dict, *, top_level: bool = True) -> None
     added; nested mappings (e.g. a ``cost`` breakdown) are summed recursively;
     booleans and other non-numeric values are ignored.
 
-    The top-level ``cacheWrite`` is left to :func:`_resolve_cache_write`, which
-    settles it against the per-call events. The skip is not applied inside
-    nested mappings: a ``cost`` breakdown itemizes cache-write *dollars*, which
-    have no second source, so dropping it would leave the sub-buckets short of
-    their own total.
-
-    Args:
-        acc: Accumulator mutated in place.
-        usage: A single turn's usage mapping.
-        top_level: Whether ``usage`` is the usage mapping itself rather than a
-            nested breakdown inside it.
+    The top-level ``cacheWrite`` is left to :func:`_resolve_cache_write`. The
+    skip does not apply inside nested mappings: a ``cost`` breakdown itemizes
+    cache-write *dollars*, which have no second source, so dropping it would
+    leave the sub-buckets short of their own total.
     """
     for key, value in usage.items():
         if (top_level and key == "cacheWrite") or isinstance(value, bool):
@@ -95,12 +88,7 @@ def _accumulate_usage(acc: dict, usage: dict, *, top_level: bool = True) -> None
 
 
 def _accumulate_cache_write(acc: dict, usage: object) -> None:
-    """Sum one event's ``cacheWrite`` into ``acc``, in place.
-
-    Args:
-        acc: Cache-write accumulator mutated in place.
-        usage: A usage mapping, or anything else (ignored).
-    """
+    """Sum one event's ``cacheWrite`` into ``acc``, in place."""
     if not isinstance(usage, dict):
         return
     written = usage.get("cacheWrite")
@@ -111,18 +99,12 @@ def _accumulate_cache_write(acc: dict, usage: object) -> None:
 def _resolve_cache_write(acc: dict, rollup: dict, per_call: dict) -> None:
     """Settle the ``cacheWrite`` bucket on whichever event reported it.
 
-    Today's ``model.completed`` rollup omits ``cacheWrite`` from both its
-    buckets and its ``total``, so the bucket is recovered from the per-call
-    ``assistant.message`` events and folded into the total -- the canonical
-    contract is that ``total`` is the sum of every bucket (see
-    :data:`~devops_bench.agents.result.TOKEN_BUCKETS`), and cache writes are
-    billed above input on Anthropic. A version that does report it has already
-    counted it in ``total``, so that value is taken as-is and nothing is folded.
-
-    Args:
-        acc: Token accumulator mutated in place.
-        rollup: Cache writes seen on ``model.completed.usage``.
-        per_call: Cache writes seen on ``assistant.message.usage``.
+    ``rollup`` is what ``model.completed.usage`` reported, ``per_call`` what the
+    ``assistant.message.usage`` events did. Today's rollup omits ``cacheWrite``
+    from both its buckets and its ``total``, so the per-call value is folded
+    into the total to keep the canonical "total is the sum of every bucket"
+    contract. A version that does report it has already counted it, so that
+    value is taken as-is.
     """
     written = rollup.get("cacheWrite")
     if isinstance(written, (int, float)):
@@ -167,16 +149,12 @@ def parse_trajectory_export(jsonl_text: str) -> ParsedRun:
 
     Returns:
         A :class:`~devops_bench.agents.shared.telemetry.ParsedRun`. ``tokens``
-        is the usage summed across every ``model.completed`` turn, not just the
-        last; ``cacheWrite`` is settled separately (see
-        :func:`_resolve_cache_write`). ``model_turns`` counts
-        ``assistant.message`` events, which is not ``len(trajectory)``: a single
-        message can carry several ``toolCall`` entries (seen live) and a
-        text-only message carries none.
-
-        There is no reasoning bucket: openclaw's usage payload carries none at
-        any thinking level (checked live at ``off`` and ``high``), so
-        ``reasoning`` normalizes to ``None`` rather than a fabricated ``0``.
+        is summed across every ``model.completed`` turn, not just the last;
+        ``cacheWrite`` is settled by :func:`_resolve_cache_write`. There is no
+        reasoning bucket — openclaw reports none at any thinking level, so it
+        normalizes to ``None`` rather than a fabricated ``0``. ``model_turns``
+        counts ``assistant.message`` events, which is not ``len(trajectory)``:
+        one message can carry several tool calls, and a text-only one none.
     """
     tokens: dict = {}
     rollup_cache_write: dict = {}
@@ -184,9 +162,8 @@ def parse_trajectory_export(jsonl_text: str) -> ParsedRun:
     errors: list[str] = []
     output = ""
     fallback_output: list[str] = []
-    # Each id maps to a FIFO queue of pending ``(call, started_at)`` pairs:
-    # distinct calls can legitimately reuse an id, so results are matched in
-    # emission order rather than the second call overwriting the first.
+    # FIFO queue of ``(call, started_at)`` per id: distinct calls can reuse an
+    # id, so results match in emission order rather than overwriting.
     pending: dict[str, list[tuple[ToolCall, float | None]]] = {}
     trajectory: list[ToolCall] = []
     model_turns = 0

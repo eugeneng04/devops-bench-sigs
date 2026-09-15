@@ -101,9 +101,8 @@ def _normalize_tool_name(name: str) -> str:
 _MCP_FAILED_STATUSES = frozenset({"failed", "error", "disconnected", "needs-auth", "needs_auth"})
 
 
-# The CLI's own reasons for ending the query loop, mapped onto
-# :data:`~devops_bench.agents.result.TERMINAL_REASONS`. Every other reason it
-# emits is a failure; the reason string itself always reaches ``errors``.
+# The CLI's own reasons for ending the query loop. Every other reason it emits
+# is a failure; the reason string itself always reaches ``errors``.
 _CLI_COMPLETED_REASON = "completed"
 _CLI_TURN_CAP_REASON = "max_turns"
 _CLI_TURN_CAP_SUBTYPE = "error_max_turns"
@@ -162,12 +161,11 @@ def parse_stream_json(stdout: str) -> ParsedRun:
     | ``result``    | terminal: authoritative answer, token usage, failure flag,|
     |               | ``terminal_reason``                                       |
 
-    ``assistant`` and ``user`` envelopes carry a top-level ISO-8601
-    ``timestamp``, so pairing a ``tool_use`` block with the ``tool_result`` that
-    answers it gives the run a real tool wait. The terminal event's
-    ``duration_ms``/``duration_api_ms`` are deliberately *not* used for this:
-    they measure concurrent work independently and their difference goes
-    negative on a real run (observed: 4901ms wall against 6553ms of API time).
+    ``tool_wait_sec`` pairs each ``tool_use`` block with the ``tool_result``
+    answering it, using the envelopes' top-level ISO-8601 ``timestamp``. The
+    terminal event's ``duration_ms``/``duration_api_ms`` are *not* used: they
+    measure concurrent work independently and their difference goes negative on
+    a real run (observed: 4901ms wall against 6553ms of API time).
 
     The accumulated assistant ``text`` doubles as a fallback answer when no
     terminal ``result`` event arrives (a truncated pipe) or when it carries an
@@ -182,14 +180,12 @@ def parse_stream_json(stdout: str) -> ParsedRun:
 
     Returns:
         A :class:`~devops_bench.agents.shared.telemetry.ParsedRun`.
-        ``model_turns`` counts distinct assistant ``message.id`` values, which
-        is *not* the terminal event's ``num_turns``: the CLI emits one envelope
-        per content block, so one API message answering with two ``tool_use``
-        blocks raises ``num_turns`` by two while the model was called once.
-        ``served_models`` is read from the assistant envelopes rather than the
-        terminal event's ``modelUsage``, whose keys also include the CLI's own
-        internal helper model (observed: a ``claude-haiku-4-5`` entry on a run
-        answered entirely by ``claude-opus-5``).
+        ``model_turns`` counts distinct assistant ``message.id`` values, not the
+        terminal event's ``num_turns``: the CLI emits one envelope per content
+        block, so one message with two ``tool_use`` blocks raises ``num_turns``
+        by two while the model was called once. ``served_models`` comes from the
+        assistant envelopes, not the terminal event's ``modelUsage``, whose keys
+        also include the CLI's own internal helper model.
     """
     text_parts: list[str] = []
     result_output: str | None = None
@@ -200,11 +196,9 @@ def parse_stream_json(stdout: str) -> ParsedRun:
     # content block of a single API message, all repeating that message's id.
     seen_message_ids: set[str] = set()
     errors: list[str] = []
-    # Each id maps to a FIFO queue of pending ``(call, started_at)`` pairs:
-    # distinct tool_use blocks can legitimately reuse an id, so results are
-    # matched in emission order rather than the second call overwriting the
-    # first. ``started_at`` is ``None`` on a stream whose envelopes carry no
-    # parseable timestamp.
+    # FIFO queue of ``(call, started_at)`` per id: distinct tool_use blocks can
+    # legitimately reuse an id, so results are matched in emission order rather
+    # than the second call overwriting the first.
     pending: dict[str, list[tuple[ToolCall, float | None]]] = {}
     trajectory: list[ToolCall] = []
     spans: list[tuple[float, float]] = []
@@ -238,20 +232,17 @@ def parse_stream_json(stdout: str) -> ParsedRun:
             message = event.get("message")
             if not isinstance(message, dict):
                 continue
-            # The CLI renders its own failures -- a 404, an over-long prompt, an
-            # interrupt -- as an assistant envelope stamped ``is_api_error_message``,
-            # carrying ``model: "<synthetic>"``, a UUID in place of a ``msg_``
-            # id and all-zero usage. Its text is the error the user should see,
-            # so it still feeds ``output``, but no model was called: counting it
-            # would put a model id that does not exist on the leaderboard and
-            # invent a round-trip.
+            # The CLI renders its own failures -- a 404, an over-long prompt --
+            # as an assistant envelope stamped ``is_api_error_message`` carrying
+            # ``model: "<synthetic>"`` and all-zero usage. Its text still feeds
+            # ``output``, but no model was called, so counting it would invent a
+            # round-trip under a model id that does not exist.
             if not event.get("is_api_error_message"):
-                # Accumulate per-turn usage so a truncated stream (no terminal
-                # ``result`` event) still yields token counts. Claude Code emits
-                # one envelope per content block of a single API message, each
-                # repeating the identical ``usage``, so count each message id
-                # only once. An envelope with no usable id is left uncounted
-                # rather than merged with every other unidentified message.
+                # Accumulate per-turn usage so a truncated stream still yields
+                # token counts, deduped by message id since the CLI repeats the
+                # identical ``usage`` on every content-block envelope. An
+                # envelope with no usable id is left uncounted rather than
+                # merged with every other unidentified message.
                 msg_id = message.get("id")
                 identified = isinstance(msg_id, str) and bool(msg_id)
                 if not (identified and msg_id in seen_message_ids):
@@ -321,8 +312,7 @@ def parse_stream_json(stdout: str) -> ParsedRun:
                 tokens = _usage_tokens(usage)
                 result_usage_seen = True
             # First terminal event wins: a later one must not append a failure
-            # the resolved reason no longer reflects, which would leave
-            # ``errors`` contradicting it.
+            # the resolved reason no longer reflects.
             if terminal_reason:
                 continue
             cli_reason = event.get("terminal_reason")
@@ -331,10 +321,9 @@ def parse_stream_json(stdout: str) -> ParsedRun:
             status = event.get("api_error_status")
             detail = f" (api status {status})" if status is not None else ""
             if cli_reason is not None and cli_reason != _CLI_COMPLETED_REASON:
-                # The CLI's reason names *why* the loop ended; the flags below
-                # only say that something went wrong. Prefer it, or a run
-                # stopped by ``prompt_too_long`` or ``api_error`` would be
-                # recorded as an anonymous failure.
+                # Preferred over the flags below, which only say that something
+                # went wrong: without it a ``prompt_too_long`` or ``api_error``
+                # run is recorded as an anonymous failure.
                 note = f"stream-json result terminal_reason: {cli_reason}{detail}"
             elif isinstance(subtype, str) and subtype.startswith("error_"):
                 note = f"stream-json result error: {subtype}"
@@ -347,9 +336,8 @@ def parse_stream_json(stdout: str) -> ParsedRun:
                 note = ""
             if note:
                 errors.append(note)
-            # ``terminal_reason`` is optional on the event, so a binary that
-            # omits it resolves from the failure flags and the subtype instead
-            # of falling through to the exit code.
+            # ``terminal_reason`` is optional on the event; a binary that omits
+            # it resolves from the flags and subtype rather than the exit code.
             capped = cli_reason == _CLI_TURN_CAP_REASON or subtype == _CLI_TURN_CAP_SUBTYPE
             terminal_reason = "error" if note and not capped else "completed"
 

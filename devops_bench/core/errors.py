@@ -90,10 +90,8 @@ class MissingDependencyError(DevOpsBenchError):
 class SubprocessError(DevOpsBenchError):
     """Raised when a subprocess exits non-zero or times out.
 
-    ``timed_out`` separates the two: a timeout is the harness cutting the agent
-    off mid-run, a non-zero exit is the agent failing on its own. Callers that
-    report why a run ended cannot tell them apart from ``returncode`` alone,
-    since a timeout is reported as ``-1``.
+    ``timed_out`` separates the two, which ``returncode`` cannot: a timeout is
+    reported as ``-1``.
     """
 
     def __init__(

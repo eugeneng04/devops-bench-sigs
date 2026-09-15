@@ -67,9 +67,8 @@ class Manifest(BaseModel):
         augmentation: Capability tokens active for the run (e.g.
             ``["mcp", "skills"]``); an empty list denotes the baseline arm.
         timeout_sec: The per-task wall-clock budget the agent ran under, or
-            ``None`` when uncapped. "Timed out" and "used 90% of its budget"
-            are both uninterpretable without it, and the budget is a run
-            setting that no row can recover after the fact.
+            ``None`` when uncapped. "Timed out" and "used 90% of its budget" are
+            both uninterpretable without it.
     """
 
     model_config = _MODEL_CONFIG
@@ -102,14 +101,11 @@ class ResultRow(BaseModel):
         setup_id: Run arm id; matches :attr:`Manifest.setup_id`.
         model: Model identifier; matches :attr:`Manifest.model`.
         harness: Canonical harness key; matches :attr:`Manifest.harness`.
-        served_model: The model that actually answered, when the harness
-            reports it; ``""`` when it does not. ``model`` is only what the run
-            *asked* for — a request for ``gemini-3-flash`` was served
-            ``gemini-3-flash-preview``, and openclaw fails over to a different
-            model mid-run — so a score attributed to ``model`` alone can name
-            the wrong one. Comma-joined in first-seen order on the rare run
-            that was served by more than one, which is itself the signal that
-            a failover happened.
+        served_model: The model that actually answered, ``""`` when the harness
+            does not report it. ``model`` is only what the run *asked* for: an
+            alias resolves to a dated id and a run can fail over mid-flight.
+            Comma-joined in first-seen order when more than one served the run,
+            which is itself the failover signal.
         augmentation: Capability tokens; matches :attr:`Manifest.augmentation`.
         run_id: Run directory suffix; matches :attr:`Manifest.run_id`.
         t: UTC ISO-8601 run timestamp; matches :attr:`Manifest.t`.
@@ -146,22 +142,19 @@ class ResultRow(BaseModel):
         scoring_version: Scoring-framework version that produced ``outcome_score``
             (e.g. ``"v1"``); ``""`` for rows written before the framework landed.
         tool_score: Tool-invocation judge score in ``[0, 1]``, or ``None``.
-        tool_calls: Number of tool calls in the run's trajectory, or ``None``
-            when no trajectory was captured. The unit of agentic work: two
-            models with the same score and the same wall clock can differ
-            several-fold here, and the trajectory itself is too large to
-            aggregate over at dashboard time.
+        tool_calls: Tool calls in the run's trajectory, or ``None`` when no
+            trajectory was captured. The unit of agentic work, and the
+            trajectory itself is too large to aggregate at dashboard time.
         tool_errors: How many of those calls returned an error. A high count
             against a passing score means the model recovered; against a
             failing one it usually means the environment broke, not the model.
-        model_turns: Model round-trips in the run, or ``None`` when the harness
-            cannot delimit them. Not ``tool_calls``: one turn can issue several
-            tool calls, and a text-only turn issues none.
+        model_turns: Model round-trips, or ``None`` when the harness cannot
+            delimit them. Not ``tool_calls``: one turn can issue several tool
+            calls, and a text-only turn issues none.
         latency_sec: Agent wall-clock seconds for the iteration.
-        tool_wait_sec: How much of ``latency_sec`` was spent waiting on tool
-            calls, with concurrent calls counted once, or ``None`` when the
-            harness reported no timings. Separates a slow environment from a
-            slow model on a leaderboard that ranks latency lower-is-better.
+        tool_wait_sec: How much of ``latency_sec`` went on tool calls,
+            concurrent calls counted once, or ``None`` when the harness reported
+            no timings. Separates a slow environment from a slow model.
         input_tokens: Non-cached prompt token count, or ``None`` when
             unreported. (Historical records that predate the canonical token
             schema may include cached tokens here.)
@@ -182,9 +175,7 @@ class ResultRow(BaseModel):
             killed at its wall-clock budget still reads ``status: "success"``.
         timeout_sec: The wall-clock budget this iteration ran under; matches
             :attr:`Manifest.timeout_sec`. Carried on the row because ingest
-            uploads ``rows.json`` alone — the manifest is never read — so a
-            run-level setting only reaches the dashboard by riding along.
-            ``None`` when uncapped.
+            uploads ``rows.json`` alone and never reads the manifest.
         validated: Whether the task is vetted as correct and eligible for the
             leaderboard; ingest gates promotion on this (default ``False``).
     """

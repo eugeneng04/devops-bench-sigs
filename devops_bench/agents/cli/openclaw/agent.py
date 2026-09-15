@@ -133,10 +133,8 @@ _OPENCLAW_STATE_DIRNAME = "state"
 _OPENCLAW_SKILLS_DIRNAME = "skills"
 _OPENCLAW_CONFIG_FILE = "openclaw.json"
 
-# Trajectory extraction runs after the agent turn, including after it timed out,
-# so it cannot inherit the turn's budget: two reads at ``timeout_sec`` each would
-# let one task occupy three times its allotted wall clock. These are local
-# metadata reads, not agent work.
+# Local metadata reads, not agent work, and they run after a timed-out turn too:
+# inheriting ``timeout_sec`` would let one task occupy three times its budget.
 _EXTRACT_TIMEOUT_SEC = 120
 
 # Bare model ids (the part after ``provider/``) absent from openclaw's built-in
@@ -481,13 +479,10 @@ class OpenClawAgent(AgentHarness):
                     timeout=self.config.timeout_sec,
                 )
             except SubprocessError as exc:
-                # Deliberately no early return. The kill ends the agent turn,
-                # but the session it wrote survives in ``OPENCLAW_STATE_DIR``
-                # and export-trajectory is a separate subprocess, so the tokens
-                # and tool calls it managed before the budget hit are still
-                # recoverable -- and a timed-out row is exactly where "how far
-                # did it get" is worth knowing. Antigravity recovers its
-                # transcript the same way.
+                # Deliberately no early return: the session survives in
+                # ``OPENCLAW_STATE_DIR`` and export-trajectory is a separate
+                # subprocess, so the tokens and tool calls the run managed
+                # before the kill are still recoverable.
                 completed, timed_out, agent_stdout = None, exc.timed_out, exc.stdout
             except OSError as exc:
                 return AgentResult.errored(
@@ -542,11 +537,11 @@ class OpenClawAgent(AgentHarness):
         isolated state the agent turn wrote to.
 
         Returns:
-            A :class:`~...shared.telemetry.ParsedRun`. Its ``output`` is the agent's
-            final answer parsed from the bundle's ``events.jsonl``
-            (``model.completed.assistantTexts``) when present, else ``""``; the
-            caller falls back to the ansi-stripped subprocess stdout when empty.
-            Every early-exit path returns an empty export carrying the errors.
+            A :class:`~...shared.telemetry.ParsedRun`. Its ``output`` is the
+            agent's final answer from the bundle's ``events.jsonl``
+            (``model.completed.assistantTexts``), else ``""`` — the caller then
+            falls back to the ansi-stripped subprocess stdout. Every early exit
+            returns an empty export carrying the errors.
         """
         errors: list[str] = []
         # The agent turn sources nvm inside a bash command, but these extraction

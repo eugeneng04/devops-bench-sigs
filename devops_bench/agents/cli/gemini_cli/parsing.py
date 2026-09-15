@@ -81,20 +81,17 @@ def parse_stream_json(stdout: str) -> ParsedRun:
         A :class:`~devops_bench.agents.shared.telemetry.ParsedRun`.
         ``tool_wait_sec`` pairs each ``tool_use`` with its ``tool_result``;
         ``served_models`` is ``init.model`` plus every key of
-        ``result.stats.models``, since the requested id can be an alias
-        (``gemini-3-flash`` resolved to ``gemini-3-flash-preview`` in a live
-        run) and ``auto`` resolves to two models in one run.
-        ``model_turns`` is segmented rather than read: the stream reports no
-        request count, and assistant ``message`` events are delta chunks (two
-        for one answer in a live run), so a turn is the model-authored run of
-        events between two ``tool_result`` batches.
+        ``result.stats.models``, since the requested id can be an alias and
+        ``auto`` resolves to two models in one run. ``model_turns`` is segmented
+        rather than read: the stream reports no request count and assistant
+        ``message`` events are delta chunks, so a turn is the model-authored run
+        of events between two ``tool_result`` batches.
     """
     output_parts: list[str] = []
     tokens: dict = {}
     errors: list[str] = []
-    # Each id maps to a FIFO queue of pending ``(call, started_at)`` pairs:
-    # distinct calls can legitimately reuse an id, so results are matched in
-    # emission order rather than the second call overwriting the first.
+    # FIFO queue of ``(call, started_at)`` per id: distinct calls can reuse an
+    # id, so results match in emission order rather than overwriting.
     pending: dict[str, list[tuple[ToolCall, float | None]]] = {}
     trajectory: list[ToolCall] = []
     spans: list[tuple[float, float]] = []
@@ -117,8 +114,8 @@ def parse_stream_json(stdout: str) -> ParsedRun:
         etype = event.get("type")
         event_time = parse_event_time(event.get("timestamp"))
         if etype == "init":
-            # ``auto`` is the router mode, not an id that answered; a live run
-            # under it was served by two models, both named in ``stats.models``.
+            # ``auto`` is the router mode, not an id that answered; the models
+            # it routed to are named in ``stats.models``.
             model = event.get("model")
             if model != "auto":
                 note_model(served_models, model)
@@ -141,11 +138,7 @@ def parse_stream_json(stdout: str) -> ParsedRun:
                 turns += 1
                 turn_open = True
             call_id = event.get("tool_id") or event.get("id") or event.get("tool_use_id") or ""
-            args = event.get("parameters")
-            if args is None:
-                args = event.get("input")
-            if args is None:
-                args = event.get("args")
+            args = event.get("parameters") or event.get("input") or event.get("args")
             call = ToolCall(
                 name=str(event.get("tool_name") or event.get("name") or ""),
                 args=args if isinstance(args, dict) else {},
@@ -183,10 +176,9 @@ def parse_stream_json(stdout: str) -> ParsedRun:
         elif etype == "result":
             # Terminal event: answer streams via ``message`` events and token
             # usage rides under ``stats``; accept ``output``/``response`` and
-            # ``tokens``/``usage`` as fallbacks.
-            # A later degenerate ``result`` (empty stats, answer repeated) must
-            # not clobber an earlier good one, so the first payload of each kind
-            # wins. ``models`` is exempt: a failover names a second one.
+            # ``tokens``/``usage`` as fallbacks. The first payload of each kind
+            # wins so a later degenerate ``result`` cannot clobber a good one;
+            # ``models`` is exempt, since a failover names a second one.
             tail = event.get("output") or event.get("response")
             if isinstance(tail, str) and tail and not output_parts:
                 output_parts.append(tail)

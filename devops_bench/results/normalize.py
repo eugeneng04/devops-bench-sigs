@@ -290,28 +290,13 @@ def _scoring_version(scores: Mapping[str, Any] | None) -> str:
 def count_tool_calls(trajectory: Any, errors: Any = None) -> tuple[int | None, int | None]:
     """Return ``(tool_calls, tool_errors)`` for a record's trajectory.
 
-    Only entries carrying a string ``name`` count, and only ``status ==
-    "error"`` counts as an error: ``called`` and ``interrupted`` are the same
-    condition — a call the parser never saw resolve — labelled differently by
-    different parsers, so counting either would make the column incomparable
-    across harnesses.
+    Only entries with a string ``name`` count, and only ``status == "error"`` is
+    an error: ``called`` and ``interrupted`` are one condition spelled two ways
+    by different parsers, so counting either would make the column incomparable.
 
-    An empty trajectory is ambiguous on its own: a run that legitimately
-    answered without calling a tool and a run whose transcript export failed
-    both land there. ``errors`` breaks the tie, because every path that loses a
-    transcript reports why. So an empty trajectory alongside an empty
-    ``errors`` list is a genuine ``(0, 0)``, and anything else stays ``None``
-    rather than sinking a dashboard average with a zero that means "not
-    captured".
-
-    Args:
-        trajectory: The record's ``trajectory`` list, or ``None``.
-        errors: The record's ``errors`` list. Omit it when the caller cannot
-            tell whether the run reported one; an empty trajectory then stays
-            ``(None, None)`` rather than being claimed as a genuine zero.
-
-    Returns:
-        A ``(tool_calls, tool_errors)`` pair, each ``int`` or ``None``.
+    An empty trajectory is ambiguous — a clean tool-less run and a failed
+    transcript export both land there — so it is a genuine ``(0, 0)`` only when
+    ``errors`` is an empty list, and ``(None, None)`` otherwise.
     """
     if not isinstance(trajectory, list):
         return None, None
@@ -331,10 +316,8 @@ def count_tool_calls(trajectory: Any, errors: Any = None) -> tuple[int | None, i
 def _served_model(value: Any) -> str:
     """Join the models that actually answered into one row field.
 
-    Returns ``""`` for anything unusable, so a harness that reports nothing is
-    distinguishable from one that reported a model. More than one entry means
-    the run failed over mid-flight, which is worth seeing rather than
-    collapsing to the first.
+    ``""`` for anything unusable. More than one entry means the run failed over
+    mid-flight, which is worth seeing rather than collapsing to the first.
     """
     if not isinstance(value, list):
         return ""
@@ -344,10 +327,8 @@ def _served_model(value: Any) -> str:
 def _non_negative_float_or_none(value: Any) -> float | None:
     """Coerce a recorded duration to a non-negative ``float``, else ``None``.
 
-    Unlike a count, ``0.0`` is a real measurement here -- tools that returned
-    inside the transcript's millisecond resolution -- so only a missing,
-    non-numeric, or negative value becomes ``None``. Booleans are rejected
-    because ``True`` is a ``float``-comparable ``int`` in Python.
+    ``0.0`` is a real measurement here, so only a missing, non-numeric, or
+    negative value becomes ``None``. ``bool`` is rejected: ``True`` is an ``int``.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None

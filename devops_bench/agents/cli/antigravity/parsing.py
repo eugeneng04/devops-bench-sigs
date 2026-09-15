@@ -405,16 +405,13 @@ def _turn_usage(blob: bytes) -> dict | None:
 class DbTokenState(NamedTuple):
     """What one read of an ``agy`` conversation DB recovered.
 
-    Attributes:
-        state: ``"ready"`` / ``"pending"`` / ``"undecodable"`` / ``"absent"``.
-        tokens: Canonical token dict when ``state`` is ``"ready"``, else ``None``.
-        turns: Decoded per-turn usage records, i.e. model round-trips, when
-            ``state`` is ``"ready"``; ``None`` otherwise.
+    ``tokens`` and ``turns`` (decoded per-turn usage records, i.e. model
+    round-trips) are populated only when ``state`` is ``"ready"``.
     """
 
     state: str
-    tokens: dict | None
-    turns: int | None
+    tokens: dict | None = None
+    turns: int | None = None
 
 
 def db_token_state(db_path: str | os.PathLike[str]) -> DbTokenState:
@@ -423,13 +420,11 @@ def db_token_state(db_path: str | os.PathLike[str]) -> DbTokenState:
     Returns:
         A :class:`DbTokenState` so the caller can handle the async flush:
 
-        * ``("ready", tokens, turns)`` — usage decoded; ``tokens`` is the
-          canonical dict and ``turns`` counts the per-turn records behind it.
-        * ``("pending", None, None)`` — an ``agy`` DB whose usage rows have not flushed
-          yet (retry after a short wait).
-        * ``("undecodable", None, None)`` — usage rows exist but none matches the
-          expected layout (schema drift; retrying will not help).
-        * ``("absent", None, None)`` — no DB, not an ``agy`` DB, or unreadable.
+        * ``ready`` — usage decoded; ``turns`` counts the records behind it.
+        * ``pending`` — usage rows have not flushed yet (retry shortly).
+        * ``undecodable`` — rows exist but none matches the expected layout
+          (schema drift; retrying will not help).
+        * ``absent`` — no DB, not an ``agy`` DB, or unreadable.
 
     Buckets are summed per-turn across ``gen_metadata``. ``cached`` is a genuine
     ``0`` when no turn hit the cache (protobuf omits the field when zero);
@@ -438,7 +433,7 @@ def db_token_state(db_path: str | os.PathLike[str]) -> DbTokenState:
     provider ``total_tokens``.
     """
     if not db_path or not os.path.exists(db_path):
-        return DbTokenState("absent", None, None)
+        return DbTokenState("absent")
     # The DB is read during agy's post-exit flush window, so a read can hit a
     # locked/half-written image (OperationalError/DatabaseError). Those are
     # transient -> "pending" so the poll retries; only genuinely unusable DBs
@@ -446,9 +441,9 @@ def db_token_state(db_path: str | os.PathLike[str]) -> DbTokenState:
     try:
         con = sqlite3.connect(f"file:{os.fspath(db_path)}?mode=ro", uri=True)
     except (sqlite3.OperationalError, sqlite3.DatabaseError):
-        return DbTokenState("pending", None, None)
+        return DbTokenState("pending")
     except sqlite3.Error:
-        return DbTokenState("absent", None, None)
+        return DbTokenState("absent")
 
     totals = {"input": 0, "cached": 0, "reasoning": 0, "output": 0}
     saw_row = False
@@ -458,8 +453,8 @@ def db_token_state(db_path: str | os.PathLike[str]) -> DbTokenState:
         tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if "gen_metadata" not in tables:
             if tables & _AGY_DB_TABLES:
-                return DbTokenState("pending", None, None)
-            return DbTokenState("absent", None, None)
+                return DbTokenState("pending")
+            return DbTokenState("absent")
         # Stream the cursor: peak memory is one blob, not the whole turn history.
         for (blob,) in con.execute("SELECT data FROM gen_metadata ORDER BY idx"):
             saw_row = True
@@ -472,18 +467,18 @@ def db_token_state(db_path: str | os.PathLike[str]) -> DbTokenState:
             for key in totals:
                 totals[key] += usage[key]
     except (sqlite3.OperationalError, sqlite3.DatabaseError):
-        return DbTokenState("pending", None, None)
+        return DbTokenState("pending")
     except sqlite3.Error:
-        return DbTokenState("absent", None, None)
+        return DbTokenState("absent")
     finally:
         con.close()
 
     if not saw_row:
         # table created but rows not flushed yet
-        return DbTokenState("pending", None, None)
+        return DbTokenState("pending")
     if not turns:
         # rows flushed, but no usage record matched
-        return DbTokenState("undecodable", None, None)
+        return DbTokenState("undecodable")
     tokens = empty_tokens()
     tokens.update(
         input=totals["input"],

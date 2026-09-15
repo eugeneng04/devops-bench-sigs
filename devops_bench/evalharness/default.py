@@ -1210,12 +1210,8 @@ class DefaultEvalHarness(Harness):
             "status": "",
             "error": None,
             "errors": [],
-            # Why the agent stopped (see ``agents.result.TERMINAL_REASONS``).
-            # Empty on a failed record: the harness never got far enough to
-            # observe the agent's own ending.
+            # All unknown on a record the harness never got far enough to run.
             "terminal_reason": "",
-            # Model round-trips and time inside tools; both unknown on a
-            # record the harness never ran.
             "model_turns": None,
             "tool_wait_sec": None,
             "served_models": [],

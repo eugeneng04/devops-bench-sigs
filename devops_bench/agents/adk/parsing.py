@@ -178,17 +178,16 @@ def parse_event_stream(events: Sequence[Any]) -> ParsedRun:
     Returns:
         A :class:`~devops_bench.agents.shared.telemetry.ParsedRun`. A call whose
         result never arrived stays ``status="called"`` with ``result=None``.
-        ``tool_wait_sec`` pairs each ``function_call`` with the event bearing its
-        ``function_response``; ``served_models`` reads ``model_version``, and
-        ``model_turns`` counts the events carrying ``usage_metadata``.
+        ``tool_wait_sec`` pairs each ``function_call`` with the event bearing
+        its ``function_response``, ``served_models`` reads ``model_version``,
+        and ``model_turns`` counts events carrying ``usage_metadata``.
     """
     output_parts: list[str] = []
     errors: list[str] = []
     trajectory: list[ToolCall] = []
-    # Pending calls carry their own start time, keyed by ADK's correlation id
-    # with a FIFO queue for the id-less calls some models emit. Each id maps to
-    # a queue rather than one call:
-    # distinct calls can legitimately reuse an id, so responses are matched in
+    # Pending ``(call, started_at)`` keyed by ADK's correlation id, with a
+    # separate FIFO for the id-less calls some models emit. Each id maps to a
+    # queue because distinct calls can reuse an id, so responses match in
     # emission order rather than the second call overwriting the first.
     pending_by_id: dict[str, list[tuple[ToolCall, float | None]]] = {}
     pending_unkeyed: deque[tuple[ToolCall, float | None]] = deque()
@@ -264,8 +263,8 @@ def parse_event_stream(events: Sequence[Any]) -> ParsedRun:
         errors=errors,
         tool_wait_sec=merged_span_sec(spans),
         served_models=served_models,
-        # 0 turns means the stream carried no usage at all, not a run that
-        # never called the model -- a stream exists because one was called.
+        # 0 turns means the stream carried no usage at all, not a run that never
+        # called the model: a stream exists because one was called.
         model_turns=turns or None,
     )
 
@@ -285,9 +284,8 @@ def _fold_response(
     nothing is reported on ``errors`` rather than dropped.
 
     Returns:
-        The matched call's start time, or ``None`` when the response matched no
-        call or that call's event carried no usable timestamp -- either way the
-        caller has nothing to time.
+        The matched call's start time, or ``None`` when nothing matched or the
+        matched call's event carried no usable timestamp.
     """
     call_id = response.get("id")
     matched: tuple[ToolCall, float | None] | None = None

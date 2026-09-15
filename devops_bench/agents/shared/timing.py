@@ -24,18 +24,10 @@ __all__ = ["merged_span_sec", "parse_event_time"]
 def parse_event_time(value: object) -> float | None:
     """Parse a transcript event timestamp into epoch seconds.
 
-    Two spellings reach here: CLI transcripts stamp ISO-8601 (``Z`` suffix or an
-    explicit offset), and the in-process ADK event stream stamps epoch seconds as
-    a ``float`` already. A stamp carrying no offset is read as UTC, so the result
-    never depends on the runner's local zone.
-
-    Args:
-        value: The raw ``ts`` / ``timestamp`` field, or anything else.
-
-    Returns:
-        Epoch seconds, or ``None`` when the value is missing or unparseable. A
-        transcript that drops the field is normal on older CLI versions, so this
-        is a "no timing available" signal, not an error.
+    CLI transcripts stamp ISO-8601; the ADK event stream stamps epoch seconds
+    already. A stamp with no offset is read as UTC so the result never depends
+    on the runner's local zone. Missing or unparseable is ``None``, meaning "no
+    timing available" rather than an error.
     """
     # ``bool`` first: ``True`` is an ``int``, and epoch second 1 is not a time.
     if isinstance(value, bool):
@@ -56,19 +48,12 @@ def parse_event_time(value: object) -> float | None:
 def merged_span_sec(intervals: list[tuple[float, float]]) -> float | None:
     """Return the wall-clock seconds covered by ``intervals``, overlaps counted once.
 
-    Agents dispatch tool calls in batches: a single model turn can issue several
-    calls stamped at the same millisecond that then run concurrently. Summing
-    their durations would report more tool time than the run took in total, so
-    overlapping intervals are merged before measuring.
-
-    Args:
-        intervals: ``(start, end)`` epoch-second pairs, in any order. Pairs whose
-            end precedes their start are dropped as clock skew.
-
-    Returns:
-        Seconds of wall clock inside at least one interval, or ``None`` when no
-        usable interval was supplied — distinct from ``0.0``, which means the
-        tools ran and returned within the transcript's resolution.
+    A model turn can dispatch several tool calls that run concurrently, so
+    summing their durations would report more tool time than the run took.
+    ``intervals`` are ``(start, end)`` epoch-second pairs in any order; a pair
+    ending before it starts is dropped as clock skew. ``None`` when none is
+    usable — distinct from ``0.0``, which means the tools returned within the
+    transcript's resolution.
     """
     usable = sorted((s, e) for s, e in intervals if e >= s)
     if not usable:
