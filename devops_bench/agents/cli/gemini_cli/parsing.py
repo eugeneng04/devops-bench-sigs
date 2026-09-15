@@ -70,7 +70,7 @@ def parse_stream_json(stdout: str) -> ParsedRun:
     | ``init``        | ``model`` (the id the CLI resolved to)                  |
     | ``message``     | ``role`` (assistant text accumulated into the output)   |
     | ``tool_use``    | ``tool_name``, ``tool_id``, ``parameters``, ``timestamp``|
-    | ``tool_result`` | ``tool_id``, ``status``, ``timestamp`` (no payload)     |
+    | ``tool_result`` | ``tool_id``, ``status``, ``is_error``, ``timestamp``, and ``content``/``output`` when present |
     | ``error``       | recorded on the errors list                             |
     | ``result``      | ``output``/``response``, ``stats`` (tokens, ``models``) |
 

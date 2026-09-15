@@ -48,10 +48,10 @@ class ParsedRun:
         served_models: Read from the transcript, which names the id the provider
             answered with rather than the one requested.
         model_turns: ``None`` when the transcript carried nothing to count.
-        terminal_reason: ``""`` when the transcript carried no terminal event --
-            a truncated pipe, which the caller resolves from the exit code
-            instead. ``"timeout"`` is the harness's own verdict and is never
-            derived from a transcript.
+        terminal_reason: ``""`` unless the transcript itself said why the run
+            stopped -- only the Claude CLI does, and even there a truncated pipe
+            leaves it empty. The harness resolves the rest from the exit code,
+            and ``"timeout"`` is always its own verdict.
     """
 
     output: str = ""
