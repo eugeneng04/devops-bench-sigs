@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Flag-only cheating detection over recorded agent trajectories.
+"""Cheating detection over recorded agent trajectories.
 
 Scans the canonical trajectory entries (``ToolCall.to_dict()`` shape, see
 :mod:`devops_bench.agents.result`) and the record's final ``output`` against a
@@ -20,8 +20,12 @@ ruleset of sensitive-access fingerprints, and attaches a ``cheating_report``
 to each record. Pure functions over record dicts — no env reads, no I/O — so
 the harness hook stays a thin caller and the scan is testable on its own.
 
-Detection never mutates scores, ``validated``, or any other record field, and
-never aborts a run: flags exist for human review only.
+Detection itself never mutates scores, ``validated``, or any other record
+field, and never aborts a run — it only writes the report. The consequence is
+applied elsewhere: :mod:`devops_bench.metrics.integrity` reads the report
+during scoring and gates a flagged run's ``OutcomeScore`` to zero. Keeping the
+verdict and its consequence in separate layers is what lets the scan stay a
+pure function that a reviewer can rerun over stored records.
 """
 
 from __future__ import annotations
