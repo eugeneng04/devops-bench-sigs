@@ -22,6 +22,7 @@ the per-metric score shapes along the way.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterable, Mapping
 from typing import Any, NamedTuple
@@ -391,7 +392,8 @@ def _non_negative_float_or_none(value: Any) -> float | None:
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value) if value >= 0 else None
+    # ``inf`` would serialize as the bare token ``Infinity``, which is not JSON.
+    return float(value) if math.isfinite(value) and value >= 0 else None
 
 
 def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list[ResultRow]:
@@ -428,8 +430,10 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
         outcome = None if unattributable else extract_score(scores, OUTCOME_SCORE_KEY)
         catastrophic_kinds = [k for k in _CATASTROPHIC_KEYS if extract_score(scores, k) == 0.0]
         tool_calls, tool_errors = count_tool_calls(record.get("trajectory"), record.get("errors"))
-        # A reported 0 is a parse miss, not a run that never called the model.
-        turns = _coerce_int(record.get("model_turns")) or None
+        # A reported 0 is a parse miss, not a run that never called the model;
+        # a negative one is corrupt.
+        turns = _coerce_int(record.get("model_turns"))
+        turns = turns if turns and turns > 0 else None
         rows.append(
             ResultRow(
                 setup_id=manifest.setup_id,

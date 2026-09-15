@@ -522,14 +522,23 @@ def _drive(
 
     async def _main() -> None:
         nonlocal reason
+        start = time.monotonic()
         try:
             if timeout_sec is None:
                 await _consume()
             else:
                 await asyncio.wait_for(_consume(), timeout=timeout_sec)
-        except TimeoutError:
-            errors.append(f"ADK run exceeded the {timeout_sec}s budget")
-            reason = "timeout"
+        except TimeoutError as exc:
+            # ``wait_for`` can only raise once the deadline has passed, and never
+            # with ``timeout=None`` — an earlier one came from inside the run
+            # (socket.timeout is a TimeoutError since 3.10), which is a failure,
+            # not an efficiency ceiling.
+            if timeout_sec is not None and time.monotonic() - start >= timeout_sec:
+                errors.append(f"ADK run exceeded the {timeout_sec}s budget")
+                reason = "timeout"
+            else:
+                errors.append(f"ADK run failed: {type(exc).__name__}: {exc}")
+                reason = "error"
         except Exception as exc:  # noqa: BLE001 - keep the partial trajectory
             errors.append(f"ADK run failed: {type(exc).__name__}: {exc}")
             reason = "error"

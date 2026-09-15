@@ -1007,6 +1007,35 @@ def test_drive_finishes_teardown_after_the_budget_expires(
     assert reason == "timeout"
 
 
+class InnerTimeoutRunner(SlowClosingRunner):
+    """Runner whose provider call raises ``TimeoutError`` well inside the budget."""
+
+    async def create_session(self, **kwargs: object) -> SimpleNamespace:
+        raise TimeoutError("provider read timed out")
+
+
+@requires_adk
+@pytest.mark.parametrize("budget", [600.0, None])
+def test_drive_reports_an_inner_timeout_as_an_error_not_the_budget(
+    monkeypatch: pytest.MonkeyPatch, budget: float | None
+) -> None:
+    """A provider socket timeout is a capability failure, not an efficiency ceiling.
+
+    ``socket.timeout`` has been a ``TimeoutError`` since 3.10, so the handler
+    that catches the budget expiring also sees every provider read timeout. With
+    no budget at all ``wait_for`` is never entered, yet the handler still fires —
+    labelling it ``timeout`` stamps a row whose ``timeoutSec`` is ``null``.
+    """
+    import google.adk.runners as adk_runners
+
+    monkeypatch.setattr(adk_runners, "InMemoryRunner", InnerTimeoutRunner)
+
+    _events, errors, reason = adk_mod._drive(object(), "prompt", budget)  # noqa: SLF001
+
+    assert reason == "error"
+    assert errors == ["ADK run failed: TimeoutError: provider read timed out"]
+
+
 def test_close_quietly_finishes_under_repeated_cancellation() -> None:
     """Teardown must not inherit cancellations aimed at the run that owns it.
 

@@ -47,6 +47,7 @@ from devops_bench.agents.cli.openclaw.agent import (
 from devops_bench.agents.cli.openclaw.parsing import _pick_session_key, _strip_ansi
 from devops_bench.agents.sandbox import SandboxSpec
 from devops_bench.core.errors import ConfigError, SubprocessError
+from devops_bench.results.normalize import count_tool_calls
 
 
 def _events(*entries: dict) -> str:
@@ -277,6 +278,22 @@ def test_parse_trajectory_export_leaves_tool_wait_none_without_timestamps() -> N
     """An export with no ``ts`` reports unmeasured, not zero seconds in tools."""
     blob = _events(_tool_call("1", "a", {}), _tool_result("1", "ok"))
     assert parse_trajectory_export(blob).tool_wait_sec is None
+
+
+def test_parse_trajectory_export_coerces_a_null_tool_name() -> None:
+    """A null name must not cost the call its row in the telemetry counts.
+
+    ``dict.get(key, default)`` returns ``None`` when the key is present holding
+    null, and ``count_tool_calls`` skips any entry whose name is not a ``str`` —
+    so an export like this dropped a failed call and reported zero tool errors.
+    """
+    blob = _events(
+        {"type": "tool.call", "data": {"toolCallId": "1", "name": None, "arguments": {}}},
+        _tool_result("1", "boom", is_error=True),
+    )
+    export = parse_trajectory_export(blob)
+    assert export.trajectory[0]["name"] == ""
+    assert count_tool_calls(export.trajectory) == (1, 1)
 
 
 def test_parse_trajectory_export_sums_nested_cost_breakdown() -> None:

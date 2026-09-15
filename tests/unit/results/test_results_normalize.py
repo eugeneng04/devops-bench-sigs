@@ -748,6 +748,10 @@ def test_build_rows_keeps_a_zero_tool_wait_but_drops_a_missing_one() -> None:
     assert wait({}) is None
     assert wait({"tool_wait_sec": -1.0}) is None
     assert wait({"tool_wait_sec": True}) is None
+    # ``json.dumps`` writes inf as the bare token ``Infinity``, which is not
+    # JSON, so one skewed transcript timestamp would poison the whole file.
+    assert wait({"tool_wait_sec": float("inf")}) is None
+    assert wait({"tool_wait_sec": float("nan")}) is None
 
 
 def test_build_rows_reports_unusable_model_turns_as_none() -> None:
@@ -766,6 +770,9 @@ def test_build_rows_reports_unusable_model_turns_as_none() -> None:
     assert turns(True) is None
     assert turns("4") is None
     assert turns(None) is None
+    # A negative count is corrupt, and the neighbouring tool_wait_sec already
+    # rejects one; the rebatch path reads records straight off disk.
+    assert turns(-3) is None
 
 
 def test_normalize_tokens_reads_cli_camelcase_buckets() -> None:

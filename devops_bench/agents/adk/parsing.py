@@ -233,7 +233,7 @@ def parse_event_stream(events: Sequence[Any]) -> ParsedRun:
             if isinstance(call, Mapping):
                 args = call.get("args")
                 entry = ToolCall(
-                    name=str(call.get("name", "")),
+                    name=str(call.get("name") or ""),
                     args=dict(args) if isinstance(args, Mapping) else {},
                 )
                 trajectory.append(entry)

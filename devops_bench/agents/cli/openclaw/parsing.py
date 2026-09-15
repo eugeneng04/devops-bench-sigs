@@ -223,7 +223,7 @@ def parse_trajectory_export(jsonl_text: str) -> ParsedRun:
             call_id = data.get("toolCallId") or data.get("id") or ""
             args = data.get("arguments")
             call = ToolCall(
-                name=data.get("name", ""),
+                name=str(data.get("name") or ""),
                 args=args if isinstance(args, dict) else {},
                 status="called",
             )

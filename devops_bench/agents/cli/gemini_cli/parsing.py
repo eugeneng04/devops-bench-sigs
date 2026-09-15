@@ -152,7 +152,7 @@ def parse_stream_json(stdout: str) -> ParsedRun:
             if args is None:
                 args = event.get("args")
             call = ToolCall(
-                name=event.get("tool_name") or event.get("name", ""),
+                name=str(event.get("tool_name") or event.get("name") or ""),
                 args=args if isinstance(args, dict) else {},
                 status="called",
             )
@@ -189,20 +189,24 @@ def parse_stream_json(stdout: str) -> ParsedRun:
             # Terminal event: answer streams via ``message`` events and token
             # usage rides under ``stats``; accept ``output``/``response`` and
             # ``tokens``/``usage`` as fallbacks.
+            # A later degenerate ``result`` (empty stats, answer repeated) must
+            # not clobber an earlier good one, so the first payload of each kind
+            # wins. ``models`` is exempt: a failover names a second one.
             tail = event.get("output") or event.get("response")
-            if isinstance(tail, str) and tail:
+            if isinstance(tail, str) and tail and not output_parts:
                 output_parts.append(tail)
             stats = event.get("stats")
             usage = event.get("tokens") or event.get("usage")
-            if isinstance(stats, dict):
-                tokens = _canonical_tokens(stats)
+            if isinstance(stats, dict) and stats:
+                if not tokens:
+                    tokens = _canonical_tokens(stats)
                 # ``stats.models`` is keyed by the model that served each slice
                 # of the usage, so a mid-run switch shows up as a second key.
                 per_model = stats.get("models")
                 if isinstance(per_model, Mapping):
                     for name in per_model:
                         note_model(served_models, name)
-            elif isinstance(usage, dict):
+            elif isinstance(usage, dict) and usage and not tokens:
                 tokens = usage
 
     return ParsedRun(

@@ -43,6 +43,7 @@ from devops_bench.agents.cli.gemini_cli.agent import (
 )
 from devops_bench.agents.sandbox import SandboxSpec
 from devops_bench.core.errors import ConfigError, SubprocessError
+from devops_bench.results.normalize import count_tool_calls
 
 
 def _stream(*events: dict) -> str:
@@ -149,6 +150,34 @@ def test_parse_stream_json_does_not_record_auto_as_a_served_model() -> None:
     )
     parsed = parse_stream_json(blob)
     assert parsed.served_models == ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
+
+
+def test_parse_stream_json_coerces_a_null_tool_name() -> None:
+    """A null name must not cost the call its row in the telemetry counts.
+
+    ``count_tool_calls`` skips any entry whose name is not a ``str``, so a
+    stream like this dropped the call and reported zero tool errors.
+    """
+    blob = _stream({"type": "tool_use", "tool_id": "1", "tool_name": None, "name": None})
+    parsed = parse_stream_json(blob)
+    assert parsed.trajectory[0]["name"] == ""
+    assert count_tool_calls(parsed.trajectory) == (1, 0)
+
+
+def test_parse_stream_json_keeps_the_first_terminal_results_payload() -> None:
+    """A later degenerate ``result`` must not wipe the counts or repeat the answer.
+
+    The CLI can emit a second terminal event carrying an empty ``stats`` block;
+    overwriting on it lost every token bucket, and appending its ``output``
+    again returned the answer twice.
+    """
+    blob = _stream(
+        {"type": "result", "output": "the answer", "stats": {"input_tokens": 100}},
+        {"type": "result", "output": "the answer", "stats": {}},
+    )
+    parsed = parse_stream_json(blob)
+    assert parsed.output == "the answer"
+    assert parsed.tokens["input"] == 100
 
 
 def test_parse_stream_json_segments_model_turns_between_tool_batches() -> None:
