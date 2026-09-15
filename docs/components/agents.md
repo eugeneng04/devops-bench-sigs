@@ -213,6 +213,30 @@ persisted.
 > means `transfer_to_agent` hops and the delegate's own calls are flattened
 > together.
 
+### Remote agents
+
+A `RemoteA2aAgent` is a `BaseAgent`, so the harness drives one unmodified. What
+differs is where its answer lives. ADK attaches the raw A2A task envelope to the
+event under `custom_metadata['a2a:response']`, and the answer is that task's
+`status.message` — the `content.parts` built alongside it mirror the trailing
+artifact instead. The parser reads the envelope, and takes the status message as
+the answer only on `completed` — a `working` / `input_required` /
+`auth_required` message is progress commentary, and the event's own text is used
+instead.
+
+A failed task (`failed`, `canceled`, `rejected`) is recorded on the result's
+errors and contributes **nothing** to the output: neither its status message,
+which is a failure notice, nor its content parts, which mirror the artifact. The
+record is still written as `status: "success"` and scored, so either one left in
+the output would be graded as the agent's answer.
+
+A remote agent's trajectory is normally empty and its token counts `None`: the
+tool calls and LLM calls happen on the far side of the boundary, so they usually
+never reach the event stream as ADK parts. This is a property of what the remote
+reports, not a rule the parser enforces — an A2A event carrying
+`function_call` / `function_response` parts is folded into the trajectory like
+any other, and `usage_metadata` is accumulated wherever ADK supplies it.
+
 The agent runs with the harness-owned workspace as the process working
 directory, matching the `cwd` the CLI harnesses hand their subprocess. An agent
 with filesystem tools that writes a relative path (`report.md`) therefore lands
