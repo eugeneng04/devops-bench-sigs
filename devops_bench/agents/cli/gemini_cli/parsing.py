@@ -87,7 +87,8 @@ def parse_stream_json(stdout: str) -> ParsedRun:
         ``tool_wait_sec`` pairs each ``tool_use`` with its ``tool_result``;
         ``served_models`` is ``init.model`` plus every key of
         ``result.stats.models``, since the requested id can be an alias
-        (``gemini-3-flash`` resolved to ``gemini-3-flash-preview`` in a live run).
+        (``gemini-3-flash`` resolved to ``gemini-3-flash-preview`` in a live
+        run) and ``auto`` resolves to two models in one run.
         ``model_turns`` is segmented rather than read: the stream reports no
         request count, and assistant ``message`` events are delta chunks (two
         for one answer in a live run), so a turn is the model-authored run of
@@ -121,7 +122,11 @@ def parse_stream_json(stdout: str) -> ParsedRun:
         etype = event.get("type")
         event_time = parse_event_time(event.get("timestamp"))
         if etype == "init":
-            note_model(served_models, event.get("model"))
+            # ``auto`` is the router mode, not an id that answered; a live run
+            # under it was served by two models, both named in ``stats.models``.
+            model = event.get("model")
+            if model != "auto":
+                note_model(served_models, model)
         elif etype == "message":
             # ``role="user"`` echoes the prompt and is skipped.
             if event.get("role") in ("assistant", "model"):

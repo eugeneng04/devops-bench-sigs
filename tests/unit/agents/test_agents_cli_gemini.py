@@ -133,6 +133,23 @@ def test_parse_stream_json_leaves_served_models_empty_when_unreported() -> None:
     assert parse_stream_json(blob).served_models == []
 
 
+def test_parse_stream_json_does_not_record_auto_as_a_served_model() -> None:
+    """``auto`` is the router mode; the models it picked are in ``stats``.
+
+    Captured live: ``init.model`` was ``auto`` and one prompt was served by
+    ``gemini-3.1-flash-lite`` and ``gemini-3.5-flash`` together.
+    """
+    blob = _stream(
+        {"type": "init", "model": "auto"},
+        {
+            "type": "result",
+            "stats": {"models": {"gemini-3.1-flash-lite": {}, "gemini-3.5-flash": {}}},
+        },
+    )
+    parsed = parse_stream_json(blob)
+    assert parsed.served_models == ["gemini-3.1-flash-lite", "gemini-3.5-flash"]
+
+
 def test_parse_stream_json_segments_model_turns_between_tool_batches() -> None:
     """Shape captured live: one turn issues both reads, a second answers.
 
