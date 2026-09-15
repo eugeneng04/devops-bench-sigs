@@ -35,9 +35,9 @@ TOKEN_BUCKETS: tuple[str, ...] = ("input", "cached", "cache_write", "reasoning",
 
 #: Why an agent run stopped, as the *harness* observed it.
 #:
-#: - ``completed``: the agent handed control back on its own. A CLI agent's own
-#:   internal turn cap is invisible from outside the process, so a capped run
-#:   lands here too.
+#: - ``completed``: the agent handed control back on its own. An agent's own
+#:   internal turn cap lands here too -- it is the agent deciding to stop, not
+#:   the harness cutting it off.
 #: - ``timeout``: the harness's wall-clock budget aborted the run.
 #: - ``error``: the run failed (subprocess fault, provider error, crash).
 #: - ``""``: not reported. Kept distinct from ``completed`` so a harness that
@@ -101,9 +101,9 @@ class AgentResult:
             on a clean run; populated when a known-error path (subprocess
             failure, parse miss, timeout) is reached — never silently dropped.
         terminal_reason: Why the run stopped; one of :data:`TERMINAL_REASONS`,
-            rejected with ``ValueError`` otherwise. A run cut off at the turn
-            cap or the wall-clock budget scores like a wrong answer, so without
-            this an efficiency ceiling reads as a capability failure.
+            rejected with ``ValueError`` otherwise. A run the harness cut off at
+            its wall-clock budget scores like a wrong answer, so without this an
+            efficiency ceiling reads as a capability failure.
         tool_wait_sec: Wall-clock seconds the run spent inside tool calls, with
             concurrent calls counted once, or ``None`` when the transcript
             carried no timings. ``latency`` alone cannot separate a slow model

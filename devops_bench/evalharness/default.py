@@ -1207,9 +1207,9 @@ class DefaultEvalHarness(Harness):
             model=model,
             harness=harness,
             augmentation=augmentation,
-            # Only the wall-clock cap: ``max_turns`` is read by the API agent
-            # alone, so stamping it would advertise a CLI arm a budget that
-            # never bound it.
+            # Only the wall-clock cap: ``max_turns`` binds the API agent and the
+            # Claude CLI but no other harness, so stamping it run-wide would
+            # advertise the other arms a budget that never bound them.
             timeout_sec=self._agent_config.timeout_sec,
             judge_model=self._judge_model_name,
         )

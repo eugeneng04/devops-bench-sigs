@@ -211,7 +211,7 @@ A flattened view, one row per setup × task × run × iteration, defined in [`ro
 
 Token buckets are `inputTokens`, `cachedTokens`, `cacheWriteTokens`, `reasoningTokens`, `outputTokens` and `totalTokens`. On canonical telemetry the total is the sum of the rest; totals are read from the record and never recomputed, so a pre-canonical row can carry a total that excludes cached or reasoning tokens. A bucket the harness did not report is `null`, never `0`.
 
-Four things are deliberate here:
+Five things are deliberate here:
 
 - `latencySec` is the **agent span**, not the whole harness run — workspace setup and transcript parsing are excluded, so the number is comparable across harnesses that differ in setup cost.
 - Scores are kept **continuous** (never pre-thresholded into pass/fail), so any pass@k formula stays computable downstream.
@@ -221,7 +221,7 @@ Four things are deliberate here:
 
 ### `manifest.json` — run-level identity
 
-The shared identity for every row in the run: schema version, `runId`, timestamp, `setupId`, `model`, `harness`, and `augmentation`.
+The shared identity for every row in the run: schema version, `runId`, timestamp, `setupId`, `model`, `harness`, `augmentation`, and `timeoutSec` (the wall-clock budget, which is run-level because every iteration ran under the same one).
 
 ## How to read a result
 
