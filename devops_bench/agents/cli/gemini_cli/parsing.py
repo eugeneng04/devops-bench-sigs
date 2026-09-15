@@ -24,15 +24,10 @@ import json
 from collections.abc import Mapping
 
 from devops_bench.agents.result import ToolCall, empty_tokens
-from devops_bench.agents.shared.telemetry import ParsedRun, note_model
+from devops_bench.agents.shared.telemetry import ParsedRun, int_or_none, note_model
 from devops_bench.agents.shared.timing import merged_span_sec, parse_event_time
 
 __all__: list[str] = ["parse_stream_json"]
-
-
-def _int_or_none(value: object) -> int | None:
-    """Coerce to ``int``, rejecting ``bool`` (a JSON ``true`` is not a count)."""
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _canonical_tokens(stats: Mapping[str, object]) -> dict[str, int | None]:
@@ -45,10 +40,10 @@ def _canonical_tokens(stats: Mapping[str, object]) -> dict[str, int | None]:
     subtractions are clamped at ``0`` so an over-reported ``cached`` (or a
     rounding quirk) can never yield a negative bucket.
     """
-    full_input = _int_or_none(stats.get("input_tokens"))
-    output = _int_or_none(stats.get("output_tokens"))
-    total = _int_or_none(stats.get("total_tokens"))
-    cached = _int_or_none(stats.get("cached"))
+    full_input = int_or_none(stats.get("input_tokens"))
+    output = int_or_none(stats.get("output_tokens"))
+    total = int_or_none(stats.get("total_tokens"))
+    cached = int_or_none(stats.get("cached"))
     inp = (
         max(full_input - cached, 0) if full_input is not None and cached is not None else full_input
     )

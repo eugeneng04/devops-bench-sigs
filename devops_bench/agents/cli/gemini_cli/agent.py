@@ -307,16 +307,11 @@ class GeminiCliAgent(AgentHarness):
                 # gemini row comparable with openclaw's and antigravity's,
                 # which also recover partial telemetry.
                 partial = parse_stream_json(exc.stdout or "")
-                return AgentResult(
-                    output=partial.output or f"Error: gemini subprocess error: {exc}",
-                    trajectory=partial.trajectory,
-                    tokens=partial.tokens,
+                return partial.to_result(
                     latency=time.monotonic() - started,
-                    errors=[f"gemini subprocess error: {exc}", *partial.errors],
                     terminal_reason="timeout" if exc.timed_out else "error",
-                    tool_wait_sec=partial.tool_wait_sec,
-                    served_models=partial.served_models,
-                    model_turns=partial.model_turns,
+                    output=partial.output or f"Error: gemini subprocess error: {exc}",
+                    errors=[f"gemini subprocess error: {exc}", *partial.errors],
                 )
             except OSError as exc:
                 # Missing / non-executable binary; core.subprocess.run does not wrap.
@@ -326,25 +321,19 @@ class GeminiCliAgent(AgentHarness):
             agent_sec = time.monotonic() - started
 
         parsed = parse_stream_json(completed.stdout or "")
-        output, trajectory, tokens = parsed.output, parsed.trajectory, parsed.tokens
+        output = parsed.output
         errors: list[str] = list(parsed.errors)
+        metadata: dict = {}
         if completed.returncode != 0:
             stderr = (completed.stderr or "").strip()
             errors.append(f"gemini exited {completed.returncode}: {stderr or '<no stderr>'}")
             if not output:
                 output = f"Error: gemini exited {completed.returncode}"
-        metadata: dict = {}
-        if completed.returncode != 0:
             metadata["returncode"] = completed.returncode
-        return AgentResult(
-            output=output,
-            trajectory=trajectory,
-            tokens=tokens,
+        return parsed.to_result(
             latency=agent_sec,
-            errors=errors,
             terminal_reason="error" if completed.returncode != 0 else "completed",
-            tool_wait_sec=parsed.tool_wait_sec,
-            served_models=parsed.served_models,
-            model_turns=parsed.model_turns,
+            output=output,
+            errors=errors,
             metadata=metadata,
         )

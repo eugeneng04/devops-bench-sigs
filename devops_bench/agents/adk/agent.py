@@ -658,15 +658,10 @@ class AdkAgent(base.AgentHarness):
         if not output and errors:
             output = f"Error: {errors[0]}"
 
-        return agents_result.AgentResult(
-            output=output,
-            trajectory=parsed.trajectory,
-            tokens=parsed.tokens,
+        return parsed.to_result(
             latency=agent_sec,
-            errors=errors,
             terminal_reason=terminal_reason,
-            tool_wait_sec=parsed.tool_wait_sec,
-            served_models=parsed.served_models,
-            model_turns=parsed.model_turns,
+            output=output,
+            errors=errors,
             metadata=metadata,
         )

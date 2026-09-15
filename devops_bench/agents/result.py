@@ -17,11 +17,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal, get_args
 
 __all__: list[str] = [
     "AgentResult",
     "TERMINAL_REASONS",
+    "TerminalReason",
     "TOKEN_BUCKETS",
     "ToolCall",
     "empty_tokens",
@@ -41,7 +42,8 @@ TOKEN_BUCKETS: tuple[str, ...] = ("input", "cached", "cache_write", "reasoning",
 #: - ``error``: the run failed (subprocess fault, provider error, crash).
 #: - ``""``: not reported. Kept distinct from ``completed`` so a harness that
 #:   has not been taught to set this is not read as having finished cleanly.
-TERMINAL_REASONS: tuple[str, ...] = ("", "completed", "timeout", "error")
+TerminalReason = Literal["", "completed", "timeout", "error"]
+TERMINAL_REASONS: tuple[TerminalReason, ...] = get_args(TerminalReason)
 
 
 def empty_tokens() -> dict[str, int | None]:
@@ -126,7 +128,7 @@ class AgentResult:
     tokens: dict[str, Any] = field(default_factory=dict)
     latency: float = 0.0
     errors: list[str] = field(default_factory=list)
-    terminal_reason: str = ""
+    terminal_reason: TerminalReason = ""
     tool_wait_sec: float | None = None
     served_models: list[str] = field(default_factory=list)
     model_turns: int | None = None

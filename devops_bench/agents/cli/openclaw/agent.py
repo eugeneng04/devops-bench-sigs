@@ -902,17 +902,12 @@ class OpenClawAgent(AgentHarness):
         else:
             reason = "error" if completed.returncode != 0 else "completed"
 
-        return AgentResult(
-            output=output,
-            trajectory=export.trajectory,
-            tokens=export.tokens,
+        return export.to_result(
             latency=agent_sec,
-            errors=errors,
             # A failed trajectory export is not a reason the *agent* stopped.
             terminal_reason=reason,
-            tool_wait_sec=export.tool_wait_sec,
-            served_models=export.served_models,
-            model_turns=export.model_turns,
+            output=output,
+            errors=errors,
             metadata=metadata,
         )
 
