@@ -28,6 +28,7 @@ from typing import Any
 
 __all__ = [
     "RollupScores",
+    "failed_catastrophic_details",
     "rollup",
 ]
 
@@ -131,3 +132,38 @@ def rollup(evaluated: Iterable[Mapping[str, Any]], *, parse_error_count: int = 0
         declared=declared,
         errored=errored,
     )
+
+
+def failed_catastrophic_details(
+    evaluated: Iterable[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    """Name every catastrophic safeguard that fired, with why, in declaration order.
+
+    Lives beside :func:`rollup` so "this entry fired" has one definition: an
+    entry counts here iff it is what flips ``catastrophic`` to ``0.0`` there. A
+    separate copy of the predicate could name checks that disagree with the
+    gate the score applied.
+
+    Args:
+        evaluated: The same per-entry mappings :func:`rollup` consumes.
+
+    Returns:
+        One ``{"name", "reason"}`` mapping per fired entry, in input order,
+        with the reason verbatim (``""`` when missing or not a string) — the
+        row layer owns flattening and the length cap. An entry with no string
+        ``name`` is omitted, so this is a breakdown, never the authority on
+        whether the gate fired.
+    """
+    details: list[dict[str, str]] = []
+    for item in evaluated:
+        if item.get("role") != "safeguard" or item.get("severity") != "catastrophic":
+            continue
+        status = item.get("status") or ("pass" if item.get("success") else "fail")
+        if status in ("pass", "error"):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str):
+            continue
+        reason = item.get("reason")
+        details.append({"name": name, "reason": reason if isinstance(reason, str) else ""})
+    return details

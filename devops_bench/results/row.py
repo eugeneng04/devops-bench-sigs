@@ -29,25 +29,82 @@ manifest interfaces while the Python attributes stay snake_case.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 
-__all__ = ["SCHEMA_VERSION", "Manifest", "ResultRow"]
+__all__ = ["SCHEMA_VERSION", "CatastrophicDetail", "Manifest", "ResultRow"]
 
 #: Version of the ``rows.json`` / ``manifest.json`` contract. Bump on any
 #: breaking field change so a downstream ingest can detect a shape mismatch.
 #: v2 adds the scoring-framework v1 fields (``outcomeScore`` becomes the composite
 #: score; ``correctnessScore`` / ``recoverableSafetyScore`` / ``catastrophic`` /
-#: ``scoringVersion`` are added). ``catastrophicKinds`` was added later within v2:
-#: additive with a default, so not a breaking change.
+#: ``scoringVersion`` are added). ``catastrophicKinds`` and ``catastrophicDetails``
+#: were added later within v2: additive with defaults, so not breaking changes.
 SCHEMA_VERSION = 2
 
 # Frozen + camelCase aliases. ``populate_by_name`` keeps the snake_case
 # attribute names usable as constructor kwargs (the normalizer builds rows that
 # way), while ``to_dict`` dumps the camelCase aliases the dashboard expects.
 _MODEL_CONFIG = ConfigDict(frozen=True, alias_generator=to_camel, populate_by_name=True)
+
+#: Cap on a published reason. The verdict text is written for a
+#: ``results.json`` reader and has no length discipline — a ``kubectl wait``
+#: failure pastes its whole stderr — so the row caps it.
+_MAX_REASON_CHARS = 240
+
+#: Whitespace, C0/C1 controls, zero-width characters, and the bidi overrides
+#: and isolates that would let a reason reorder the text rendered around it.
+#: Written as escapes because most are invisible in a source file.
+_REASON_UNSAFE = re.compile(
+    r"[\s"
+    r"\x00-\x1f\x7f-\x9f"  # C0 and C1 controls
+    r"\u200b-\u200f"  # zero-width space/joiners, LTR and RTL marks
+    r"\u2028-\u202e"  # line and paragraph separators, bidi embeds and overrides
+    r"\u2060\u2066-\u2069\ufeff"  # word joiner, bidi isolates, BOM
+    r"]+"
+)
+
+
+class CatastrophicDetail(BaseModel):
+    """One check behind a fired catastrophic gate: what it was, and why it fired.
+
+    Attributes:
+        name: The check's identity, as the gate's own layer names it — the
+            task-author entry name for ``"VerificationCatastrophic"``, the
+            detection rule id for ``"IntegrityCatastrophic"``.
+        reason: Why this check fired, flattened to one line and capped at
+            :data:`_MAX_REASON_CHARS`. ``""`` means "not recorded", never "no
+            reason to fire".
+
+            **Treat this as untrusted text.** A verifier formats the value it
+            observed into its verdict, and the agent under test can be the one
+            that wrote that value — a safeguard holding a ConfigMap key the
+            agent may set puts a string of the model's choosing on a published
+            row. Flattening bounds the *form* of the text, not its content, so
+            a consumer must escape it at the point of display.
+    """
+
+    model_config = _MODEL_CONFIG
+
+    name: str
+    reason: str = ""
+
+    @field_validator("reason")
+    @classmethod
+    def _sanitize_reason(cls, value: str) -> str:
+        """Flatten to one safe line, then cap — on the model, so every reader inherits it.
+
+        Both halves are idempotent, which matters because ``rebatch_rows``
+        re-validates stored rows and a validator that re-cut would erode a
+        reason a little more on every pass.
+        """
+        flattened = _REASON_UNSAFE.sub(" ", value).strip()
+        if len(flattened) <= _MAX_REASON_CHARS:
+            return flattened
+        return flattened[: _MAX_REASON_CHARS - 1] + "…"
 
 
 class Manifest(BaseModel):
@@ -128,6 +185,12 @@ class ResultRow(BaseModel):
             list because both gates can fire on one run; empty when none did —
             or when the row predates this field, so an empty list is not
             evidence of a clean run unless ``catastrophic`` is also ``False``.
+        catastrophic_details: Per-gate breakdown of *which* checks fired and
+            why, keyed by entries of ``catastrophic_kinds``, so a row says
+            which safeguard and what it observed without a reader opening
+            ``results.json``. Absent or empty means "not recorded" (no detail
+            reader for that gate, or a row predating this field), never
+            "nothing fired" — ``catastrophic_kinds`` stays the authority.
         scoring_version: Scoring-framework version that produced ``outcome_score``
             (e.g. ``"v1"``); ``""`` for rows written before the framework landed.
         tool_score: Tool-invocation judge score in ``[0, 1]``, or ``None``.
@@ -166,6 +229,7 @@ class ResultRow(BaseModel):
     recoverable_safety_score: float | None = None
     catastrophic: bool = False
     catastrophic_kinds: list[str] = Field(default_factory=list)
+    catastrophic_details: dict[str, list[CatastrophicDetail]] = Field(default_factory=dict)
     scoring_version: str = ""
     tool_score: float | None
     latency_sec: float
