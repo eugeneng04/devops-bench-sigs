@@ -22,12 +22,10 @@ __all__ = ["merged_span_sec", "parse_event_time"]
 
 
 def parse_event_time(value: object) -> float | None:
-    """Parse a transcript event timestamp into epoch seconds.
+    """Parse an ISO-8601 or epoch-second timestamp; ``None`` when unusable.
 
-    CLI transcripts stamp ISO-8601; the ADK event stream stamps epoch seconds
-    already. A stamp with no offset is read as UTC so the result never depends
-    on the runner's local zone. Missing or unparseable is ``None``, meaning "no
-    timing available" rather than an error.
+    An offset-less stamp is read as UTC, so the result never depends on the
+    runner's local zone.
     """
     # ``bool`` first: ``True`` is an ``int``, and epoch second 1 is not a time.
     if isinstance(value, bool):
@@ -46,13 +44,11 @@ def parse_event_time(value: object) -> float | None:
 
 
 def merged_span_sec(intervals: list[tuple[float, float]]) -> float | None:
-    """Return the wall-clock seconds covered by ``intervals``, overlaps counted once.
+    """Return wall-clock seconds covered by ``(start, end)`` pairs, overlaps once.
 
-    A model turn can dispatch several tool calls that run concurrently, so
-    summing their durations would report more tool time than the run took.
-    ``intervals`` are ``(start, end)`` epoch-second pairs in any order; a pair
-    ending before it starts is dropped as clock skew. ``None`` when none is
-    usable — distinct from ``0.0``, which means the tools returned within the
+    A turn can dispatch concurrent calls, so summing durations would overcount.
+    A pair ending before it starts is dropped as clock skew. ``None`` when none
+    is usable — distinct from ``0.0``, meaning the tools returned inside the
     transcript's resolution.
     """
     usable = sorted((s, e) for s, e in intervals if e >= s)

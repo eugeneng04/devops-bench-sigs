@@ -42,8 +42,7 @@ def test_agent_result_defaults_to_empty_collections() -> None:
     assert result.metadata == {}
     assert result.latency == 0.0
     assert not result.has_errors()
-    # Unreported, not "finished cleanly" — a harness that has not been taught
-    # to set this must not be read as having observed a clean ending.
+    # Unreported, not "finished cleanly": an untaught harness must not read as clean.
     assert result.terminal_reason == ""
 
 

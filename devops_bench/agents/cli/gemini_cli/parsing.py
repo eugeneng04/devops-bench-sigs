@@ -79,19 +79,14 @@ def parse_stream_json(stdout: str) -> ParsedRun:
 
     Returns:
         A :class:`~devops_bench.agents.shared.telemetry.ParsedRun`.
-        ``tool_wait_sec`` pairs each ``tool_use`` with its ``tool_result``;
-        ``served_models`` is ``init.model`` plus every key of
-        ``result.stats.models``, since the requested id can be an alias and
-        ``auto`` resolves to two models in one run. ``model_turns`` is segmented
-        rather than read: the stream reports no request count and assistant
-        ``message`` events are delta chunks, so a turn is the model-authored run
-        of events between two ``tool_result`` batches.
+        ``served_models`` merges ``init.model`` with ``result.stats.models``,
+        since ``auto`` can resolve to two models in one run. ``model_turns`` is
+        segmented between ``tool_result`` batches; the stream reports no count.
     """
     output_parts: list[str] = []
     tokens: dict = {}
     errors: list[str] = []
-    # FIFO queue of ``(call, started_at)`` per id: distinct calls can reuse an
-    # id, so results match in emission order rather than overwriting.
+    # FIFO per id: reused ids match in emission order instead of overwriting.
     pending: dict[str, list[tuple[ToolCall, float | None]]] = {}
     trajectory: list[ToolCall] = []
     spans: list[tuple[float, float]] = []
@@ -114,8 +109,7 @@ def parse_stream_json(stdout: str) -> ParsedRun:
         etype = event.get("type")
         event_time = parse_event_time(event.get("timestamp"))
         if etype == "init":
-            # ``auto`` is the router mode, not an id that answered; the models
-            # it routed to are named in ``stats.models``.
+            # ``auto`` is the router mode; what it routed to is in ``stats.models``.
             model = event.get("model")
             if model != "auto":
                 note_model(served_models, model)
@@ -174,11 +168,7 @@ def parse_stream_json(stdout: str) -> ParsedRun:
             msg = event.get("message") or event.get("error") or str(event)
             errors.append(f"stream-json error event: {msg}")
         elif etype == "result":
-            # Terminal event: answer streams via ``message`` events and token
-            # usage rides under ``stats``; accept ``output``/``response`` and
-            # ``tokens``/``usage`` as fallbacks. The first payload of each kind
-            # wins so a later degenerate ``result`` cannot clobber a good one;
-            # ``models`` is exempt, since a failover names a second one.
+            # Fallbacks: first wins over what already streamed, except ``models``.
             tail = event.get("output") or event.get("response")
             if isinstance(tail, str) and tail and not output_parts:
                 output_parts.append(tail)
@@ -187,8 +177,7 @@ def parse_stream_json(stdout: str) -> ParsedRun:
             if isinstance(stats, dict) and stats:
                 if not tokens:
                     tokens = _canonical_tokens(stats)
-                # ``stats.models`` is keyed by the model that served each slice
-                # of the usage, so a mid-run switch shows up as a second key.
+                # Keyed per serving model, so a mid-run switch adds a second key.
                 per_model = stats.get("models")
                 if isinstance(per_model, Mapping):
                     for name in per_model:

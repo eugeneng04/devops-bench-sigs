@@ -50,12 +50,7 @@ _UNDECODABLE_MAX_ATTEMPTS = 2
 
 
 def _read_db_state(db_path: pathlib.Path) -> parsing.DbTokenState:
-    """Read canonical token usage and the turn count from the conversation DB.
-
-    Polls ``conversations/<uuid>.db`` for the async flush while it reports
-    ``pending``, and returns the last state read. Its ``tokens`` / ``turns`` are
-    ``None`` when usage never materializes.
-    """
+    """Poll the conversation DB through its async flush; return the last state read."""
     undecodable_seen = 0
     state = parsing.DbTokenState("absent")
     for attempt in range(_DB_FLUSH_POLL_ATTEMPTS):
@@ -311,8 +306,7 @@ class AgyCliAgent(base.AgentHarness):
                     latency=time.monotonic() - started,
                 )
             finally:
-                # Stamp the span before cleanup: unlinking the token is harness
-                # work, so a slow filesystem must not land in the agent's span.
+                # Stamp before cleanup: unlinking the token is harness work.
                 agent_sec = time.monotonic() - started
                 # agy only needs the token while running. Remove the copy once it
                 # exits so the live credential never lingers in a workspace that

@@ -133,8 +133,7 @@ _OPENCLAW_STATE_DIRNAME = "state"
 _OPENCLAW_SKILLS_DIRNAME = "skills"
 _OPENCLAW_CONFIG_FILE = "openclaw.json"
 
-# Local metadata reads, not agent work, and they run after a timed-out turn too:
-# inheriting ``timeout_sec`` would let one task occupy three times its budget.
+# Local metadata reads; inheriting ``timeout_sec`` would treble a task's budget.
 _EXTRACT_TIMEOUT_SEC = 120
 
 # Bare model ids (the part after ``provider/``) absent from openclaw's built-in
@@ -479,10 +478,7 @@ class OpenClawAgent(AgentHarness):
                     timeout=self.config.timeout_sec,
                 )
             except SubprocessError as exc:
-                # Deliberately no early return: the session survives in
-                # ``OPENCLAW_STATE_DIR`` and export-trajectory is a separate
-                # subprocess, so the tokens and tool calls the run managed
-                # before the kill are still recoverable.
+                # No early return: the session survives the kill, so the export still works.
                 completed, timed_out, agent_stdout = None, exc.timed_out, exc.stdout
             except OSError as exc:
                 return AgentResult.errored(
@@ -537,11 +533,9 @@ class OpenClawAgent(AgentHarness):
         isolated state the agent turn wrote to.
 
         Returns:
-            A :class:`~...shared.telemetry.ParsedRun`. Its ``output`` is the
-            agent's final answer from the bundle's ``events.jsonl``
-            (``model.completed.assistantTexts``), else ``""`` — the caller then
-            falls back to the ansi-stripped subprocess stdout. Every early exit
-            returns an empty export carrying the errors.
+            A :class:`~...shared.telemetry.ParsedRun`. ``output`` is the answer
+            from the bundle, else ``""`` and the caller falls back to stdout.
+            Every early exit returns an empty export carrying the errors.
         """
         errors: list[str] = []
         # The agent turn sources nvm inside a bash command, but these extraction

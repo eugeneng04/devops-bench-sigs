@@ -75,9 +75,7 @@ _CATASTROPHIC_KEYS = score_keys.CATASTROPHIC_SCORE_KEYS
 # Token usage aliases per provider, in lookup priority. The canonical keys
 # (``input`` / ``cached`` / ``reasoning`` / ``output``; see
 # ``devops_bench.agents.result.TOKEN_BUCKETS``) come first; the rest keep
-# historical ``results.json`` records readable. The CLI harnesses pass their
-# tool's own usage keys through verbatim, so the tool's spelling is part of
-# this contract. Totals here are read, never recomputed.
+# historical ``results.json`` records readable, CLI spellings included.
 _INPUT_TOKEN_KEYS = ("input", "prompt_tokens", "prompt_token_count", "input_tokens")
 _OUTPUT_TOKEN_KEYS = (
     "output",
@@ -290,13 +288,10 @@ def _scoring_version(scores: Mapping[str, Any] | None) -> str:
 def count_tool_calls(trajectory: Any, errors: Any = None) -> tuple[int | None, int | None]:
     """Return ``(tool_calls, tool_errors)`` for a record's trajectory.
 
-    Only entries with a string ``name`` count, and only ``status == "error"`` is
-    an error: ``called`` and ``interrupted`` are one condition spelled two ways
-    by different parsers, so counting either would make the column incomparable.
-
-    An empty trajectory is ambiguous — a clean tool-less run and a failed
-    transcript export both land there — so it is a genuine ``(0, 0)`` only when
-    ``errors`` is an empty list, and ``(None, None)`` otherwise.
+    Only ``status == "error"`` is an error: ``called`` and ``interrupted`` are
+    one condition spelled two ways, so counting either would skew the column.
+    An empty trajectory is ``(0, 0)`` only when ``errors`` is an empty list,
+    since a failed transcript export looks the same as a tool-less run.
     """
     if not isinstance(trajectory, list):
         return None, None
@@ -314,21 +309,16 @@ def count_tool_calls(trajectory: Any, errors: Any = None) -> tuple[int | None, i
 
 
 def _served_model(value: Any) -> str:
-    """Join the models that actually answered into one row field.
-
-    ``""`` for anything unusable. More than one entry means the run failed over
-    mid-flight, which is worth seeing rather than collapsing to the first.
-    """
+    """Comma-join the models that answered; several means a mid-run failover."""
     if not isinstance(value, list):
         return ""
     return ",".join(v for v in value if isinstance(v, str) and v)
 
 
 def _non_negative_float_or_none(value: Any) -> float | None:
-    """Coerce a recorded duration to a non-negative ``float``, else ``None``.
+    """Coerce a duration to a non-negative ``float``, else ``None``.
 
-    ``0.0`` is a real measurement here, so only a missing, non-numeric, or
-    negative value becomes ``None``. ``bool`` is rejected: ``True`` is an ``int``.
+    ``0.0`` is a real measurement here. ``bool`` is rejected: ``True`` is an ``int``.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -358,8 +348,7 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
         correctness = _first_score(scores, _CORRECTNESS_KEYS)
         catastrophic_kinds = [k for k in _CATASTROPHIC_KEYS if extract_score(scores, k) == 0.0]
         tool_calls, tool_errors = count_tool_calls(record.get("trajectory"), record.get("errors"))
-        # A reported 0 is a parse miss, not a run that never called the model;
-        # a negative one is corrupt.
+        # A reported 0 is a parse miss; a negative one is corrupt.
         turns = _coerce_int(record.get("model_turns"))
         turns = turns if turns and turns > 0 else None
         rows.append(

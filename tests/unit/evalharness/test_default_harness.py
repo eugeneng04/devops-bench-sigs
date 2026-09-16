@@ -788,8 +788,7 @@ def test_failed_record_keys_match_golden(isolated_env: None) -> None:
     assert record["status"] == "failed"
     assert record["error"] == "deployer.up() failed"
     assert record["errors"] == ["deployer.up() failed"]
-    # The failure happened outside the agent, so there is no agent ending to
-    # report — "" rather than "error", which would blame the agent.
+    # The failure was outside the agent: "" rather than "error", which would blame it.
     assert record["terminal_reason"] == ""
 
 

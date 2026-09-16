@@ -482,21 +482,10 @@ def _drive(
 ) -> tuple[list[dict], list[str], str]:
     """Run the agent to completion and collect its serialized event stream.
 
-    ``events`` is populated as the stream arrives rather than at the end: ADK
-    surfaces a failing tool by yielding an error event and *then* raising out of
-    the iterator, so a run that dies mid-way still has a partial trajectory
-    worth scoring. Both the timeout and the failure are recorded as errors and
-    returned alongside whatever was collected.
-
-    Args:
-        root_agent: The prepared ADK agent.
-        prompt: Task prompt to send as the user message.
-        timeout_sec: Wall-clock budget, or ``None`` for no limit.
-
-    Returns:
-        An ``(events, errors, terminal_reason)`` tuple. The budget expiring and
-        the run failing both leave a partial trajectory, so the errors list
-        alone cannot tell them apart.
+    ``events`` fills as the stream arrives: ADK yields an error event and *then*
+    raises, so a run that dies mid-way still has a trajectory worth scoring.
+    ``terminal_reason`` is returned because a timeout and a failure both leave
+    one, so ``errors`` alone cannot tell them apart.
     """
     from google.adk.runners import InMemoryRunner
     from google.genai import types
@@ -528,9 +517,7 @@ def _drive(
             else:
                 await asyncio.wait_for(_consume(), timeout=timeout_sec)
         except TimeoutError as exc:
-            # ``wait_for`` only raises once the deadline has passed; an earlier
-            # one came from inside the run (socket.timeout is a TimeoutError),
-            # which is a failure, not an efficiency ceiling.
+            # An earlier TimeoutError came from inside the run, so it is a failure.
             if timeout_sec is not None and time.monotonic() - start >= timeout_sec:
                 errors.append(f"ADK run exceeded the {timeout_sec}s budget")
                 reason = "timeout"
@@ -639,9 +626,7 @@ class AdkAgent(base.AgentHarness):
         prepared, metadata, errors = self._prepare(root_agent)
         if workspace_path is not None:
             metadata["workspace"] = str(workspace_path)
-        # Latency brackets the agent run alone: resolving the target and
-        # preparing the tree is harness setup, and folding it in would make an
-        # ADK row's latency incomparable with a CLI row's.
+        # Bracket the agent run alone; resolving and preparing the tree is setup.
         started = time.monotonic()
         with _in_workspace(workspace_path):
             events, run_errors, terminal_reason = _drive(prepared, prompt, self.config.timeout_sec)

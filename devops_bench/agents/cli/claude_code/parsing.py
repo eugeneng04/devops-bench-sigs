@@ -101,8 +101,7 @@ def _normalize_tool_name(name: str) -> str:
 _MCP_FAILED_STATUSES = frozenset({"failed", "error", "disconnected", "needs-auth", "needs_auth"})
 
 
-# The CLI's own reasons for ending the query loop. Every other reason it emits
-# is a failure; the reason string itself always reaches ``errors``.
+# The CLI's own loop-exit reasons; every other reason it emits is a failure.
 _CLI_COMPLETED_REASON = "completed"
 _CLI_TURN_CAP_REASON = "max_turns"
 _CLI_TURN_CAP_SUBTYPE = "error_max_turns"
@@ -161,11 +160,10 @@ def parse_stream_json(stdout: str) -> ParsedRun:
     | ``result``    | terminal: authoritative answer, token usage, failure flag,|
     |               | ``terminal_reason``                                       |
 
-    ``tool_wait_sec`` pairs each ``tool_use`` block with the ``tool_result``
-    answering it, using the envelopes' top-level ISO-8601 ``timestamp``. The
-    terminal event's ``duration_ms``/``duration_api_ms`` are *not* used: they
-    measure concurrent work independently and their difference goes negative on
-    a real run (observed: 4901ms wall against 6553ms of API time).
+    ``tool_wait_sec`` pairs each ``tool_use`` with its ``tool_result`` by
+    envelope ``timestamp``. The terminal ``duration_ms``/``duration_api_ms`` are
+    *not* used: their difference goes negative on real runs (observed 4901ms
+    wall against 6553ms of API time).
 
     The accumulated assistant ``text`` doubles as a fallback answer when no
     terminal ``result`` event arrives (a truncated pipe) or when it carries an
@@ -180,25 +178,20 @@ def parse_stream_json(stdout: str) -> ParsedRun:
 
     Returns:
         A :class:`~devops_bench.agents.shared.telemetry.ParsedRun`.
-        ``model_turns`` counts distinct assistant ``message.id`` values, not the
-        terminal event's ``num_turns``: the CLI emits one envelope per content
-        block, so one message with two ``tool_use`` blocks raises ``num_turns``
-        by two while the model was called once. ``served_models`` comes from the
-        assistant envelopes, not the terminal event's ``modelUsage``, whose keys
-        also include the CLI's own internal helper model.
+        ``model_turns`` counts distinct assistant ``message.id`` values, not
+        ``num_turns``, which the CLI raises once per content block rather than
+        per model call. ``served_models`` comes from the assistant envelopes,
+        not ``modelUsage``, whose keys include the CLI's own helper model.
     """
     text_parts: list[str] = []
     result_output: str | None = None
     tokens: dict = empty_tokens()
     result_usage_seen = False
     acc_usage: dict = {}
-    # Doubles as the model-turn counter: Claude Code emits one envelope per
-    # content block of a single API message, all repeating that message's id.
+    # Doubles as the model-turn counter; one envelope per content block repeats the id.
     seen_message_ids: set[str] = set()
     errors: list[str] = []
-    # FIFO queue of ``(call, started_at)`` per id: distinct tool_use blocks can
-    # legitimately reuse an id, so results are matched in emission order rather
-    # than the second call overwriting the first.
+    # FIFO per id: reused ids match in emission order instead of overwriting.
     pending: dict[str, list[tuple[ToolCall, float | None]]] = {}
     trajectory: list[ToolCall] = []
     spans: list[tuple[float, float]] = []
@@ -232,17 +225,9 @@ def parse_stream_json(stdout: str) -> ParsedRun:
             message = event.get("message")
             if not isinstance(message, dict):
                 continue
-            # The CLI renders its own failures -- a 404, an over-long prompt --
-            # as an assistant envelope stamped ``is_api_error_message`` carrying
-            # ``model: "<synthetic>"`` and all-zero usage. Its text still feeds
-            # ``output``, but no model was called, so counting it would invent a
-            # round-trip under a model id that does not exist.
+            # A CLI-rendered error envelope carries a synthetic model and no real call.
             if not event.get("is_api_error_message"):
-                # Accumulate per-turn usage so a truncated stream still yields
-                # token counts, deduped by message id since the CLI repeats the
-                # identical ``usage`` on every content-block envelope. An
-                # envelope with no usable id is left uncounted rather than
-                # merged with every other unidentified message.
+                # Per-turn usage backs a truncated stream; dedupe the repeated id.
                 msg_id = message.get("id")
                 identified = isinstance(msg_id, str) and bool(msg_id)
                 if not (identified and msg_id in seen_message_ids):
@@ -311,8 +296,7 @@ def parse_stream_json(stdout: str) -> ParsedRun:
             if isinstance(usage, dict) and _has_usage(usage):
                 tokens = _usage_tokens(usage)
                 result_usage_seen = True
-            # First terminal event wins: a later one must not append a failure
-            # the resolved reason no longer reflects.
+            # First terminal event wins; a later one no longer reflects the reason.
             if terminal_reason:
                 continue
             cli_reason = event.get("terminal_reason")
@@ -321,23 +305,18 @@ def parse_stream_json(stdout: str) -> ParsedRun:
             status = event.get("api_error_status")
             detail = f" (api status {status})" if status is not None else ""
             if cli_reason is not None and cli_reason != _CLI_COMPLETED_REASON:
-                # Preferred over the flags below, which only say that something
-                # went wrong: without it a ``prompt_too_long`` or ``api_error``
-                # run is recorded as an anonymous failure.
+                # Names the failure; the flags below only say one happened.
                 note = f"stream-json result terminal_reason: {cli_reason}{detail}"
             elif isinstance(subtype, str) and subtype.startswith("error_"):
                 note = f"stream-json result error: {subtype}"
             elif event.get("is_error"):
-                # A failed API call can still carry ``subtype: "success"``
-                # (observed: a 404 model-not-found). Without this the run would
-                # score as clean with an empty trajectory and zeroed usage.
+                # A failed call can still say ``subtype: "success"`` (observed: a 404).
                 note = f"stream-json result flagged is_error{detail}"
             else:
                 note = ""
             if note:
                 errors.append(note)
-            # ``terminal_reason`` is optional on the event; a binary that omits
-            # it resolves from the flags and subtype rather than the exit code.
+            # ``terminal_reason`` is optional; a binary omitting it resolves from the flags.
             capped = cli_reason == _CLI_TURN_CAP_REASON or subtype == _CLI_TURN_CAP_SUBTYPE
             terminal_reason = "error" if note and not capped else "completed"
 
@@ -369,32 +348,16 @@ _USAGE_KEYS = (
 
 
 def _has_usage(usage: dict) -> bool:
-    """True if ``usage`` carries at least one recognized integer count.
-
-    Distinguishes a terminal ``result`` that reported genuine (possibly zero)
-    counts from one that reported nothing, so the accumulator fallback only
-    fires in the latter case.
-    """
+    """True if ``usage`` has a recognized count, so a genuine zero is not a miss."""
     return any(int_or_none(usage.get(key)) is not None for key in _USAGE_KEYS)
 
 
-# ``output_tokens`` is deliberately absent from the accumulator. The per-turn
-# ``usage`` on an assistant envelope is the streaming ``message_start`` snapshot,
-# whose ``output_tokens`` is a placeholder of a few tokens rather than the final
-# count (observed: a summed 3 against a terminal 3069). The prompt-side fields do
-# accumulate faithfully, so they are kept and ``output`` is left unreported —
-# per the bucket contract, an absent number beats an invented one.
+# Per-turn ``output_tokens`` is a ``message_start`` placeholder (observed 3 vs 3069).
 _ACC_USAGE_KEYS = tuple(key for key in _USAGE_KEYS if key != "output_tokens")
 
 
 def _add_usage(acc: dict, usage: object) -> None:
-    """Fold an Anthropic per-turn ``usage`` block into a running accumulator.
-
-    Callers dedupe by message id first, so each API message is added once. The
-    terminal ``result`` usage is cumulative and authoritative; this accumulator
-    is only a best-effort stand-in for a truncated stream that never emits it,
-    and covers :data:`_ACC_USAGE_KEYS` only.
-    """
+    """Fold a per-turn ``usage`` block in; a stand-in for a truncated stream."""
     if not isinstance(usage, dict):
         return
     for key in _ACC_USAGE_KEYS:
@@ -406,18 +369,10 @@ def _add_usage(acc: dict, usage: object) -> None:
 def _usage_tokens(usage: dict) -> dict[str, int | None]:
     """Normalize an Anthropic ``usage`` block onto :data:`TOKEN_BUCKETS`.
 
-    ``input_tokens`` is already the uncached prompt; cache reads and writes stay
-    separate buckets (writes bill at a premium). Extended thinking is billed
-    *inside* ``output_tokens`` and counted again under
-    ``output_tokens_details.thinking_tokens``, so it is subtracted back out to
-    honour the contract that ``output`` excludes ``reasoning`` while ``total``
-    stays exact. Without that details block ``reasoning`` stays ``None`` rather
-    than a fabricated ``0``.
-
-    ``total`` is only filled in once ``output`` is known. The accumulator path
-    leaves that bucket unreported on purpose (see :data:`_ACC_USAGE_KEYS`), and
-    a prompt-side-only sum published under ``total`` reaches the dashboard row
-    verbatim — an absent total beats one that undercounts the whole output side.
+    Thinking is billed inside ``output_tokens`` and repeated under
+    ``output_tokens_details``, so it is subtracted back out to keep ``output``
+    free of ``reasoning``. ``total`` is filled only once ``output`` is known: a
+    prompt-side-only sum would reach the dashboard as an undercount.
     """
     tokens = empty_tokens()
     output = int_or_none(usage.get("output_tokens"))

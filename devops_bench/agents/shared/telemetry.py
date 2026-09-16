@@ -25,13 +25,11 @@ __all__ = ["ParsedRun", "int_or_none", "note_model"]
 
 @dataclasses.dataclass(slots=True)
 class ParsedRun:
-    """What one agent transcript yielded.
+    """What one agent transcript yielded; fields follow :class:`AgentResult`.
 
-    Fields carry the semantics documented on
-    :class:`~devops_bench.agents.result.AgentResult`. ``tool_wait_sec`` is a
-    lower bound: a call whose two envelopes are not both timestamped counts for
-    nothing. ``terminal_reason`` is ``""`` unless the transcript itself said why
-    the run stopped (only the Claude CLI does); the harness resolves the rest.
+    ``tool_wait_sec`` is a lower bound: a call whose two envelopes are not both
+    timestamped counts for nothing. ``terminal_reason`` is ``""`` unless the
+    transcript said why the run stopped; only the Claude CLI does.
     """
 
     output: str = ""
@@ -54,9 +52,8 @@ class ParsedRun:
     ) -> AgentResult:
         """Carry this run's telemetry onto an :class:`AgentResult`.
 
-        ``output``, ``errors`` and ``metadata`` override the parsed values with
-        what the harness resolved. ``terminal_reason`` is always the harness's
-        call: only it knows whether it killed the process.
+        Overrides win over the parsed values. ``terminal_reason`` is always the
+        harness's call: only it knows whether it killed the process.
         """
         return AgentResult(
             output=self.output if output is None else output,

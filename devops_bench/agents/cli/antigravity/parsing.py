@@ -403,11 +403,7 @@ def _turn_usage(blob: bytes) -> dict | None:
 
 
 class DbTokenState(NamedTuple):
-    """What one read of an ``agy`` conversation DB recovered.
-
-    ``tokens`` and ``turns`` (decoded per-turn usage records, i.e. model
-    round-trips) are populated only when ``state`` is ``"ready"``.
-    """
+    """One read of an ``agy`` DB; ``tokens``/``turns`` are set only when ``ready``."""
 
     state: str
     tokens: dict | None = None
@@ -418,19 +414,10 @@ def db_token_state(db_path: str | os.PathLike[str]) -> DbTokenState:
     """Read canonical token usage from an ``agy`` conversation DB.
 
     Returns:
-        A :class:`DbTokenState` so the caller can handle the async flush:
-
-        * ``ready`` — usage decoded; ``turns`` counts the records behind it.
-        * ``pending`` — usage rows have not flushed yet (retry shortly).
-        * ``undecodable`` — rows exist but none matches the expected layout
-          (schema drift; retrying will not help).
-        * ``absent`` — no DB, not an ``agy`` DB, or unreadable.
-
-    Buckets are summed per-turn across ``gen_metadata``. ``cached`` is a genuine
-    ``0`` when no turn hit the cache (protobuf omits the field when zero);
-    ``cache_write`` is always ``None``. ``total`` is the full footprint
-    (input + cached + reasoning + output), the same quantity as Gemini's
-    provider ``total_tokens``.
+        A :class:`DbTokenState`. Only ``pending`` is worth retrying — the flush
+        is async; ``undecodable`` is schema drift and ``absent`` is terminal.
+        Buckets sum per turn across ``gen_metadata``; ``cached`` is a genuine
+        ``0`` (protobuf omits it when zero) and ``cache_write`` always ``None``.
     """
     if not db_path or not os.path.exists(db_path):
         return DbTokenState("absent")

@@ -90,8 +90,7 @@ class MissingDependencyError(DevOpsBenchError):
 class SubprocessError(DevOpsBenchError):
     """Raised when a subprocess exits non-zero or times out.
 
-    ``timed_out`` separates the two, which ``returncode`` cannot: a timeout is
-    reported as ``-1``.
+    ``timed_out`` distinguishes them; a timeout's ``returncode`` is ``-1``.
     """
 
     def __init__(

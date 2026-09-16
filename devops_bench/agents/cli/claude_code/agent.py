@@ -354,14 +354,9 @@ class ClaudeCodeAgent(AgentHarness):
                         input=_CLOSED_STDIN,
                     )
                 except SubprocessError as exc:
-                    # Report a timeout as one rather than as an exit -1 that
-                    # reads like a crash. str(exc) embeds the child's full
-                    # stderr, so rebuild the message from the clipped tail rather
-                    # than interpolating it. The timeout carries the partial
-                    # stream-json captured before the kill; fall through so the
-                    # trajectory is recovered rather than dropped.
+                    # No early return: the stream-json captured before the kill parses.
                     timed_out = exc.timed_out
-                    stderr = _stderr_tail(exc.stderr)
+                    stderr = _stderr_tail(exc.stderr)  # str(exc) embeds the child's full stderr.
                     returncode = exc.returncode
                     stdout = exc.stdout or ""
                     reason = (
@@ -402,10 +397,7 @@ class ClaudeCodeAgent(AgentHarness):
             output = output or f"Error: {reason}"
         return parsed.to_result(
             latency=agent_sec,
-            # A timeout is the harness's own doing and outranks whatever the
-            # killed process wrote. Otherwise the stream's terminal event wins:
-            # the CLI exits 1 on a turn cap the parser resolves to ``completed``.
-            # The exit code governs only a stream that never reached that event.
+            # A timeout wins; the exit code governs only a stream with no terminal event.
             terminal_reason=(
                 "timeout"
                 if timed_out

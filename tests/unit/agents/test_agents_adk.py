@@ -1172,8 +1172,7 @@ def test_drive_finishes_teardown_after_the_budget_expires(
     assert SlowClosingRunner.progress == ["started", "finished"]
     assert events == []
     assert errors == ["ADK run exceeded the 0.02s budget"]
-    # The budget expiring is not the agent failing, and the leaderboard has to
-    # tell an efficiency ceiling from a capability failure.
+    # The budget expiring is an efficiency ceiling, not a capability failure.
     assert reason == "timeout"
 
 

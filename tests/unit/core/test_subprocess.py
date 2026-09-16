@@ -91,8 +91,7 @@ def test_run_input_is_forwarded():
 def test_run_timeout_raises_subprocess_error():
     with pytest.raises(SubprocessError) as exc_info:
         bench_subprocess.run(_py("import time; time.sleep(5)"), timeout=0.2)
-    # A timeout is reported as returncode -1, which on POSIX is indistinguishable
-    # from a SIGHUP kill, so callers that report *why* a run ended need the flag.
+    # returncode -1 is indistinguishable from a SIGHUP kill, so callers need the flag.
     assert exc_info.value.timed_out is True
 
 

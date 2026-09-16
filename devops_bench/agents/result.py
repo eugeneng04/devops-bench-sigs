@@ -33,11 +33,7 @@ __all__: list[str] = [
 # ``output`` excludes ``reasoning``, and ``total`` is the sum of all buckets.
 TOKEN_BUCKETS: tuple[str, ...] = ("input", "cached", "cache_write", "reasoning", "output", "total")
 
-#: Why an agent run stopped, as the *harness* observed it. ``completed``: the
-#: agent handed control back on its own (its own turn cap lands here too).
-#: ``timeout``: the harness's wall-clock budget aborted it. ``error``: the run
-#: failed. ``""``: not reported — kept distinct from ``completed`` so a harness
-#: that never sets this is not read as having finished cleanly.
+#: Why a run stopped, as the *harness* saw it. ``""`` is unreported, not ``completed``.
 TerminalReason = Literal["", "completed", "timeout", "error"]
 TERMINAL_REASONS: tuple[TerminalReason, ...] = get_args(TerminalReason)
 
@@ -55,11 +51,9 @@ class ToolCall:
         name: Tool name as advertised by the agent (e.g. an MCP tool name).
         args: Tool arguments as a JSON-serializable mapping.
         result: Tool output text once the tool returns; ``None`` until then.
-        status: Lifecycle marker — ``"called"`` when first emitted,
-            ``"completed"`` once the result is folded in, ``"error"`` when the
-            tool failed. Antigravity also emits ``"interrupted"`` for a call
-            left pending at the end of a run — the same condition other parsers
-            leave as ``"called"``, so neither counts as a tool error.
+        status: ``"called"``, ``"completed"``, ``"error"``, or antigravity's
+            ``"interrupted"`` — the same unresolved condition as ``"called"``,
+            so neither counts as a tool error.
     """
 
     name: str
@@ -87,26 +81,19 @@ class AgentResult:
             emits the same canonical entry shape so metrics consume one schema.
         tokens: Provider-reported token usage (shape is provider-defined; pass
             through verbatim).
-        latency: Wall-clock seconds of the agent turn itself. A harness that can
-            bracket the span more precisely than the whole ``run()`` call stamps
-            it in ``_execute``; :meth:`AgentHarness.run` backfills the whole-run
-            elapsed only when it was left at zero.
+        latency: Wall-clock seconds of the agent turn. A harness that can bracket
+            it more tightly stamps it in ``_execute``; :meth:`AgentHarness.run`
+            backfills the whole-run elapsed only when it was left at zero.
         errors: Human-readable error or extraction-failure messages. **Empty**
             on a clean run; populated when a known-error path (subprocess
             failure, parse miss, timeout) is reached — never silently dropped.
-        terminal_reason: Why the run stopped; one of :data:`TERMINAL_REASONS`,
-            rejected with ``ValueError`` otherwise. Without it a run cut off at
-            its budget reads as a capability failure.
-        tool_wait_sec: Wall-clock seconds spent inside tool calls, concurrent
-            calls counted once, or ``None`` when the transcript carried no
-            timings. Separates a slow environment from a slow model.
-        served_models: Model ids the provider actually answered with, in
-            first-seen order; empty when the harness reports none. Config names
-            the *requested* model, which an alias or a mid-run failover can
-            resolve to something else.
-        model_turns: How many times the model was called, or ``None`` when the
-            harness cannot tell. Distinct from ``len(trajectory)``: one turn can
-            issue several tool calls, and a text-only turn issues none.
+        terminal_reason: One of :data:`TERMINAL_REASONS`; ``ValueError`` otherwise.
+        tool_wait_sec: Seconds inside tool calls, concurrent calls counted once;
+            ``None`` when the transcript carried no timings.
+        served_models: Model ids that actually answered, first-seen order. Config
+            names the *requested* model, which an alias or failover can redirect.
+        model_turns: Model calls, or ``None`` when the harness cannot tell. Not
+            ``len(trajectory)``: one turn can issue several tool calls or none.
         metadata: Agent-specific extras (e.g. raw provider stats, session ids)
             that do not fit the typed fields above.
     """
@@ -123,8 +110,7 @@ class AgentResult:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        # An unrecognized reason reaches the dashboard, matches no grouping and
-        # is dropped with no warning, so fail at the source instead.
+        # An unrecognized reason matches no dashboard grouping and is dropped there.
         if self.terminal_reason not in TERMINAL_REASONS:
             raise ValueError(
                 f"terminal_reason must be one of {TERMINAL_REASONS}, got {self.terminal_reason!r}"
@@ -172,9 +158,8 @@ class AgentResult:
         Args:
             msg: Error message to surface on :attr:`errors` and ``output``.
             latency: Elapsed seconds before the failure, when available.
-            terminal_reason: Why the run stopped. Pass ``"timeout"`` when the
-                harness cut the run off at its budget, which is a different
-                signal from the agent failing.
+            terminal_reason: Pass ``"timeout"`` when the harness cut the run off
+                at its budget — a different signal from the agent failing.
 
         Returns:
             An :class:`AgentResult` with empty trajectory, the canonical

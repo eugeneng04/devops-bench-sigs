@@ -171,8 +171,7 @@ def test_parse_trajectory_export_sums_cache_write_from_per_call_events() -> None
     export = parse_trajectory_export(blob)
     assert export.errors == []
     assert export.tokens["cacheWrite"] == 19
-    # The rollup total omits cacheWrite too, so it is folded back in: the
-    # canonical contract is that total is the sum of every bucket.
+    # The rollup total omits cacheWrite; canonical total is the sum of every bucket.
     assert export.tokens["total"] == 182 + 19 + 322 + 19
     assert export.tokens["total"] == (
         export.tokens["input"]

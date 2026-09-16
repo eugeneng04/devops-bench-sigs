@@ -31,10 +31,9 @@ Calls and responses are correlated by the ``id`` ADK stamps on both sides, so a
 call and its result fold into one :class:`~devops_bench.agents.result.ToolCall`
 rather than two trajectory entries.
 
-Three event-level fields outside ``content`` carry the run's telemetry:
-``timestamp`` (epoch seconds, on every event), ``usage_metadata`` (one block per
-LLM call), and ``model_version`` (the id the provider reported, on the events
-the model authored).
+Telemetry rides outside ``content``: ``timestamp`` (epoch seconds, every event),
+``usage_metadata`` (one block per LLM call), and ``model_version`` (only on the
+events the model authored).
 
 An event from a remote A2A agent also carries the raw task envelope under
 ``custom_metadata['a2a:response']``. That matters because the agent's actual
@@ -246,18 +245,13 @@ def parse_event_stream(events: Sequence[Any]) -> ParsedRun:
 
     Returns:
         A :class:`~devops_bench.agents.shared.telemetry.ParsedRun`. A call whose
-        result never arrived stays ``status="called"`` with ``result=None``.
-        ``tool_wait_sec`` pairs each ``function_call`` with the event bearing
-        its ``function_response``, ``served_models`` reads ``model_version``,
-        and ``model_turns`` counts events carrying ``usage_metadata``.
+        result never arrived stays ``status="called"``. ``served_models`` reads
+        ``model_version``; ``model_turns`` counts ``usage_metadata`` events.
     """
     output_parts: list[str] = []
     errors: list[str] = []
     trajectory: list[ToolCall] = []
-    # Pending ``(call, started_at)`` keyed by ADK's correlation id, with a
-    # separate FIFO for the id-less calls some models emit. Each id maps to a
-    # queue because distinct calls can reuse an id, so responses match in
-    # emission order rather than the second call overwriting the first.
+    # FIFO per id (plus one for id-less calls): reused ids match in emission order.
     pending_by_id: dict[str, list[tuple[ToolCall, float | None]]] = {}
     pending_unkeyed: deque[tuple[ToolCall, float | None]] = deque()
     sums: dict[str, int] = {}
@@ -360,8 +354,7 @@ def parse_event_stream(events: Sequence[Any]) -> ParsedRun:
         errors=errors,
         tool_wait_sec=merged_span_sec(spans),
         served_models=served_models,
-        # 0 turns means the stream carried no usage at all, not a run that never
-        # called the model: a stream exists because one was called.
+        # 0 turns means no usage was reported; a stream exists only if a model ran.
         model_turns=turns or None,
     )
 
@@ -373,16 +366,10 @@ def _fold_response(
     errors: list[str],
     index: int,
 ) -> float | None:
-    """Attach one ``function_response`` to the call it answers.
+    """Attach one ``function_response`` to the call it answers; return its start time.
 
-    Matching is by ADK's correlation ``id``; a response with no id is paired
-    with the oldest id-less call still awaiting a result, which is exact for a
-    stream that answers calls in the order they were made. A response matching
-    nothing is reported on ``errors`` rather than dropped.
-
-    Returns:
-        The matched call's start time, or ``None`` when nothing matched or the
-        matched call's event carried no usable timestamp.
+    Matching is by ADK's correlation ``id``, falling back to the oldest id-less
+    call. A response matching nothing is reported on ``errors``, not dropped.
     """
     call_id = response.get("id")
     matched: tuple[ToolCall, float | None] | None = None
