@@ -69,9 +69,7 @@ __all__ = [
 # content-fingerprints (same-name iterations stay path-only), so a
 # prompt-named entry whose path rule is dropped still flags when the earlier
 # task's content surfaces. v8: findings carry the rule's ``id``, ``material``
-# and ``evidence``, so a report is readable without the ruleset that produced
-# it; and the four-artifact ``harness-environment`` files rule is split into
-# one rule per artifact, so finding counts for that category can rise.
+# and ``evidence``
 DETECTOR_VERSION = 8
 # Shape of the ``cheating_report`` mapping itself.
 REPORT_SCHEMA_VERSION = 1

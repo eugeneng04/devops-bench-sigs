@@ -410,6 +410,11 @@ def test_row_reason_is_flattened_and_capped() -> None:
     assert len(capped) == _MAX_REASON_CHARS
     assert capped.endswith("…")
 
+    # Invisibles a hand-listed character class misses: the tag block encodes
+    # arbitrary hidden ASCII, and ALM is a bidi control like the isolates.
+    smuggled = "a\U000e0041\U000e0042b؜c­d"
+    assert CatastrophicDetail(name="held", reason=smuggled).reason == "a b c d"
+
 
 def test_row_reason_survives_a_real_rebatch_round_trip_unchanged() -> None:
     # Rows are re-validated on rebatch, so a validator that re-cut would erode a

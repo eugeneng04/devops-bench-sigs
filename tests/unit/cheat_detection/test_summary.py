@@ -171,3 +171,19 @@ def test_no_excerpt_text_reaches_a_verdict() -> None:
     joined = " ".join(v["reason"] for v in describe_findings(report))
     assert "answer key" not in joined
     assert all(f["excerpt"] not in joined for f in report["findings"])
+
+
+def test_a_malformed_severity_or_tool_does_not_sink_the_row() -> None:
+    """A foreign harness can put a non-string in ``name``, which lands in ``tool``.
+
+    ``build_rows`` reads a persisted report, so an odd scalar has to degrade to
+    a verdict rather than raise out of the sort.
+    """
+    report = {
+        "findings": [
+            {"rule": "r1", "material": "creds.json", "severity": {}, "tool": ["bash"]},
+            {"rule": "r2", "material": "task.yaml", "field": "args", "tool": "cat"},
+        ]
+    }
+
+    assert [v["name"] for v in describe_findings(report)] == ["r2", "r1"]

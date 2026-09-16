@@ -74,37 +74,23 @@ _CATASTROPHIC_KEYS = score_keys.CATASTROPHIC_SCORE_KEYS
 
 
 def _verification_catastrophic_details(record: Mapping[str, Any]) -> list[CatastrophicDetail]:
-    """Name the failed catastrophic safeguards from the record's report, with why.
-
-    Delegates the "did this entry fire" predicate to
-    :func:`~devops_bench.verification.rollup.failed_catastrophic_details`, the
-    module whose rollup produced the gate score — re-deriving it here could
-    list checks that disagree with the zero the score applied.
-    """
+    """Name the failed catastrophic safeguards from the record's report, with why."""
     report = record.get("verification_report")
     if not isinstance(report, list):
         return []
-    return [CatastrophicDetail(**d) for d in failed_catastrophic_details(report)]
+    valid_entries = (item for item in report if isinstance(item, Mapping))
+    return [CatastrophicDetail(**d) for d in failed_catastrophic_details(valid_entries)]
 
 
 def _integrity_catastrophic_details(record: Mapping[str, Any]) -> list[CatastrophicDetail]:
-    """Say which benchmark material the run reached, and how.
-
-    Wording lives with the detection domain that owns the findings
-    (:func:`~devops_bench.cheat_detection.summary.describe_findings`); this
-    layer only reads the report and type-checks it the way ``IntegrityMetric``
-    does, since a malformed report must not sink the whole ``build_rows`` pass.
-    """
+    """Say which benchmark material the run reached, and how."""
     report = record.get("cheating_report")
     if not isinstance(report, Mapping):
         return []
     return [CatastrophicDetail(**d) for d in describe_findings(report)]
 
 
-# What to publish as a fired gate's ``catastrophicDetails`` entry, read from
-# the raw record (this layer sees the full record, not just ``scores``). A gate
-# key with no reader here still fires and lands in ``catastrophicKinds``; its
-# details are an empty list, which the row schema documents as "unknown".
+# Per-gate explainers: what to publish as a fired gate's ``catastrophicDetails`` entry.
 _CATASTROPHIC_DETAIL_READERS: dict[str, Any] = {
     score_keys.VERIFICATION_CATASTROPHIC_KEY: _verification_catastrophic_details,
     score_keys.INTEGRITY_CATASTROPHIC_KEY: _integrity_catastrophic_details,
@@ -339,8 +325,6 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
         tokens = normalize_tokens(record.get("tokens"))
         correctness = _first_score(scores, _CORRECTNESS_KEYS)
         catastrophic_kinds = [k for k in _CATASTROPHIC_KEYS if extract_score(scores, k) == 0.0]
-        # Keyed off the kinds that fired, not off the raw reports, so a detail
-        # can never appear for a gate the score did not apply.
         catastrophic_details = {
             kind: reader(record) if (reader := _CATASTROPHIC_DETAIL_READERS.get(kind)) else []
             for kind in catastrophic_kinds

@@ -29,7 +29,6 @@ manifest interfaces while the Python attributes stay snake_case.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -42,7 +41,7 @@ __all__ = ["SCHEMA_VERSION", "CatastrophicDetail", "Manifest", "ResultRow"]
 #: v2 adds the scoring-framework v1 fields (``outcomeScore`` becomes the composite
 #: score; ``correctnessScore`` / ``recoverableSafetyScore`` / ``catastrophic`` /
 #: ``scoringVersion`` are added). ``catastrophicKinds`` and ``catastrophicDetails``
-#: were added later within v2: additive with defaults, so not breaking changes.
+#: were added later within v2.
 SCHEMA_VERSION = 2
 
 # Frozen + camelCase aliases. ``populate_by_name`` keeps the snake_case
@@ -50,22 +49,8 @@ SCHEMA_VERSION = 2
 # way), while ``to_dict`` dumps the camelCase aliases the dashboard expects.
 _MODEL_CONFIG = ConfigDict(frozen=True, alias_generator=to_camel, populate_by_name=True)
 
-#: Cap on a published reason. The verdict text is written for a
-#: ``results.json`` reader and has no length discipline — a ``kubectl wait``
-#: failure pastes its whole stderr — so the row caps it.
+# Max characters for a reason
 _MAX_REASON_CHARS = 240
-
-#: Whitespace, C0/C1 controls, zero-width characters, and the bidi overrides
-#: and isolates that would let a reason reorder the text rendered around it.
-#: Written as escapes because most are invisible in a source file.
-_REASON_UNSAFE = re.compile(
-    r"[\s"
-    r"\x00-\x1f\x7f-\x9f"  # C0 and C1 controls
-    r"\u200b-\u200f"  # zero-width space/joiners, LTR and RTL marks
-    r"\u2028-\u202e"  # line and paragraph separators, bidi embeds and overrides
-    r"\u2060\u2066-\u2069\ufeff"  # word joiner, bidi isolates, BOM
-    r"]+"
-)
 
 
 class CatastrophicDetail(BaseModel):
@@ -95,13 +80,9 @@ class CatastrophicDetail(BaseModel):
     @field_validator("reason")
     @classmethod
     def _sanitize_reason(cls, value: str) -> str:
-        """Flatten to one safe line, then cap — on the model, so every reader inherits it.
-
-        Both halves are idempotent, which matters because ``rebatch_rows``
-        re-validates stored rows and a validator that re-cut would erode a
-        reason a little more on every pass.
-        """
-        flattened = _REASON_UNSAFE.sub(" ", value).strip()
+        """Flatten to one printable line, then cap — on the model, so every reader inherits it."""
+        printable = "".join(c if c.isprintable() else " " for c in value)
+        flattened = " ".join(printable.split())
         if len(flattened) <= _MAX_REASON_CHARS:
             return flattened
         return flattened[: _MAX_REASON_CHARS - 1] + "…"
@@ -187,10 +168,7 @@ class ResultRow(BaseModel):
             evidence of a clean run unless ``catastrophic`` is also ``False``.
         catastrophic_details: Per-gate breakdown of *which* checks fired and
             why, keyed by entries of ``catastrophic_kinds``, so a row says
-            which safeguard and what it observed without a reader opening
-            ``results.json``. Absent or empty means "not recorded" (no detail
-            reader for that gate, or a row predating this field), never
-            "nothing fired" — ``catastrophic_kinds`` stays the authority.
+            which safeguard and what it observed.
         scoring_version: Scoring-framework version that produced ``outcome_score``
             (e.g. ``"v1"``); ``""`` for rows written before the framework landed.
         tool_score: Tool-invocation judge score in ``[0, 1]``, or ``None``.

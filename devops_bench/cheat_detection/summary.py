@@ -14,14 +14,11 @@
 
 """Turn a stored ``cheating_report`` into publishable one-line verdicts.
 
-The detector owns the findings; this module owns the sentence each fired rule
-contributes to a leaderboard row. Excerpts never cross that line — they hold
-captured file content — so a verdict names the material and where it was
-touched, and nothing else.
-
-The wording splits on a finding's ``field``: ``args`` means the agent typed the
-material into a tool call, ``result``/``output`` means it merely appeared in
-front of the agent. Both trip the gate; they are not the same accusation.
+Follows 2 sentence templates:
+- Typed (agent put the material into a tool call):
+  {material}: read by the agent — {loc}, {loc}, {loc} (+N more reads, +M passive sightings)
+- Surfaced (agent merely saw the material):
+  {material}: {evidence} appeared in {where}{step} (+N more)
 """
 
 from __future__ import annotations
@@ -32,9 +29,7 @@ from typing import Any
 __all__ = ["describe_findings"]
 
 _SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
-# Locations named in one verdict before the rest become a count.
 _MAX_LOCATIONS = 3
-# Sorts last: a finding with no trajectory index came from the final output.
 _LAST = float("inf")
 
 
@@ -50,12 +45,7 @@ def _location(index: int | None, tool: str) -> str:
 
 
 def _verdict(material: str, evidence: str, typed: list[Any], surfaced: list[Any]) -> str:
-    """Compose one rule's sentence from where its findings landed.
-
-    Typed access leads when present: the agent putting the material in a
-    command is the stronger claim, and a sighting alongside it is a footnote
-    rather than a second verdict.
-    """
+    """Return one rule's sentence from where its findings landed."""
     if typed:
         shown = typed[:_MAX_LOCATIONS]
         line = f"{material}: read by the agent — " + ", ".join(_location(*w) for w in shown)
@@ -75,13 +65,7 @@ def _verdict(material: str, evidence: str, typed: list[Any], surfaced: list[Any]
 
 
 def describe_findings(report: Mapping[str, Any]) -> list[dict[str, str]]:
-    """Return one ``{name, reason}`` verdict per rule that fired.
-
-    Ordered by how much each implicates the run: typed access first, then
-    severity, then trajectory position. Reports written before detector v8
-    carry no rule ids, so they fall back to bare category names — the
-    strongest statement their findings support.
-    """
+    """Return one ``{name, reason}`` verdict per rule that fired."""
     groups: dict[str, dict[str, Any]] = {}
     findings = report.get("findings")
     for finding in findings if isinstance(findings, list) else []:
@@ -91,17 +75,19 @@ def describe_findings(report: Mapping[str, Any]) -> list[dict[str, str]]:
         if not isinstance(rule, str) or not rule:
             continue
         index = finding.get("trajectory_index")
+        severity = finding.get("severity")
+        tool = finding.get("tool")
         group = groups.setdefault(
             rule,
             {
                 "material": finding.get("material") or rule,
                 "evidence": finding.get("evidence") or "the path",
-                "severity": finding.get("severity"),
+                "severity": severity if isinstance(severity, str) else None,
                 "typed": [],
                 "surfaced": [],
             },
         )
-        where = (index if isinstance(index, int) else None, finding.get("tool") or "")
+        where = (index if isinstance(index, int) else None, tool if isinstance(tool, str) else "")
         group["typed" if finding.get("field") == "args" else "surfaced"].append(where)
 
     if not groups:

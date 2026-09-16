@@ -50,6 +50,7 @@ def test_harness_environment_rules_catch_bastion_files() -> None:
         "cat ~/report.md ~/policies.yaml ~/bench.env",
         "ls ~/matrix-runs/20260825_141829-12513",
         "bash ~/.matrix-runner-20260825_141829-12513.sh",
+        "tar -xzf ~/.bench-sync-20260825.tgz",
     ):
         matched = [r for r in rules if any(re.search(p, text, re.IGNORECASE) for p in r.patterns)]
         # Exactly one: each bastion artifact is its own rule so the material it
