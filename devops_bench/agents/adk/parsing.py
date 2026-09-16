@@ -35,6 +35,12 @@ Three event-level fields outside ``content`` carry the run's telemetry:
 ``timestamp`` (epoch seconds, on every event), ``usage_metadata`` (one block per
 LLM call), and ``model_version`` (the id the provider reported, on the events
 the model authored).
+
+An event from a remote A2A agent also carries the raw task envelope under
+``custom_metadata['a2a:response']``. That matters because the agent's actual
+answer lives in the task's ``status.message``, while the ``content.parts`` ADK
+builds alongside it hold a *mirror of the last artifact* — so the envelope, not
+the content, is what the judge should grade.
 """
 
 from __future__ import annotations
@@ -60,6 +66,23 @@ _USAGE_FIELDS: dict[str, str] = {
     "total_token_count": "total",
 }
 
+# Where ``RemoteA2aAgent`` stashes the raw task envelope on the event it builds.
+# ADK's converter does not export the key, so it is spelled out here.
+_A2A_RESPONSE_KEY: str = "a2a:response"
+
+# Terminal ``TaskState`` values meaning the remote agent never answered. The
+# proto types serialize the enum as ``TASK_STATE_FAILED`` and the pydantic types
+# as ``failed``, so states are normalized to the bare slug before the lookup.
+_A2A_FAILURE_STATES: frozenset[str] = frozenset({"failed", "canceled", "rejected"})
+
+# The one state whose status message is the agent's answer. ADK also emits
+# streaming updates carrying a status message — ``working`` most often, and
+# ``input_required`` / ``auth_required`` are no more final — and that text is
+# progress commentary. Appending it would put narration ahead of the real
+# answer in the output the judge grades. A failure state's message is a failure
+# notice, which is not an answer either; it goes to ``errors`` instead.
+_A2A_ANSWER_STATE: str = "completed"
+
 
 def _parts(event: Mapping[str, Any]) -> list[Any]:
     """Return an event's ``content.parts`` list, or ``[]`` when it has none."""
@@ -78,6 +101,48 @@ def _is_user_content(event: Mapping[str, Any]) -> bool:
     """
     content = event.get("content")
     return isinstance(content, Mapping) and content.get("role") == "user"
+
+
+def _a2a_task(event: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Return the A2A task envelope ``RemoteA2aAgent`` attached, if any."""
+    metadata = event.get("custom_metadata")
+    if not isinstance(metadata, Mapping):
+        return None
+    response = metadata.get(_A2A_RESPONSE_KEY)
+    return response if isinstance(response, Mapping) else None
+
+
+def _a2a_status(task: Mapping[str, Any]) -> tuple[str | None, str | None]:
+    """Pull the reported state and final message text out of a task envelope.
+
+    Returns:
+        A ``(state, text)`` tuple. ``state`` is normalized to the bare slug
+        (``"completed"``, not ``"TASK_STATE_COMPLETED"``). ``text`` is ``None``
+        when the task carried no status message.
+
+    States other than :data:`_A2A_ANSWER_STATE` carry a message too — a
+    streaming update's is progress commentary, a failure's is a failure notice —
+    so the state must be checked before the text is treated as the answer.
+    """
+    status = task.get("status")
+    if not isinstance(status, Mapping):
+        return None, None
+
+    raw_state = status.get("state")
+    state = raw_state.lower().removeprefix("task_state_") if isinstance(raw_state, str) else None
+
+    message = status.get("message")
+    parts = message.get("parts") if isinstance(message, Mapping) else None
+    texts = (
+        [
+            part["text"]
+            for part in parts
+            if isinstance(part, Mapping) and isinstance(part.get("text"), str)
+        ]
+        if isinstance(parts, list)
+        else []
+    )
+    return state, ("".join(texts) or None)
 
 
 def _response_text(response: Any) -> tuple[str, bool]:
@@ -172,6 +237,10 @@ def parse_event_stream(events: Sequence[Any]) -> ParsedRun:
     the output text: the former would duplicate the text they are chunks of, and
     the latter is reasoning the judge should not grade as an answer.
 
+    An event carrying an A2A task envelope is read from the envelope instead: its
+    ``status.message`` is the remote agent's answer, and a terminal state other
+    than completed lands on ``errors``.
+
     Args:
         events: Serialized ``Event`` mappings in the order ADK yielded them.
 
@@ -219,6 +288,32 @@ def parse_event_stream(events: Sequence[Any]) -> ParsedRun:
         user_content = _is_user_content(event)
         event_time = parse_event_time(event.get("timestamp"))
 
+        # A remote agent's answer is the A2A task's status message. Take it in
+        # place of the event's own text, which mirrors the trailing artifact.
+        a2a_text: str | None = None
+        a2a_failed = False
+        task = _a2a_task(event)
+        if task is not None:
+            state, status_text = _a2a_status(task)
+            if state in _A2A_FAILURE_STATES:
+                # A failed task has no answer, and neither half of the event is
+                # a stand-in for one: the status message is a failure notice,
+                # and the content parts mirror the trailing artifact. The record
+                # is still written as ``status: "success"`` and scored, so
+                # whichever one reaches ``output`` gets graded as the response.
+                # Report the failure and contribute nothing.
+                a2a_failed = True
+                errors.append(f"event {index}: remote A2A task {state}")
+            elif state == _A2A_ANSWER_STATE:
+                # Leaving ``a2a_text`` unset on a non-answer state also lets the
+                # event's own text fall through as before, rather than being
+                # suppressed in favour of the progress note that displaced it.
+                # A completed task with no status message falls through the same
+                # way: the artifact is then the only text there is.
+                a2a_text = status_text
+            if a2a_text and not partial:
+                output_parts.append(a2a_text)
+
         for part in _parts(event):
             if not isinstance(part, Mapping):
                 continue
@@ -253,6 +348,8 @@ def parse_event_stream(events: Sequence[Any]) -> ParsedRun:
                 and not partial
                 and not user_content
                 and not part.get("thought")
+                and a2a_text is None
+                and not a2a_failed
             ):
                 output_parts.append(text)
 

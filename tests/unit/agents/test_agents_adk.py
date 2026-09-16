@@ -32,6 +32,7 @@ import sys
 import textwrap
 from collections.abc import AsyncIterator
 from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -141,6 +142,53 @@ MCP_CALL_EVENT = {
     },
     "author": "mcp_spike",
     "id": "bb22",
+}
+
+# Shaped after a ``RemoteA2aAgent`` driven against a real A2A gRPC server, with
+# the payload text replaced by neutral stand-ins. Note that ``content.parts``
+# mirrors the *trailing artifact* while the answer sits in ``status.message`` —
+# the two disagree, which is the point of the fixture.
+A2A_EVENT: dict[str, Any] = {
+    "content": {"parts": [{"text": "node-1 mem = 0.97"}], "role": "model"},
+    "custom_metadata": {
+        "a2a:task_id": "494405c7-b9be-441f-beae-be07ba49b5b7",
+        "a2a:context_id": "64c847ad-f70e-42f2-b24e-2b88e3550780",
+        "a2a:request": {
+            "messageId": "6bbd7789-6c50-49bf-a713-6f83a37f4f58",
+            "role": "ROLE_USER",
+            "parts": [{"text": "Diagnose the evicted pod", "metadata": {"is_user_input": True}}],
+        },
+        "a2a:response": {
+            "id": "494405c7-b9be-441f-beae-be07ba49b5b7",
+            "contextId": "64c847ad-f70e-42f2-b24e-2b88e3550780",
+            "status": {
+                "state": "TASK_STATE_COMPLETED",
+                "message": {
+                    "messageId": "587e9b357eb547629ef6d675a01d60b5",
+                    "role": "ROLE_AGENT",
+                    "parts": [{"text": "RCA: node memory pressure evicted the pod."}],
+                },
+                "timestamp": "2026-09-11T16:47:45.085206Z",
+            },
+            "artifacts": [
+                {
+                    "artifactId": "5d57761d-7b73-4100-8457-d26419e3b0a8",
+                    "name": "triage_agent",
+                    "parts": [{"text": "matched skill gke-node-pressure"}],
+                    "metadata": {"sub_agent": "triage_agent"},
+                },
+                {
+                    "artifactId": "c829905b-dccf-475f-8e22-f4368ee8fca9",
+                    "name": "diagnostic_agent",
+                    "parts": [{"text": "node-1 mem = 0.97"}],
+                    "metadata": {"sub_agent": "diagnostic_agent"},
+                },
+            ],
+        },
+    },
+    "invocation_id": "e-efdd3f9c",
+    "author": "triage_remote",
+    "id": "0a2db279",
 }
 
 
@@ -427,6 +475,134 @@ def test_parse_event_stream_matches_reused_call_ids_in_emission_order() -> None:
     assert parsed.errors == []
     assert [(e["name"], e["result"]) for e in parsed.trajectory] == [("a", "ra"), ("b", "rb")]
     assert parsed.tool_wait_sec == 20.0
+
+
+def test_parse_event_stream_prefers_the_a2a_status_message() -> None:
+    parsed = parsing.parse_event_stream([A2A_EVENT])
+
+    assert parsed.output == "RCA: node memory pressure evicted the pod."
+    assert parsed.trajectory == []
+    assert parsed.errors == []
+
+
+def test_parse_event_stream_reports_a_failed_a2a_task() -> None:
+    """A failure notice is an error, not the answer.
+
+    The record is written as ``status: "success"`` whatever is in ``errors``,
+    and only ``status: "failed"`` records are skipped when scoring, so anything
+    left in ``output`` here is graded as the agent's response.
+    """
+    event = copy.deepcopy(A2A_EVENT)
+    status = event["custom_metadata"]["a2a:response"]["status"]
+    status["state"] = "TASK_STATE_FAILED"
+    status["message"]["parts"] = [{"text": "the metrics backend is unreachable"}]
+
+    parsed = parsing.parse_event_stream([event])
+
+    assert parsed.output == ""
+    assert parsed.errors == ["event 0: remote A2A task failed"]
+
+
+@pytest.mark.parametrize("state", ["TASK_STATE_FAILED", "TASK_STATE_CANCELED", "rejected"])
+def test_parse_event_stream_keeps_a_failed_tasks_artifact_out_of_output(state: str) -> None:
+    """Nor does the event's own text stand in for the answer a failure lacks.
+
+    Suppressing only the status message would fall straight back to
+    ``content.parts`` — the trailing-artifact mirror this whole path exists to
+    keep out of the graded output.
+    """
+    event = copy.deepcopy(A2A_EVENT)
+    del event["custom_metadata"]["a2a:response"]["status"]["message"]
+    event["custom_metadata"]["a2a:response"]["status"]["state"] = state
+
+    parsed = parsing.parse_event_stream([event])
+
+    assert parsed.output == ""
+    assert parsed.errors == [
+        f"event 0: remote A2A task {state.lower().removeprefix('task_state_')}"
+    ]
+
+
+def test_parse_event_stream_falls_back_to_content_on_a_completed_task_with_no_message() -> None:
+    """A completed task need not carry a status message; the artifact is all there is.
+
+    Unlike a failure, a completed task did produce something, so the fallback
+    that serves a non-terminal state serves this one too.
+    """
+    event = copy.deepcopy(A2A_EVENT)
+    del event["custom_metadata"]["a2a:response"]["status"]["message"]
+
+    parsed = parsing.parse_event_stream([event])
+
+    assert parsed.output == "node-1 mem = 0.97"
+    assert parsed.errors == []
+
+
+def test_parse_event_stream_accepts_a_lowercase_a2a_state() -> None:
+    """The pydantic A2A types spell the enum ``rejected``, the proto ones don't."""
+    event = copy.deepcopy(A2A_EVENT)
+    event["custom_metadata"]["a2a:response"]["status"]["state"] = "rejected"
+
+    assert parsing.parse_event_stream([event]).errors == ["event 0: remote A2A task rejected"]
+
+
+def test_parse_event_stream_falls_back_to_content_without_a_status_message() -> None:
+    """A task still working carries no status message; the event text is all there is."""
+    event = copy.deepcopy(A2A_EVENT)
+    event["custom_metadata"]["a2a:response"]["status"] = {"state": "TASK_STATE_WORKING"}
+
+    parsed = parsing.parse_event_stream([event])
+
+    assert parsed.output == "node-1 mem = 0.97"
+    assert parsed.errors == []
+
+
+def test_parse_event_stream_ignores_a_working_tasks_status_message() -> None:
+    """A streaming update's status message is progress text, not the answer.
+
+    ADK emits ``working`` events that carry a ``status.message``. Treating one
+    as the answer puts narration ahead of the real answer in the graded output —
+    and, because a status message displaces the event's own text, drops that
+    event's content as well.
+    """
+    working = copy.deepcopy(A2A_EVENT)
+    working["content"]["parts"] = [{"text": "checking node pressure"}]
+    status = working["custom_metadata"]["a2a:response"]["status"]
+    status["state"] = "TASK_STATE_WORKING"
+    status["message"]["parts"] = [{"text": "Analyzing node pressure..."}]
+
+    parsed = parsing.parse_event_stream([working, A2A_EVENT])
+
+    assert "Analyzing node pressure..." not in parsed.output
+    assert parsed.output.endswith("RCA: node memory pressure evicted the pod.")
+    assert parsed.errors == []
+
+
+@pytest.mark.parametrize("state", ["TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED"])
+def test_parse_event_stream_ignores_a_non_terminal_status_message(state: str) -> None:
+    """``working`` is not the only non-final state that carries a message."""
+    event = copy.deepcopy(A2A_EVENT)
+    status = event["custom_metadata"]["a2a:response"]["status"]
+    status["state"] = state
+    status["message"]["parts"] = [{"text": "which namespace?"}]
+
+    parsed = parsing.parse_event_stream([event])
+
+    assert parsed.output == "node-1 mem = 0.97"
+    assert parsed.errors == []
+
+
+def test_parse_event_stream_still_folds_tool_calls_on_an_a2a_event() -> None:
+    event = copy.deepcopy(A2A_EVENT)
+    event["content"]["parts"].append(CALL_EVENT["content"]["parts"][0])
+
+    parsed = parsing.parse_event_stream([event, RESPONSE_EVENT])
+
+    assert parsed.output == "RCA: node memory pressure evicted the pod."
+    assert parsed.errors == []
+    assert [(entry["name"], entry["status"]) for entry in parsed.trajectory] == [
+        ("scale_deployment", "completed")
+    ]
 
 
 # --------------------------------------------------------------------------
