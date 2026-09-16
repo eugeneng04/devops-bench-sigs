@@ -23,6 +23,7 @@ resolves with **no harness edit**.
 from __future__ import annotations
 
 from collections.abc import Generator
+from pathlib import Path
 
 import pytest
 from pytest_mock import MockerFixture
@@ -87,9 +88,25 @@ def test_alias_normalizes_to_canonical_key() -> None:
     # ``gemini-cli`` is the friendly alias for the gemini agent; resolution must
     # not require a path table — the alias map normalizes to ``gemini`` and the
     # registry returns the registered class.
-    agent_cls = AGENTS.get("gemini")
+    #
+    # Resolve first: builtin harnesses self-register on the lazy import that
+    # ``resolve_agent`` performs, so reading ``AGENTS`` ahead of it would pass
+    # only when some earlier test happened to import the module.
     agent = harness.resolve_agent("gemini-cli")
-    assert isinstance(agent, agent_cls)
+    assert isinstance(agent, AGENTS.get("gemini"))
+
+
+def test_claude_code_alias_normalizes_to_canonical_key() -> None:
+    """``claude-code`` resolves to the canonical ``claude`` agent.
+
+    The ``AGENTS`` registry has no alias mechanism; the alias lives in
+    ``_AGENT_TYPE_ALIASES`` and is applied only by ``resolve_agent``, whose lazy
+    import is also what registers the builtin — hence resolving before reading.
+    """
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c")
+
+    agent = harness.resolve_agent("claude-code")
+    assert isinstance(agent, AGENTS.get("claude"))
 
 
 def test_unknown_agent_type_raises_not_registered() -> None:
@@ -150,3 +167,24 @@ def test_entry_point_agent_resolves_with_no_harness_edit(
     mock_eps.assert_called_once_with(group="devops_bench.agents")
     # The harness threaded its built config into the entry-point-loaded agent.
     assert isinstance(_DummyAgent.last_config, AgentConfig)
+
+
+def test_manifest_records_the_canonical_harness_key(tmp_path: Path, mocker: MockerFixture) -> None:
+    """An arm selected via an alias records the canonical key, not the alias.
+
+    ``harness`` is contractually the canonical key (``ResultRow.harness``), and
+    ``setup_id`` is derived from it, so recording the alias would split one arm
+    into two dashboard setups. Nothing else asserts what ``_write_run_artifacts``
+    writes.
+    """
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c")
+    harness.agent_type = "claude-code"
+    harness._agent_config.model = "claude-opus-4-8"  # noqa: SLF001 - arm identity under test
+    write_manifest = mocker.patch.object(harness.reporter, "write_manifest")
+    mocker.patch.object(harness.reporter, "write_rows")
+
+    harness._write_run_artifacts(tmp_path, [])  # noqa: SLF001 - the unit under test
+
+    manifest = write_manifest.call_args.args[1]
+    assert manifest["harness"] == "claude"
+    assert manifest["setupId"].startswith("claude-opus-4-8-claude")

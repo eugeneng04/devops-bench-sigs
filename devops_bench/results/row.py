@@ -31,8 +31,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
+
+from devops_bench.agents.result import TerminalReason
 
 __all__ = ["SCHEMA_VERSION", "Manifest", "ResultRow"]
 
@@ -40,7 +42,8 @@ __all__ = ["SCHEMA_VERSION", "Manifest", "ResultRow"]
 #: breaking field change so a downstream ingest can detect a shape mismatch.
 #: v2 adds the scoring-framework v1 fields (``outcomeScore`` becomes the composite
 #: score; ``correctnessScore`` / ``recoverableSafetyScore`` / ``catastrophic`` /
-#: ``scoringVersion`` are added).
+#: ``scoringVersion`` are added). ``catastrophicKinds`` was added later within v2:
+#: additive with a default, so not a breaking change.
 SCHEMA_VERSION = 2
 
 # Frozen + camelCase aliases. ``populate_by_name`` keeps the snake_case
@@ -63,6 +66,9 @@ class Manifest(BaseModel):
             ``api``).
         augmentation: Capability tokens active for the run (e.g.
             ``["mcp", "skills"]``); an empty list denotes the baseline arm.
+        timeout_sec: The per-task wall-clock budget the agent ran under, or
+            ``None`` when uncapped. "Timed out" and "used 90% of its budget" are
+            both uninterpretable without it.
     """
 
     model_config = _MODEL_CONFIG
@@ -74,6 +80,7 @@ class Manifest(BaseModel):
     model: str
     harness: str
     augmentation: list[str]
+    timeout_sec: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-serializable mapping written to ``manifest.json``."""
@@ -94,6 +101,11 @@ class ResultRow(BaseModel):
         setup_id: Run arm id; matches :attr:`Manifest.setup_id`.
         model: Model identifier; matches :attr:`Manifest.model`.
         harness: Canonical harness key; matches :attr:`Manifest.harness`.
+        served_model: The model that actually answered, ``""`` when the harness
+            does not report it. ``model`` is only what the run *asked* for: an
+            alias resolves to a dated id and a run can fail over mid-flight.
+            Comma-joined in first-seen order when more than one served the run,
+            which is itself the failover signal.
         augmentation: Capability tokens; matches :attr:`Manifest.augmentation`.
         run_id: Run directory suffix; matches :attr:`Manifest.run_id`.
         t: UTC ISO-8601 run timestamp; matches :attr:`Manifest.t`.
@@ -114,12 +126,35 @@ class ResultRow(BaseModel):
             scores, so this value will not reconcile by hand against
             ``outcome_score``. ``None`` when the task declared no recoverable
             safeguards.
-        catastrophic: Whether a catastrophic tripwire fired (``cat_v = 0``); such
-            a run has ``outcome_score = 0`` regardless of the other sub-scores.
+        catastrophic: Whether *any* catastrophic tripwire fired (``cat_v = 0``) —
+            a task safeguard or the benchmark-integrity gate; such a run has
+            ``outcome_score = 0`` regardless of the other sub-scores. Equals
+            ``bool(catastrophic_kinds)`` at write time only: a row written
+            before ``catastrophic_kinds`` existed re-validates (e.g. through
+            ``aggregate.rebatch_rows``) with a genuine ``True`` beside the
+            defaulted empty list, so never derive this flag from the list.
+        catastrophic_kinds: The score keys of the gates that fired, verbatim
+            (``"VerificationCatastrophic"`` for a task safeguard,
+            ``"IntegrityCatastrophic"`` for the benchmark-integrity gate). A
+            list because both gates can fire on one run; empty when none did —
+            or when the row predates this field, so an empty list is not
+            evidence of a clean run unless ``catastrophic`` is also ``False``.
         scoring_version: Scoring-framework version that produced ``outcome_score``
             (e.g. ``"v1"``); ``""`` for rows written before the framework landed.
         tool_score: Tool-invocation judge score in ``[0, 1]``, or ``None``.
+        tool_calls: Tool calls in the run's trajectory, or ``None`` when no
+            trajectory was captured. The unit of agentic work, and the
+            trajectory itself is too large to aggregate at dashboard time.
+        tool_errors: How many of those calls returned an error. A high count
+            against a passing score means the model recovered; against a
+            failing one it usually means the environment broke, not the model.
+        model_turns: Model round-trips, or ``None`` when the harness cannot
+            delimit them. Not ``tool_calls``: one turn can issue several tool
+            calls, and a text-only turn issues none.
         latency_sec: Agent wall-clock seconds for the iteration.
+        tool_wait_sec: How much of ``latency_sec`` went on tool calls,
+            concurrent calls counted once, or ``None`` when the harness reported
+            no timings. Separates a slow environment from a slow model.
         input_tokens: Non-cached prompt token count, or ``None`` when
             unreported. (Historical records that predate the canonical token
             schema may include cached tokens here.)
@@ -134,6 +169,13 @@ class ResultRow(BaseModel):
         total_tokens: Provider-reported or bucket-sum total, or ``None`` when
             unreported. Semantics vary for pre-canonical records.
         status: Terminal record status, ``"success"`` or ``"failed"``.
+        terminal_reason: Why the *agent* stopped — ``"completed"``,
+            ``"timeout"``, ``"error"``, or ``""`` when unreported. Distinct
+            from ``status``, which describes the record: a run the harness
+            killed at its wall-clock budget still reads ``status: "success"``.
+        timeout_sec: The wall-clock budget this iteration ran under; matches
+            :attr:`Manifest.timeout_sec`. Carried on the row because ingest
+            uploads ``rows.json`` alone and never reads the manifest.
         validated: Whether the task is vetted as correct and eligible for the
             leaderboard; ingest gates promotion on this (default ``False``).
     """
@@ -143,6 +185,7 @@ class ResultRow(BaseModel):
     setup_id: str
     model: str
     harness: str
+    served_model: str = ""
     augmentation: list[str]
     run_id: str
     t: str
@@ -153,9 +196,14 @@ class ResultRow(BaseModel):
     correctness_score: float | None = None
     recoverable_safety_score: float | None = None
     catastrophic: bool = False
+    catastrophic_kinds: list[str] = Field(default_factory=list)
     scoring_version: str = ""
     tool_score: float | None
+    tool_calls: int | None = None
+    tool_errors: int | None = None
+    model_turns: int | None = None
     latency_sec: float
+    tool_wait_sec: float | None = None
     input_tokens: int | None
     output_tokens: int | None
     cached_tokens: int | None = None
@@ -163,6 +211,8 @@ class ResultRow(BaseModel):
     cache_write_tokens: int | None = None
     total_tokens: int | None = None
     status: str
+    terminal_reason: TerminalReason = ""
+    timeout_sec: float | None = None
     validated: bool = False
 
     def to_dict(self) -> dict[str, Any]:

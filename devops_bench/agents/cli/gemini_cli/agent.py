@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -91,7 +92,12 @@ def _build_settings(mcp_servers: tuple[McpBinding, ...], *, skills_enabled: bool
     return settings
 
 
-def _build_argv(target: str, prompt: str, allowed_tools: tuple[str, ...]) -> list[str]:
+def _build_argv(
+    target: str,
+    prompt: str,
+    allowed_tools: tuple[str, ...],
+    extra_flags: tuple[str, ...] = (),
+) -> list[str]:
     """Build the ``gemini`` invocation for ``prompt``.
 
     ``--approval-mode yolo`` is always passed so the CLI auto-approves every tool
@@ -116,6 +122,7 @@ def _build_argv(target: str, prompt: str, allowed_tools: tuple[str, ...]) -> lis
         prompt: Task prompt.
         allowed_tools: Pre-approved tool names; each yields a separate
             ``--allowed-tools <name>`` pair (redundant under yolo).
+        extra_flags: Optional extra CLI flags to forward to the binary.
 
     Returns:
         The argv list ready to hand to ``core.subprocess.run``.
@@ -129,6 +136,8 @@ def _build_argv(target: str, prompt: str, allowed_tools: tuple[str, ...]) -> lis
         # `--extensions=` disables extensions; `-e=`/`-e=""` print help + exit 1
         # on gemini >= 0.47, and `-e none` loads an extension named "none".
         argv.append("--extensions=")
+    if extra_flags:
+        argv.extend(extra_flags)
     argv.extend(["-p", prompt])
     return argv
 
@@ -224,7 +233,7 @@ class GeminiCliAgent(AgentHarness):
         """
         caps = self.config.capabilities
         target = os.path.expanduser(self.config.target or "gemini")
-        argv = _build_argv(target, prompt, caps.allowed_tools)
+        argv = _build_argv(target, prompt, caps.allowed_tools, self.config.extra_flags)
         env_overlay = _build_env(self.config)
         rules_text = caps.rules.text
 
@@ -240,6 +249,7 @@ class GeminiCliAgent(AgentHarness):
                 (gemini_dir / _GEMINI_SETTINGS_FILE).write_text(
                     json.dumps(settings, indent=2), encoding="utf-8"
                 )
+            started = time.monotonic()
             try:
                 completed = run(
                     argv,
@@ -249,25 +259,36 @@ class GeminiCliAgent(AgentHarness):
                     timeout=self.config.timeout_sec,
                 )
             except SubprocessError as exc:
-                return AgentResult.errored(f"gemini subprocess error: {exc}")
+                # The stream-json written before the kill is a valid prefix, so
+                # the trajectory and tokens the run managed are still parseable.
+                partial = parse_stream_json(exc.stdout or "")
+                return partial.to_result(
+                    latency=time.monotonic() - started,
+                    terminal_reason="timeout" if exc.timed_out else "error",
+                    output=partial.output or f"Error: gemini subprocess error: {exc}",
+                    errors=[f"gemini subprocess error: {exc}", *partial.errors],
+                )
             except OSError as exc:
                 # Missing / non-executable binary; core.subprocess.run does not wrap.
-                return AgentResult.errored(f"gemini binary unavailable: {exc}")
+                return AgentResult.errored(
+                    f"gemini binary unavailable: {exc}", latency=time.monotonic() - started
+                )
+            agent_sec = time.monotonic() - started
 
-        output, trajectory, tokens, parse_errors = parse_stream_json(completed.stdout or "")
-        errors: list[str] = list(parse_errors)
+        parsed = parse_stream_json(completed.stdout or "")
+        output = parsed.output
+        errors: list[str] = list(parsed.errors)
+        metadata: dict = {}
         if completed.returncode != 0:
             stderr = (completed.stderr or "").strip()
             errors.append(f"gemini exited {completed.returncode}: {stderr or '<no stderr>'}")
             if not output:
                 output = f"Error: gemini exited {completed.returncode}"
-        metadata: dict = {}
-        if completed.returncode != 0:
             metadata["returncode"] = completed.returncode
-        return AgentResult(
+        return parsed.to_result(
+            latency=agent_sec,
+            terminal_reason="error" if completed.returncode != 0 else "completed",
             output=output,
-            trajectory=trajectory,
-            tokens=tokens,
             errors=errors,
             metadata=metadata,
         )

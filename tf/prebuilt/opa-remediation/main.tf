@@ -22,6 +22,14 @@ terraform {
       source  = "tehcyx/kind"
       version = ">= 0.5.0"
     }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.25"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.12"
+    }
     null = {
       source  = "hashicorp/null"
       version = ">= 3.0.0"
@@ -36,6 +44,18 @@ provider "google" {
 
 provider "kind" {}
 
+provider "kubernetes" {
+  config_path    = pathexpand(var.host_kubeconfig_path)
+  config_context = var.host_kubecontext
+}
+
+provider "helm" {
+  kubernetes {
+    config_path    = pathexpand(var.host_kubeconfig_path)
+    config_context = var.host_kubecontext
+  }
+}
+
 locals {
   # GitOps repo path on the shared bastion host. setup.sh rm -rf's + reseeds it,
   # so a fixed path would let one run wipe a concurrent run's repo. cluster_name
@@ -46,22 +66,27 @@ locals {
 
 # GKE/KinD cluster. Kyverno + the workloads are installed by setup.sh.
 module "cluster" {
-  source          = "../../modules/cluster"
-  infra_provider  = var.infra_provider
-  project_id      = var.project_id
-  cluster_name    = var.cluster_name
-  location        = var.location
-  node_count      = var.node_count
-  machine_type    = var.machine_type
-  node_image      = var.node_image
-  kubeconfig_path = var.kubeconfig_path
+  source                = "../../modules/cluster"
+  infra_provider        = var.infra_provider
+  project_id            = var.project_id
+  cluster_name          = var.cluster_name
+  location              = var.location
+  node_count            = var.node_count
+  machine_type          = var.machine_type
+  node_image            = var.node_image
+  kubeconfig_path       = var.kubeconfig_path
+  host_kubeconfig_path  = var.host_kubeconfig_path
+  host_kubecontext      = var.host_kubecontext
+  service_type          = var.service_type
+  vcluster_service_cidr = var.vcluster_service_cidr
+  node_port             = var.node_port
 }
 
 # Outside-the-cluster setup: install Kyverno, apply audit policies, deploy the
 # violating workloads, and seed the GitOps repo. Runs during `tofu apply`,
 # before the agent starts.
 resource "null_resource" "setup" {
-  depends_on = [module.cluster]
+  depends_on = [module.cluster, local_sensitive_file.vcluster_kubeconfig]
 
   triggers = {
     cluster = module.cluster.cluster_name
@@ -75,10 +100,16 @@ resource "null_resource" "setup" {
       PROJECT_ID     = var.project_id
       CLUSTER_NAME   = module.cluster.cluster_name
       LOCATION       = var.location
-      KUBECONFIG     = pathexpand(var.kubeconfig_path)
+      KUBECONFIG     = var.infra_provider == "vcluster" ? try(local_sensitive_file.vcluster_kubeconfig[0].filename, pathexpand(var.kubeconfig_path)) : pathexpand(var.kubeconfig_path)
       REPO_PATH      = pathexpand(local.repo_path)
       MANIFESTS_DIR  = "${path.module}/manifests"
     }
   }
 }
 
+
+resource "local_sensitive_file" "vcluster_kubeconfig" {
+  count    = var.infra_provider == "vcluster" ? 1 : 0
+  content  = module.cluster.kubeconfig
+  filename = "/tmp/devops-bench-vcluster-${module.cluster.cluster_name}.kubeconfig"
+}

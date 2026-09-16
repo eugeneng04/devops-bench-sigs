@@ -21,3 +21,9 @@ output "cluster_location" {
   value       = module.cluster.location
   description = "The region/zone or 'local'"
 }
+
+output "kubeconfig" {
+  value       = module.cluster.kubeconfig
+  description = "Raw kubeconfig YAML (vcluster-only)"
+  sensitive   = true
+}

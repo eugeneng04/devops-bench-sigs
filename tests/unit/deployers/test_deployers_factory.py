@@ -291,6 +291,19 @@ def test_get_deployer_absolute_stack_requires_explicit_provider(tmp_path, base_c
     assert "INFRA_PROVIDER" in err_msg
 
 
+def test_get_deployer_relative_escaping_stack_requires_explicit_provider(base_config):
+    # A relative stack that escapes the tf/ directory must require an explicit provider.
+    with pytest.raises(ConfigError) as exc_info:
+        get_deployer(
+            {"deployer": "tofu", "stack": "../vcluster"},
+            base_config["project_id"],
+            base_config["cluster_name"],
+            base_config["location"],
+        )
+    err_msg = str(exc_info.value)
+    assert "requires an explicit provider" in err_msg
+
+
 def test_get_deployer_absolute_stack_with_provider(tmp_path, base_config):
     abs_stack = tmp_path / "ext" / "stack"
     abs_stack.mkdir(parents=True)
@@ -302,3 +315,88 @@ def test_get_deployer_absolute_stack_with_provider(tmp_path, base_config):
     )
     assert isinstance(deployer, TFDeployer)
     assert deployer.tf_dir == str(abs_stack)
+
+
+def test_get_deployer_tofu_vcluster_stack(mocker, base_config):
+    mocker.patch("devops_bench.deployers.tofu.Path.exists", return_value=True)
+    mocker.patch(
+        "devops_bench.providers.vcluster._get_current_context",
+        return_value="kind-test",
+    )
+    deployer = get_deployer(
+        {"deployer": "tofu", "stack": "prebuilt/vcluster"},
+        base_config["project_id"],
+        base_config["cluster_name"],
+        base_config["location"],
+    )
+    assert isinstance(deployer, TFDeployer)
+    assert deployer.variables["infra_provider"] == "vcluster"
+    assert deployer.variables["project_id"] == base_config["project_id"]
+    assert deployer.variables["cluster_name"] == base_config["cluster_name"]
+    assert deployer.variables["namespace"] == f"vcluster-{base_config['cluster_name']}"
+    assert deployer.tf_dir == str(_TF_ROOT / "prebuilt/vcluster")
+
+
+def test_get_deployer_infra_provider_env_vcluster(mocker, base_config, monkeypatch):
+    monkeypatch.setenv("INFRA_PROVIDER", "vcluster")
+    mocker.patch("devops_bench.deployers.tofu.Path.exists", return_value=True)
+    mocker.patch(
+        "devops_bench.providers.vcluster._get_current_context",
+        return_value="kind-test",
+    )
+    deployer = get_deployer(
+        {"deployer": "tofu", "stack": "prebuilt/kind"},
+        base_config["project_id"],
+        base_config["cluster_name"],
+        base_config["location"],
+    )
+    assert isinstance(deployer, TFDeployer)
+    assert deployer.variables["namespace"] == f"vcluster-{base_config['cluster_name']}"
+
+
+def test_get_deployer_tofu_gcp_stack_requires_explicit_provider(base_config):
+    # Cloud stacks cannot be auto-deduced by path alone to prevent unexpected charges.
+    with pytest.raises(ConfigError, match="requires an explicit provider"):
+        get_deployer(
+            {"deployer": "tofu", "stack": "prebuilt/gcp"},
+            base_config["project_id"],
+            base_config["cluster_name"],
+            base_config["location"],
+        )
+
+
+def test_get_deployer_tofu_gcp_stack_explicit_provider(mocker, base_config, monkeypatch):
+    monkeypatch.delenv("KUBECONFIG", raising=False)
+    mocker.patch("devops_bench.deployers.tofu.Path.exists", return_value=True)
+    deployer = get_deployer(
+        {"deployer": "tofu", "stack": "prebuilt/gcp", "provider": "gcp"},
+        base_config["project_id"],
+        base_config["cluster_name"],
+        base_config["location"],
+    )
+    assert isinstance(deployer, TFDeployer)
+    assert deployer.variables == {
+        "infra_provider": "gcp",
+        "project_id": base_config["project_id"],
+        "cluster_name": base_config["cluster_name"],
+        "location": base_config["location"],
+    }
+    assert deployer.tf_dir == str(_TF_ROOT / "prebuilt/gcp")
+
+
+def test_get_deployer_bench_tf_root_override(tmp_path, mocker, base_config, monkeypatch):
+    custom_tf_root = tmp_path / "custom_tf"
+    stack_dir = custom_tf_root / "prebuilt" / "kind"
+    stack_dir.mkdir(parents=True)
+    monkeypatch.setenv("BENCH_TF_ROOT", str(custom_tf_root))
+    mocker.patch("devops_bench.deployers.tofu.Path.exists", return_value=True)
+
+    deployer = get_deployer(
+        {"deployer": "tofu", "stack": "prebuilt/kind"},
+        base_config["project_id"],
+        base_config["cluster_name"],
+        base_config["location"],
+    )
+    assert isinstance(deployer, TFDeployer)
+    assert deployer.variables["infra_provider"] == "kind"
+    assert deployer.tf_dir == str((custom_tf_root / "prebuilt/kind").resolve())

@@ -13,23 +13,23 @@
 # limitations under the License.
 
 variable "infra_provider" {
-  description = "The cloud provider to use (gcp or kind)"
+  description = "The cloud provider to use (gcp, kind, or vcluster)"
   type        = string
 }
 
 variable "project_id" {
-  description = "The GCP project ID (empty for kind)"
+  description = "The GCP project ID (GCP-only)"
   type        = string
   default     = ""
 }
 
 variable "cluster_name" {
-  description = "The name of the GKE or KinD cluster"
+  description = "The name of the GKE, KinD, or vcluster cluster"
   type        = string
 }
 
 variable "location" {
-  description = "GCP zone/region or 'local'"
+  description = "GCP zone/region (GCP) or 'local' (KinD/vcluster)"
   type        = string
   default     = "local"
 }
@@ -52,7 +52,7 @@ variable "node_image" {
 
 variable "kubeconfig_path" {
   type        = string
-  description = "Path kind writes the kubeconfig to (read by the agent)."
+  description = "Path kind writes the kubeconfig to (KinD-only, read by the agent)."
   default     = "~/.kube/config"
 }
 
@@ -60,4 +60,34 @@ variable "repo_path" {
   type        = string
   description = "Local bare git repo (GitOps source of truth). Empty (default) derives a per-run-unique path from cluster_name so concurrent runs on the shared bastion don't collide (see locals)."
   default     = ""
+}
+
+variable "host_kubecontext" {
+  type        = string
+  description = "Host Kubernetes context to use (vcluster-only)"
+  default     = null
+}
+
+variable "host_kubeconfig_path" {
+  type        = string
+  description = "Path to host cluster kubeconfig file (vcluster-only)"
+  default     = "~/.kube/config"
+}
+
+variable "service_type" {
+  type        = string
+  description = "Exposure mechanism for the vcluster (see modules/cluster). The harness's vcluster provider resolves this per host: NodePort for local hosts, LoadBalancer for remote ones. Must be declared here so that resolved value survives; undeclared variables are dropped before reaching tofu."
+  default     = "LoadBalancer"
+}
+
+variable "vcluster_service_cidr" {
+  type        = string
+  description = "Host cluster's Service CIDR for vcluster runs (see modules/cluster). Must be set explicitly on hosts that don't use the Kubernetes default range (e.g. GKE); empty keeps the chart default, which only suits kind-style hosts."
+  default     = ""
+}
+
+variable "node_port" {
+  type        = number
+  description = "Static port override for local KinD testing (vcluster-only)"
+  default     = null
 }
