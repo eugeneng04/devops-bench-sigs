@@ -737,6 +737,46 @@ def test_model_override_base_url_ignored_for_other_providers(
     assert _build_model_override(AgentConfig(model="gemini-3.1-pro-preview")) == {}
 
 
+def test_model_override_populates_optional_model_entry_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``AGENT_CONTEXT_WINDOW``, ``AGENT_MODEL_REASONING``, and ``AGENT_MAX_TOKENS`` populate the entry."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:8000/v1")
+    monkeypatch.setenv("AGENT_CONTEXT_WINDOW", "262144")
+    monkeypatch.setenv("AGENT_MODEL_REASONING", "true")
+    monkeypatch.setenv("AGENT_MAX_TOKENS", "65536")
+    override = _build_model_override(AgentConfig(model="qwen3.8-27b-fp8", provider="openai"))
+    assert override["models"]["providers"]["openai"]["models"] == [
+        {
+            "id": "qwen3.8-27b-fp8",
+            "name": "qwen3.8-27b-fp8",
+            "contextWindow": 262144,
+            "reasoning": True,
+            "maxTokens": 65536,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("var", "value"),
+    [
+        ("AGENT_CONTEXT_WINDOW", "not-an-int"),
+        ("AGENT_MAX_TOKENS", "not-an-int"),
+        ("AGENT_MODEL_REASONING", "maybe"),
+    ],
+)
+def test_model_override_rejects_invalid_model_entry_env(
+    monkeypatch: pytest.MonkeyPatch,
+    var: str,
+    value: str,
+) -> None:
+    """Invalid ``AGENT_CONTEXT_WINDOW`` / ``AGENT_MAX_TOKENS`` / ``AGENT_MODEL_REASONING`` raise ``ConfigError``."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:8000/v1")
+    monkeypatch.setenv(var, value)
+    with pytest.raises(ConfigError):
+        _build_model_override(AgentConfig(model="qwen3.8-27b-fp8", provider="openai"))
+
+
 def _empty_sessions_run(argv: list[str], **kwargs: Any) -> SimpleNamespace:
     """Core-subprocess.run stub: ``oc sessions`` returns no rows."""
     return _make_subprocess_result(stdout=json.dumps([]), returncode=0)
