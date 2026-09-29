@@ -76,7 +76,7 @@ from devops_bench.agents.shared.cli_capabilities import (
     materialize_skills,
 )
 from devops_bench.core import SubprocessError, get_logger
-from devops_bench.core.config import get_env
+from devops_bench.core.config import get_bool, get_env, get_int
 from devops_bench.core.errors import ConfigError
 from devops_bench.core.model_providers import resolve_provider
 from devops_bench.core.subprocess import run
@@ -216,6 +216,8 @@ def _build_model_override(config: AgentConfig) -> dict:
 
     An ``openai`` model is always registered when ``OPENAI_BASE_URL`` is set, with
     that ``baseUrl``: a self-hosted server's model ids are never in oc's catalog.
+    ``AGENT_CONTEXT_WINDOW``, ``AGENT_MODEL_REASONING``, and ``AGENT_MAX_TOKENS``
+    populate ``contextWindow``, ``reasoning``, and ``maxTokens`` on the entry when set.
 
     Returns an empty dict when no model is configured or the model is already in
     oc's catalog (caller then writes no ``models``/``agents`` sections).
@@ -240,7 +242,16 @@ def _build_model_override(config: AgentConfig) -> dict:
     provider_entry: dict = dict(_PROVIDER_TRANSPORT[provider])
     if base_url:
         provider_entry["baseUrl"] = base_url.rstrip("/")
-    provider_entry["models"] = [{"id": bare, "name": bare}]
+    model_entry: dict[str, str | int | bool] = {"id": bare, "name": bare}
+    context_window = get_int("AGENT_CONTEXT_WINDOW")
+    if context_window is not None:
+        model_entry["contextWindow"] = context_window
+    if get_bool("AGENT_MODEL_REASONING"):
+        model_entry["reasoning"] = True
+    max_tokens = get_int("AGENT_MAX_TOKENS")
+    if max_tokens is not None:
+        model_entry["maxTokens"] = max_tokens
+    provider_entry["models"] = [model_entry]
     return {
         "models": {"providers": {provider: provider_entry}},
         # Allowlist ``provider/id`` for the agent's per-run ``--model`` override.
