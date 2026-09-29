@@ -408,3 +408,51 @@ def test_probe_survives_a_stdout_burst_larger_than_the_line_cap(tmp_path: Path) 
     binding = McpBinding(name="chatty", command=_server(tmp_path, burst))
 
     assert probe_stdio_server(binding, timeout=30) == ("alpha", "beta")
+
+
+_SINGLE_INSTANCE_LAUNCHER = """
+import os, subprocess, sys
+child = subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])
+# Exit as soon as the probe closes stdin or sends SIGTERM, leaving the child
+# behind in the process group to test that _terminate still reaps it.
+sys.stdin.read()
+"""
+
+_SINGLE_INSTANCE_SERVER = """
+import fcntl, json, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+lock = open(sys.argv[1], "w")
+try:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.stderr.write("lock already held by previous launch\\n")
+    sys.exit(1)
+print(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {
+    "protocolVersion": "2025-06-18", "capabilities": {},
+    "serverInfo": {"name": "s", "version": "1"}}}), flush=True)
+print(json.dumps({"jsonrpc": "2.0", "id": 2,
+                  "result": {"tools": [{"name": "t"}]}}), flush=True)
+time.sleep(60)
+"""
+
+
+def test_probe_releases_exclusive_resources_before_a_second_launch(tmp_path: Path) -> None:
+    """Every server is launched twice per run (probe, then the CLI's real launch).
+
+    A launcher wrapper that exits on ``stdin`` EOF / ``SIGTERM`` while its
+    server child ignores ``SIGTERM`` would leave the probe's child holding an
+    exclusive lock or port when the real launch starts unless ``_terminate``
+    escalates ``SIGKILL`` to the process group after ``proc.wait()``.
+    """
+    launcher = tmp_path / "launcher.py"
+    launcher.write_text(_SINGLE_INSTANCE_LAUNCHER, encoding="utf-8")
+    server = tmp_path / "single.py"
+    server.write_text(_SINGLE_INSTANCE_SERVER, encoding="utf-8")
+    lockfile = tmp_path / "server.lock"
+    binding = McpBinding(
+        name="single",
+        command=(sys.executable, str(launcher), str(server), str(lockfile)),
+    )
+
+    assert probe_stdio_server(binding, timeout=10.0) == ("t",)
+    assert probe_stdio_server(binding, timeout=10.0) == ("t",)

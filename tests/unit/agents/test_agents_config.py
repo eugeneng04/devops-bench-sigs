@@ -326,6 +326,11 @@ def test_from_env_rejects_a_literal_in_a_secret_named_mcp_env_value(key: str) ->
         # Not credential-shaped: rejecting every literal would break ordinary
         # configuration, which is the common case.
         ("NODE_ENV", "production"),
+        # Substrings inside a larger word are not credentials: boundaries are
+        # non-alphanumeric (``\b`` treats ``_`` as a word character).
+        ("MAX_TOKENS", "4096"),
+        ("KEYSTONE_REGION", "us-east-1"),
+        ("TOKENIZER", "cl100k_base"),
         # An empty value carries nothing to leak.
         ("API_KEY", ""),
     ],

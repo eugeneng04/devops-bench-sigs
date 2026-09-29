@@ -47,7 +47,23 @@ _ENV_REF = re.compile(r"\$\{\w+\}")
 # is written verbatim into the CLI's config file inside the agent's workspace,
 # and the harness collects that workspace wholesale into the run's artifacts, so
 # a pasted credential would be persisted with the results.
-_SECRET_KEY_HINTS: tuple[str, ...] = ("TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL")
+#
+# Matched on non-alphanumeric boundaries rather than as raw substrings (and not
+# with ``\b``, which treats ``_`` as a word character and misses
+# ``SCREAMING_SNAKE_CASE``) so ordinary knobs like ``MAX_TOKENS``,
+# ``KEYSTONE_REGION``, or ``TOKENIZER`` are not mistaken for credentials.
+_SECRET_KEY_HINTS: tuple[str, ...] = (
+    "TOKEN",
+    "KEY",
+    "SECRET",
+    "PASSWORD",
+    "CREDENTIAL",
+    "CREDENTIALS",
+)
+_SECRET_KEY_RE = re.compile(
+    rf"(?:^|[^A-Za-z0-9])(?:{'|'.join(_SECRET_KEY_HINTS)})(?:$|[^A-Za-z0-9])",
+    re.IGNORECASE,
+)
 
 
 def _reject_literal_secrets(name: str, env: dict[str, str]) -> None:
@@ -64,7 +80,7 @@ def _reject_literal_secrets(name: str, env: dict[str, str]) -> None:
     for key, value in env.items():
         if not value or _ENV_REF.search(value):
             continue
-        if any(hint in key.upper() for hint in _SECRET_KEY_HINTS):
+        if _SECRET_KEY_RE.search(key):
             raise ConfigError(
                 f"AGENT_MCP_CONFIG server {name!r} env {key!r} looks like a credential but "
                 f"holds a literal; use a '${{{key}}}' reference so the value stays out of "

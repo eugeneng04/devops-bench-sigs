@@ -446,15 +446,30 @@ def _signal_group(proc: subprocess.Popen, sig: int) -> None:
 def _terminate(proc: subprocess.Popen, readers: tuple[threading.Thread, ...] = ()) -> None:
     """Stop the probed server and release its pipes, always within a bounded time.
 
-    Ordering is load-bearing. ``TextIOWrapper.close()`` must take the buffer lock
-    a blocked reader thread holds, and that reader only unblocks at EOF, which
-    needs *every* holder of the pipe's write end to exit. So the process group is
-    signalled first, then the readers are joined with a deadline, and any stream
-    whose reader is still alive is abandoned rather than closed — a leaked file
-    descriptor is recoverable, an unbounded hang on the per-run path is not.
+    Ordering is load-bearing so the probe never overlaps the CLI's real launch:
+
+    1. Close ``stdin`` first so a launcher or server that exits on ``stdin`` EOF
+       (per the MCP stdio transport spec) begins a clean shutdown before the
+       signal lands.
+    2. Signal the whole process group (``start_new_session=True`` sets
+       ``pgid == proc.pid``), wait for the leader, and join the stdout/stderr
+       reader threads — which reach EOF only when *every* descendant holding the
+       inherited write end has exited.
+    3. If a reader is still alive after ``SIGTERM`` (a launcher wrapper exited
+       on ``SIGTERM`` while the server child it spawned ignored ``SIGTERM``),
+       escalate ``SIGKILL`` to the process group ``proc.pid`` — still valid in
+       the kernel after the leader is reaped — and re-join so no probe child is
+       left holding a lock or port when the CLI starts the server for real.
+    4. Any stream whose reader still has not unblocked is abandoned rather than
+       closed: ``TextIOWrapper.close()`` takes the buffer lock a blocked reader
+       holds, and a leaked fd is recoverable where a per-run hang is not.
 
     Idempotent: called on both the success and failure paths of a single probe.
     """
+    if proc.stdin is not None:
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
+
     _signal_group(proc, signal.SIGTERM)
     try:
         proc.wait(timeout=_SIGNAL_GRACE_SEC)
@@ -470,13 +485,22 @@ def _terminate(proc: subprocess.Popen, readers: tuple[threading.Thread, ...] = (
         reader.join(timeout=_READER_JOIN_SEC)
         stuck = stuck or reader.is_alive()
 
-    streams = (proc.stdin,) if stuck else (proc.stdin, proc.stdout, proc.stderr)
+    if stuck:
+        with contextlib.suppress(OSError, AttributeError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        stuck = False
+        for reader in readers:
+            reader.join(timeout=_READER_JOIN_SEC)
+            stuck = stuck or reader.is_alive()
+
     if stuck:
         _log.warning(
             "MCP probe reader still blocked after the server was killed; "
             "leaving its pipes open to avoid a hang"
         )
-    for stream in streams:
+        return
+
+    for stream in (proc.stdout, proc.stderr):
         try:
             if stream is not None:
                 stream.close()
