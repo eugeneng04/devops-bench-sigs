@@ -28,7 +28,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any, NamedTuple
 
 from devops_bench.core import score_keys
-from devops_bench.results.row import Manifest, ResultRow
+from devops_bench.results.row import CheckGroupRow, CheckRow, Manifest, ResultRow
 
 __all__ = [
     "OUTCOME_SCORE_KEY",
@@ -347,6 +347,89 @@ def _non_negative_float_or_none(value: Any) -> float | None:
     return float(value) if math.isfinite(value) and value >= 0 else None
 
 
+def _text(value: Any) -> str:
+    """Coerce an optional display value to a string, mapping ``None`` to ``""``."""
+    return "" if value is None else str(value)
+
+
+def _check_rows(report: Any) -> list[CheckRow]:
+    """Flatten a record's ``verification_report`` into :class:`CheckRow` items.
+
+    Records written before the tri-state ``status`` landed carry only
+    ``success``; derive ``pass`` / ``fail`` from it in that case. Per-child
+    diagnostics and timings are dropped: the row explains the outcome, the
+    record keeps the evidence.
+    """
+    rows: list[CheckRow] = []
+    for item in report or []:
+        if not isinstance(item, Mapping):
+            continue
+        status = item.get("status") or ("pass" if item.get("success") else "fail")
+        weight = item.get("weight")
+        rows.append(
+            CheckRow(
+                name=_text(item.get("name")),
+                title=_text(item.get("title")),
+                description=_text(item.get("description")),
+                group=_text(item.get("group")),
+                failure_hint=_text(item.get("failure_hint")),
+                role=_text(item.get("role")),
+                severity=_text(item.get("severity")),
+                # Pass the stored value through; only an absent weight takes
+                # the entry default. Rewriting a stored 0 would misreport it.
+                weight=1.0 if weight is None else float(weight),
+                mode=_text(item.get("mode")),
+                status=_text(status),
+                reason=_text(item.get("reason")),
+            )
+        )
+    return rows
+
+
+def _parse_error_rows(errors: Any) -> list[CheckRow]:
+    """Surface each ``verification_parse_errors`` item as an ``error`` check.
+
+    An entry that fails to parse, or is dropped as a duplicate name, never
+    evaluates, yet it already fails closed into the correctness score. Without
+    a row for it a viewer would see a low score next to an all-green check
+    list. The row carries the role and severity the entry declared, so a
+    safeguard that went unrun reads as one; ``objective`` is the fallback for
+    an entry that declared nothing usable, and is also what the rollup charges
+    every such entry as, at weight 1.0.
+    """
+    rows: list[CheckRow] = []
+    for item in errors or []:
+        if not isinstance(item, Mapping):
+            continue
+        rows.append(
+            CheckRow(
+                name=_text(item.get("name")),
+                title=_text(item.get("title")),
+                description=_text(item.get("description")),
+                group=_text(item.get("group")),
+                failure_hint=_text(item.get("failure_hint")),
+                role=_text(item.get("role")) or "objective",
+                severity=_text(item.get("severity")),
+                status="error",
+                reason=f"not evaluated: {_text(item.get('reason'))}",
+            )
+        )
+    return rows
+
+
+def _check_groups(groups: Any) -> dict[str, CheckGroupRow]:
+    """Map a record's ``task_metadata.check_groups`` onto :class:`CheckGroupRow`."""
+    if not isinstance(groups, Mapping):
+        return {}
+    return {
+        str(key): CheckGroupRow(
+            title=_text(group.get("title")), description=_text(group.get("description"))
+        )
+        for key, group in groups.items()
+        if isinstance(group, Mapping)
+    }
+
+
 def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list[ResultRow]:
     """Flatten harness result records into :class:`ResultRow` rows for one run.
 
@@ -372,6 +455,9 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
         # A reported 0 is a parse miss; a negative one is corrupt.
         turns = _coerce_int(record.get("model_turns"))
         turns = turns if turns and turns > 0 else None
+        task_meta = record.get("task_metadata")
+        if not isinstance(task_meta, Mapping):
+            task_meta = {}
         rows.append(
             ResultRow(
                 setup_id=manifest.setup_id,
@@ -382,6 +468,13 @@ def build_rows(records: Iterable[Mapping[str, Any]], manifest: Manifest) -> list
                 t=manifest.t,
                 task_folder=record.get("folder", "") or "",
                 task_name=record.get("name", "") or "",
+                task_title=_text(task_meta.get("title")),
+                task_summary=_text(task_meta.get("summary")),
+                task_category=_text(task_meta.get("category")),
+                task_tags=[str(tag) for tag in (task_meta.get("tags") or [])],
+                check_groups=_check_groups(task_meta.get("check_groups")),
+                checks=_check_rows(record.get("verification_report"))
+                + _parse_error_rows(record.get("verification_parse_errors")),
                 iteration=0,
                 outcome_score=extract_score(scores, OUTCOME_SCORE_KEY),
                 correctness_score=correctness,

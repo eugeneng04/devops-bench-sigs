@@ -51,6 +51,18 @@ fields present: `task_id`, `name`, `prompt`, `expected_output`,
 manifest-generation tasks** (no cluster). For `tofu`, `infrastructure.stack`
 resolves to an existing `tf/prebuilt/<dir>` (confirm the directory exists).
 
+### Display metadata
+
+A validated task carries `title`, `summary`, `category`, and every
+`verification_spec` entry carries `title` and `description`; an unvalidated task
+may omit them, and that is not a finding. Where present they are written for a
+result viewer, not the agent: plain English, outcome not method, no
+`{{placeholders}}` and a `category` from the schema's `CATEGORIES` (the schema
+rejects both). Every `group` names a declared `check_groups` key. A
+`failure_hint` should describe the common wrong path, not restate the
+description. *Why:* these fields are the only thing a leaderboard can show next
+to a failed check.
+
 ### Spec parsing
 
 `verification_spec` / `chaos_spec` parse against the registries (`VERIFIERS`,

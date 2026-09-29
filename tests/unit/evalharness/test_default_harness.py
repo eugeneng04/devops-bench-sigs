@@ -470,7 +470,7 @@ def test_run_one_evaluates_verification_on_the_exception_path_when_infra_is_up(
     # exception path.
     monkeypatch.setattr(harness, "execute_agent", _boom)
     canned_report = [{"name": "web-ready", "success": True, "status": "pass"}]
-    monkeypatch.setattr(harness, "_run_verification", lambda entries: canned_report)
+    monkeypatch.setattr(harness, "_run_verification", lambda entries, **kwargs: canned_report)
     task = Task.from_dict(
         {
             "task_id": "t",
@@ -715,6 +715,7 @@ _RESULTS_JSON_REQUIRED_KEYS: frozenset[str] = frozenset(
         "verification_status",
         "generation_only",
         "validated",
+        "task_metadata",
     }
 )
 
@@ -776,6 +777,55 @@ def test_success_record_keys_match_golden(isolated_env: None) -> None:
     assert record["errors"] == []
     assert record["terminal_reason"] == "completed"
     assert record["scores"] == {}
+
+
+def test_records_snapshot_the_task_display_metadata(isolated_env: None) -> None:
+    """Both record shapes carry the task's display metadata verbatim.
+
+    Snapshotting it on the record is what lets a row render with the titles
+    that were true when it ran, without joining back to the task file.
+    """
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c")
+    task = Task.from_dict(
+        {
+            "name": "t",
+            "title": "Fix the thing",
+            "summary": "It is broken; fix it.",
+            "category": "remediate",
+            "tags": ["kubernetes"],
+            "check_groups": {"fixed": {"title": "Fixed", "description": "All good."}},
+        }
+    )
+    expected = {
+        "title": "Fix the thing",
+        "summary": "It is broken; fix it.",
+        "category": "remediate",
+        "tags": ["kubernetes"],
+        "check_groups": {"fixed": {"title": "Fixed", "description": "All good."}},
+    }
+    success = harness._build_success_record(  # noqa: SLF001 - testing the record shape
+        task=task,
+        prompt="p",
+        expected_output="e",
+        agent_res=_stub_agent_result(),
+        chaos_report={},
+        perf_report={},
+    )
+    failed = harness._build_failed_record(task, RuntimeError("boom"))  # noqa: SLF001
+    assert success["task_metadata"] == expected
+    assert failed["task_metadata"] == expected
+
+
+def test_record_task_metadata_is_empty_for_a_bare_task(isolated_env: None) -> None:
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c")
+    record = harness._build_failed_record(Task(name="t"), RuntimeError("boom"))  # noqa: SLF001
+    assert record["task_metadata"] == {
+        "title": "",
+        "summary": "",
+        "category": "",
+        "tags": [],
+        "check_groups": {},
+    }
 
 
 def test_failed_record_keys_match_golden(isolated_env: None) -> None:
