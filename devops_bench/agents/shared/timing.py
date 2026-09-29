@@ -22,10 +22,16 @@ __all__ = ["merged_span_sec", "parse_event_time"]
 
 
 def parse_event_time(value: object) -> float | None:
-    """Parse an ISO-8601 or epoch-second timestamp; ``None`` when unusable.
+    """Parse an ISO-8601 or epoch-second timestamp into epoch seconds.
 
     An offset-less stamp is read as UTC, so the result never depends on the
     runner's local zone.
+
+    Args:
+        value: The raw ``ts`` / ``timestamp`` field, or anything else.
+
+    Returns:
+        Epoch seconds, or ``None`` when the value is missing or unparseable.
     """
     # ``bool`` first: ``True`` is an ``int``, and epoch second 1 is not a time.
     if isinstance(value, bool):
@@ -44,12 +50,18 @@ def parse_event_time(value: object) -> float | None:
 
 
 def merged_span_sec(intervals: list[tuple[float, float]]) -> float | None:
-    """Return wall-clock seconds covered by ``(start, end)`` pairs, overlaps once.
+    """Return wall-clock seconds covered by ``intervals``, overlaps counted once.
 
     A turn can dispatch concurrent calls, so summing durations would overcount.
-    A pair ending before it starts is dropped as clock skew. ``None`` when none
-    is usable — distinct from ``0.0``, meaning the tools returned inside the
-    transcript's resolution.
+
+    Args:
+        intervals: ``(start, end)`` epoch-second pairs, in any order. Pairs whose
+            end precedes their start are dropped as clock skew.
+
+    Returns:
+        Seconds of wall clock inside at least one interval, or ``None`` when no
+        usable interval was supplied — distinct from ``0.0``, meaning the tools
+        returned inside the transcript's resolution.
     """
     usable = sorted((s, e) for s, e in intervals if e >= s)
     if not usable:

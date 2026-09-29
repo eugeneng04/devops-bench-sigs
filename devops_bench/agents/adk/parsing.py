@@ -366,10 +366,21 @@ def _fold_response(
     errors: list[str],
     index: int,
 ) -> float | None:
-    """Attach one ``function_response`` to the call it answers; return its start time.
+    """Attach one ``function_response`` to the call it answers.
 
     Matching is by ADK's correlation ``id``, falling back to the oldest id-less
     call. A response matching nothing is reported on ``errors``, not dropped.
+
+    Args:
+        response: The ``function_response`` mapping from the event part.
+        pending_by_id: Pending ``(call, started_at)`` queues keyed by call id.
+        pending_unkeyed: FIFO queue of pending id-less ``(call, started_at)`` pairs.
+        errors: Error accumulator mutated in place on an unmatched response.
+        index: Zero-based event index in the stream, for error reporting.
+
+    Returns:
+        The matched call's start time, or ``None`` when the response matched no
+        call or that call's event carried no usable timestamp.
     """
     call_id = response.get("id")
     matched: tuple[ToolCall, float | None] | None = None

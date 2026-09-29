@@ -484,8 +484,17 @@ def _drive(
 
     ``events`` fills as the stream arrives: ADK yields an error event and *then*
     raises, so a run that dies mid-way still has a trajectory worth scoring.
-    ``terminal_reason`` is returned because a timeout and a failure both leave
-    one, so ``errors`` alone cannot tell them apart.
+
+    Args:
+        root_agent: The prepared ADK agent.
+        prompt: Task prompt to send as the user message.
+        timeout_sec: Wall-clock budget, or ``None`` for no limit.
+
+    Returns:
+        An ``(events, errors, terminal_reason)`` tuple, where the reason is one
+        of :data:`~devops_bench.agents.result.TERMINAL_REASONS`. A timeout and a
+        failure both leave a partial trajectory, so ``errors`` alone cannot tell
+        them apart.
     """
     from google.adk.runners import InMemoryRunner
     from google.genai import types

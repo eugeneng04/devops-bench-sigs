@@ -69,6 +69,12 @@ def _accumulate_usage(acc: dict, usage: dict, *, top_level: bool = True) -> None
     Top-level ``cacheWrite`` is left to :func:`_resolve_cache_write`, but not
     nested: a ``cost`` breakdown itemizes cache-write *dollars*, which have no
     second source.
+
+    Args:
+        acc: Accumulator mutated in place.
+        usage: A single turn's usage mapping.
+        top_level: Whether ``usage`` is the usage mapping itself rather than a
+            nested breakdown inside it.
     """
     for key, value in usage.items():
         if (top_level and key == "cacheWrite") or isinstance(value, bool):
@@ -82,7 +88,12 @@ def _accumulate_usage(acc: dict, usage: dict, *, top_level: bool = True) -> None
 
 
 def _accumulate_cache_write(acc: dict, usage: object) -> None:
-    """Sum one event's ``cacheWrite`` into ``acc``, in place."""
+    """Sum one event's ``cacheWrite`` into ``acc``, in place.
+
+    Args:
+        acc: Cache-write accumulator mutated in place.
+        usage: A usage mapping, or anything else (ignored).
+    """
     if not isinstance(usage, dict):
         return
     written = usage.get("cacheWrite")
@@ -95,6 +106,11 @@ def _resolve_cache_write(acc: dict, rollup: dict, per_call: dict) -> None:
 
     Today's rollup omits ``cacheWrite`` from its buckets *and* its total, so a
     per-call value is added into the total; a rollup value is taken as-is.
+
+    Args:
+        acc: Token accumulator mutated in place.
+        rollup: Cache writes seen on ``model.completed.usage``.
+        per_call: Cache writes seen on ``assistant.message.usage``.
     """
     written = rollup.get("cacheWrite")
     if isinstance(written, (int, float)):

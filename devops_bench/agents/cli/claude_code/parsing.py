@@ -178,17 +178,20 @@ def parse_stream_json(stdout: str) -> ParsedRun:
 
     Returns:
         A :class:`~devops_bench.agents.shared.telemetry.ParsedRun`.
-        ``model_turns`` counts distinct assistant ``message.id`` values, not
-        ``num_turns``, which the CLI raises once per content block rather than
-        per model call. ``served_models`` comes from the assistant envelopes,
-        not ``modelUsage``, whose keys include the CLI's own helper model.
+        ``model_turns`` counts distinct root-agent assistant ``message.id``
+        values (skipping subagent envelopes tagged with ``parent_tool_use_id``),
+        not ``num_turns``, which the CLI raises once per content block rather
+        than per model call. ``served_models`` comes from the same root-agent
+        assistant envelopes, not ``modelUsage``, whose keys include the CLI's
+        own helper model.
     """
     text_parts: list[str] = []
     result_output: str | None = None
     tokens: dict = empty_tokens()
     result_usage_seen = False
     acc_usage: dict = {}
-    # Doubles as the model-turn counter; one envelope per content block repeats the id.
+    # One envelope per content block repeats the message id; dedupe usage and turns.
+    seen_usage_ids: set[str] = set()
     seen_message_ids: set[str] = set()
     errors: list[str] = []
     # FIFO per id: reused ids match in emission order instead of overwriting.
@@ -230,11 +233,16 @@ def parse_stream_json(stdout: str) -> ParsedRun:
                 # Per-turn usage backs a truncated stream; dedupe the repeated id.
                 msg_id = message.get("id")
                 identified = isinstance(msg_id, str) and bool(msg_id)
-                if not (identified and msg_id in seen_message_ids):
+                if not (identified and msg_id in seen_usage_ids):
+                    if identified:
+                        seen_usage_ids.add(str(msg_id))
+                    _add_usage(acc_usage, message.get("usage"))
+                # Subagent messages carry ``parent_tool_use_id``; skip them so a
+                # helper model does not look like a failover or inflate turns.
+                if not event.get("parent_tool_use_id"):
                     if identified:
                         seen_message_ids.add(str(msg_id))
-                    _add_usage(acc_usage, message.get("usage"))
-                note_model(served_models, message.get("model"))
+                    note_model(served_models, message.get("model"))
             event_time = parse_event_time(event.get("timestamp"))
             content = message.get("content")
             if not isinstance(content, list):
@@ -348,7 +356,15 @@ _USAGE_KEYS = (
 
 
 def _has_usage(usage: dict) -> bool:
-    """True if ``usage`` has a recognized count, so a genuine zero is not a miss."""
+    """Return whether ``usage`` carries at least one recognized integer count.
+
+    Args:
+        usage: A terminal ``result.usage`` mapping.
+
+    Returns:
+        ``True`` if at least one count is present (so a genuine zero is not
+        treated as a parse miss).
+    """
     return any(int_or_none(usage.get(key)) is not None for key in _USAGE_KEYS)
 
 
@@ -357,7 +373,12 @@ _ACC_USAGE_KEYS = tuple(key for key in _USAGE_KEYS if key != "output_tokens")
 
 
 def _add_usage(acc: dict, usage: object) -> None:
-    """Fold a per-turn ``usage`` block in; a stand-in for a truncated stream."""
+    """Fold a per-turn ``usage`` block in; a stand-in for a truncated stream.
+
+    Args:
+        acc: Running usage accumulator mutated in place.
+        usage: A single turn's ``usage`` mapping, or anything else (ignored).
+    """
     if not isinstance(usage, dict):
         return
     for key in _ACC_USAGE_KEYS:
@@ -373,6 +394,12 @@ def _usage_tokens(usage: dict) -> dict[str, int | None]:
     ``output_tokens_details``, so it is subtracted back out to keep ``output``
     free of ``reasoning``. ``total`` is filled only once ``output`` is known: a
     prompt-side-only sum would reach the dashboard as an undercount.
+
+    Args:
+        usage: Cumulative or per-turn Anthropic ``usage`` mapping.
+
+    Returns:
+        Canonical token dict keyed by :data:`TOKEN_BUCKETS`.
     """
     tokens = empty_tokens()
     output = int_or_none(usage.get("output_tokens"))

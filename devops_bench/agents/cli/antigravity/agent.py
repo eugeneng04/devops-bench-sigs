@@ -50,7 +50,16 @@ _UNDECODABLE_MAX_ATTEMPTS = 2
 
 
 def _read_db_state(db_path: pathlib.Path) -> parsing.DbTokenState:
-    """Poll the conversation DB through its async flush; return the last state read."""
+    """Poll the conversation DB through its async flush.
+
+    Args:
+        db_path: Path to the ``conversations/<uuid>.db`` file.
+
+    Returns:
+        The last :class:`~devops_bench.agents.cli.antigravity.parsing.DbTokenState`
+        read. Its ``tokens`` / ``turns`` are ``None`` when usage never
+        materializes (missing DB, or schema drift making the blobs undecodable).
+    """
     undecodable_seen = 0
     state = parsing.DbTokenState("absent")
     for attempt in range(_DB_FLUSH_POLL_ATTEMPTS):

@@ -835,6 +835,32 @@ def test_parse_stream_json_ignores_the_cli_synthetic_error_envelope() -> None:
     assert "There's an issue with the selected model." in parsed.output
 
 
+def test_parse_stream_json_skips_subagent_messages_for_served_models_and_turns() -> None:
+    """Subagent assistant envelopes carry ``parent_tool_use_id`` and may run on
+    a helper model; counting them would look like a mid-run failover and inflate
+    the root agent's ``modelTurns``."""
+    blob = _stream(
+        _assistant(
+            {"type": "tool_use", "id": "task_1", "name": "Task", "input": {}},
+            msg_id="m1",
+            model="claude-sonnet-4-6",
+        ),
+        {
+            **_assistant(
+                {"type": "text", "text": "helper"},
+                msg_id="sub_1",
+                model="claude-haiku-4-5",
+            ),
+            "parent_tool_use_id": "task_1",
+        },
+        _user({"type": "tool_result", "tool_use_id": "task_1", "content": "done"}),
+        _assistant({"type": "text", "text": "answer"}, msg_id="m2", model="claude-sonnet-4-6"),
+    )
+    parsed = parse_stream_json(blob)
+    assert parsed.served_models == ["claude-sonnet-4-6"]
+    assert parsed.model_turns == 2
+
+
 def test_parse_stream_json_counts_model_turns_by_message_id() -> None:
     """Claude Code emits one envelope per content block, all repeating the
     message id, so envelope count would overcount a single model turn."""

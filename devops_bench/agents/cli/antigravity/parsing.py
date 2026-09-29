@@ -403,7 +403,14 @@ def _turn_usage(blob: bytes) -> dict | None:
 
 
 class DbTokenState(NamedTuple):
-    """One read of an ``agy`` DB; ``tokens``/``turns`` are set only when ``ready``."""
+    """What one read of an ``agy`` conversation DB recovered.
+
+    Attributes:
+        state: ``"ready"`` / ``"pending"`` / ``"undecodable"`` / ``"absent"``.
+        tokens: Canonical token dict when ``state`` is ``"ready"``, else ``None``.
+        turns: Decoded per-turn usage records, i.e. model round-trips, when
+            ``state`` is ``"ready"``; ``None`` otherwise.
+    """
 
     state: str
     tokens: dict | None = None
@@ -412,6 +419,9 @@ class DbTokenState(NamedTuple):
 
 def db_token_state(db_path: str | os.PathLike[str]) -> DbTokenState:
     """Read canonical token usage from an ``agy`` conversation DB.
+
+    Args:
+        db_path: Path to the ``conversations/<uuid>.db`` file.
 
     Returns:
         A :class:`DbTokenState`. Only ``pending`` is worth retrying — the flush

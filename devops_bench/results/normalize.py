@@ -292,6 +292,14 @@ def count_tool_calls(trajectory: Any, errors: Any = None) -> tuple[int | None, i
     one condition spelled two ways, so counting either would skew the column.
     An empty trajectory is ``(0, 0)`` only when ``errors`` is an empty list,
     since a failed transcript export looks the same as a tool-less run.
+
+    Args:
+        trajectory: The record's ``trajectory`` list, or ``None``.
+        errors: The record's ``errors`` list; omit when unavailable so an empty
+            trajectory stays ``(None, None)`` rather than a claimed zero.
+
+    Returns:
+        A ``(tool_calls, tool_errors)`` pair, each ``int`` or ``None``.
     """
     if not isinstance(trajectory, list):
         return None, None
@@ -309,7 +317,14 @@ def count_tool_calls(trajectory: Any, errors: Any = None) -> tuple[int | None, i
 
 
 def _served_model(value: Any) -> str:
-    """Comma-join the models that answered; several means a mid-run failover."""
+    """Comma-join the models that answered; several means a mid-run failover.
+
+    Args:
+        value: The record's ``served_models`` list, or ``None``.
+
+    Returns:
+        Comma-joined model ids, or ``""`` when ``value`` is not a usable list.
+    """
     if not isinstance(value, list):
         return ""
     return ",".join(v for v in value if isinstance(v, str) and v)
@@ -319,6 +334,12 @@ def _non_negative_float_or_none(value: Any) -> float | None:
     """Coerce a duration to a non-negative ``float``, else ``None``.
 
     ``0.0`` is a real measurement here. ``bool`` is rejected: ``True`` is an ``int``.
+
+    Args:
+        value: Candidate duration in seconds.
+
+    Returns:
+        A finite non-negative ``float``, or ``None`` when missing or invalid.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
