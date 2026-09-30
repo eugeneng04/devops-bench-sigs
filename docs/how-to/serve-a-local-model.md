@@ -50,7 +50,7 @@ or use `a2-highgpu-1g` (A100 80 GB, omitting `boot_disk_type`).
 | `model` | `""` | Hugging Face repo ID. Non-empty enables GPU scheduling (`TERMINATE`), defaults `image` to Ubuntu 24.04 with NVIDIA 580 drivers, and installs `sglang.service`. |
 | `served_name` | `""` | Model ID advertised at `/v1/models` (defaults to `model`). |
 | `tp` | `1` | Tensor parallelism degree (`--tp`). |
-| `context_length` | `null` | Context window in tokens (`--context-length`). |
+| `context_length` | `null` | Context window in tokens (`--context-length`). Must not exceed the model's `max_position_embeddings` in `config.json`; leave `null` to let SGLang derive the model's native maximum. |
 | `reasoning_parser` | `""` | SGLang `--reasoning-parser`. Empty omits the flag. |
 | `tool_call_parser` | `""` | SGLang `--tool-call-parser`. Empty omits the flag. |
 | `sglang_image` | `lmsysorg/sglang:v0.5.20` | Pinned SGLang container image. |
@@ -60,13 +60,12 @@ or use `a2-highgpu-1g` (A100 80 GB, omitting `boot_disk_type`).
 | `boot_disk_gb` | `50` | Raise to `200`+ when serving a model. |
 
 > [!WARNING]
-> **Parsers are per model family.** Set `reasoning_parser = "qwen3"` for Qwen3
-> models; for `tool_call_parser`, use `"qwen3_coder"` on `Qwen3.8` / `Qwen3-Coder`
-> models (XML `<function=...>` tool calls) and `"qwen25"` on standard
-> `Qwen/Qwen3-*` models such as `Qwen3-8B-FP8` or `Qwen3-32B` (JSON
-> `<tool_call>` tags). For other families (such as Gemma), look up the matching
-> parser names in SGLang's documentation — a mismatched tool-call parser causes
-> every turn to finish as plain text with zero tool calls and no error.
+> **Parsers are per model family.**
+> - **Qwen 3.8 / Qwen3-Coder** (e.g. `Qwen/Qwen3.8-27B-FP8`): `reasoning_parser = "qwen3"`, `tool_call_parser = "qwen3_coder"` (XML `<function=...>` tool calls).
+> - **Standard Qwen 3** (e.g. `Qwen/Qwen3-8B-FP8`, `Qwen/Qwen3-32B`): `reasoning_parser = "qwen3"`, `tool_call_parser = "qwen"` (JSON `<tool_call>` tags; `"qwen25"` is deprecated in SGLang `v0.5.20`).
+> - **Gemma 4** (e.g. `google/gemma-4-E2B-it`, `google/gemma-4-27B-it`): `reasoning_parser = "gemma4"`, `tool_call_parser = "gemma4"` (and set `hf_token_secret` for gated weights). Note that Gemma 3 (`google/gemma-3-*`) uses a strict alternating `user`/`assistant` Hugging Face chat template that rejects `role: "tool"` messages on multi-turn tool calls (`400 BadRequestError`); use Gemma 4 for tool-calling agents.
+>
+> A mismatched `tool_call_parser` causes every turn to finish as plain text with zero tool calls and no error.
 
 ---
 
@@ -117,9 +116,10 @@ export CHAOS_MODEL=gemini-3.1-pro-preview
   `OPENAI_BASE_URL`, `AGENT_MODEL`, and `AGENT_MAX_TOKENS`.
 - **Keep `AGENT_CONTEXT_WINDOW` at `65536` or higher for OpenClaw:** OpenClaw
   reserves `16384` tokens by default before triggering CLI transcript compaction,
-  and its built-in system prompt + tool definitions consume ~12.7K tokens per
-  turn. Setting `AGENT_CONTEXT_WINDOW` too low (e.g. `32768`) triggers
-  compaction after just two turns.
+  and its built-in system prompt + tool definitions consume ~12.7K–24K tokens per
+  turn. Setting `AGENT_CONTEXT_WINDOW` too low (e.g. `32768` or `40960`) triggers
+  compaction after just two turns (`CLI transcript compaction failed: Already compacted`),
+  even when the server's `--context-length` is `40960`.
 
 ---
 
