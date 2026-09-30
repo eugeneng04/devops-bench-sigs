@@ -186,6 +186,22 @@ def test_normalize_tokens_openclaw_cost_breakdown_is_not_read_as_tokens() -> Non
     assert normalize_tokens(tokens) == (100, 20, 300, None, None, 420)
 
 
+def test_normalize_tokens_reads_cli_camelcase_buckets() -> None:
+    tokens = {
+        "input": 58,
+        "output": 11613,
+        "cacheRead": 1613330,
+        "cacheWrite": 225457,
+        "reasoningTokens": 175,
+        "totalTokens": 1850458,
+    }
+    assert normalize_tokens(tokens) == (58, 11613, 1613330, 175, 225457, 1850458)
+
+
+def test_normalize_tokens_canonical_key_wins_over_camelcase() -> None:
+    assert normalize_tokens({"cached": 1, "cacheRead": 2})[2] == 1
+
+
 # -- extract_score -----------------------------------------------------------
 
 
