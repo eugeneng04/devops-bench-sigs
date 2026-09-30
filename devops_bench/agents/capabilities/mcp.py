@@ -37,29 +37,12 @@ class McpBinding:
         command: argv-style command launching the MCP server, or ``()`` when
             the agent runs MCP in-process. The API agent feeds this to
             :class:`~devops_bench.agents.api.mcp.MCPClient`.
-        env: Environment pairs the server is launched with, as a tuple of
-            ``(name, value)`` so the binding stays hashable. A value may carry
-            ``${VAR}`` references (braces required — a bare ``$VAR`` stays
-            literal) resolved from the runner's environment.
-
-            Two things expand those references, and which one runs depends on
-            who launches the server:
-
-            * The harness, via
-              :func:`~devops_bench.agents.shared.mcp_probe.expand_env`, when it
-              spawns the server itself — the preflight probe and the API agent.
-              The resolved value exists only in that child process.
-            * The CLI, for a server the binary spawns. The reference is written
-              into the CLI's config file **unexpanded** and the CLI resolves it
-              from its own environment, so a credential never lands in the
-              agent's workspace — which is collected wholesale into the run's
-              artifacts.
-
-            Both read the same runner env, so the two paths agree on the value;
-            only the expansion point differs. A secret-named value must be a
-            reference rather than a literal, enforced when the grant is parsed.
-        cwd: Working directory the server is launched in. Empty inherits the
-            agent's working directory (the per-run workspace).
+        env: Environment ``(name, value)`` pairs for the server. Values may
+            carry ``${VAR}`` references resolved from the runner environment
+            (in-memory for the probe and API agent, or by the CLI at launch so
+            credentials are never written into workspace artifacts).
+        cwd: Working directory the server is launched in (``""`` inherits the
+            agent's workspace).
         tools: Tool names this server exposes to the agent. The Gemini CLI
             passes these via ``--allowed-tools``; the API agent advertises
             whatever the live MCP server lists (this field acts as

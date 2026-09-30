@@ -23,6 +23,8 @@ import sqlite3
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from devops_bench.agents import capabilities
 from devops_bench.agents import config as agents_config
 from devops_bench.agents.cli.antigravity import agent as agy_mod
@@ -819,13 +821,14 @@ def test_agy_cli_agent_forwards_extra_flags(
 @mock.patch.object(pathlib.Path, "home")
 @mock.patch.object(devops_subprocess, "run")
 def test_agy_cli_agent_fails_the_run_when_a_granted_mcp_server_is_unreachable(
-    mock_run, mock_home, tmp_path, monkeypatch
-):
-    """A granted server that never starts leaves agy falling back to shell tools
-    while the run is still scored as an MCP arm — the same gate the other CLI
-    harnesses run, so the binary must never be launched."""
+    mock_run: mock.MagicMock,
+    mock_home: mock.MagicMock,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable MCP server aborts the run before ``agy`` is invoked."""
 
-    def boom(*_a, **_kw):
+    def boom(*_a: object, **_kw: object) -> dict[str, tuple[str, ...]]:
         raise McpUnreachableError("MCP server 'gke' is unreachable: could not launch server")
 
     mock_home.return_value = tmp_path
@@ -842,7 +845,6 @@ def test_agy_cli_agent_fails_the_run_when_a_granted_mcp_server_is_unreachable(
     assert result.errors == [
         "MCP preflight failed: MCP server 'gke' is unreachable: could not launch server"
     ]
-    # The gcloud project/location lookups still run; the agy binary must not.
     assert all(call.args[0][0] == "gcloud" for call in mock_run.call_args_list)
 
 
@@ -946,16 +948,12 @@ def test_agy_cli_agent_discovers_parent_conversations_when_nested_is_empty(
 def test_agy_cli_agent_probes_with_the_run_env_and_workdir(
     mock_run, mock_home, tmp_path, monkeypatch
 ):
-    """The probe must launch the server the way agy will: with the harness env
-    overlay applied and in the workspace, or it validates a different process
-    than the one the run uses."""
+    """``preflight_mcp`` receives the harness env overlay and workspace directory."""
     seen: dict = {}
     mock_home.return_value = tmp_path
     mock_run.return_value = SimpleNamespace(args=["agy"], returncode=0, stdout="ok", stderr="")
 
     def record(_bindings, **kw):
-        # The workspace is a temp dir torn down when ``_execute`` returns, so
-        # its existence has to be sampled here rather than asserted afterwards.
         seen.update(kw, cwd_exists=pathlib.Path(kw["cwd"]).is_dir())
 
     monkeypatch.setattr(agy_mod, "preflight_mcp", record)
@@ -976,10 +974,7 @@ def test_agy_cli_agent_probes_with_the_run_env_and_workdir(
 @mock.patch.object(pathlib.Path, "home")
 @mock.patch.object(devops_subprocess, "run")
 def test_agy_cli_agent_probes_every_granted_binding(mock_run, mock_home, tmp_path, monkeypatch):
-    """Every granted binding is handed to the probe verbatim. Passing a subset —
-    or a rebuilt binding that drops ``env``/``cwd`` — would gate on a server the
-    run does not launch, and the dead one it does launch would score as an MCP
-    arm."""
+    """Every granted ``McpBinding`` is passed verbatim to ``preflight_mcp``."""
     seen: dict = {}
     mock_home.return_value = tmp_path
     mock_run.return_value = SimpleNamespace(args=["agy"], returncode=0, stdout="ok", stderr="")

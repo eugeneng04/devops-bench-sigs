@@ -68,28 +68,17 @@ def agent_workdir(workspace_path: Path | None, *, prefix: str) -> Iterator[Path]
 def build_mcp_servers(mcp_servers: tuple[McpBinding, ...]) -> dict[str, dict]:
     """Map MCP bindings with a launch command to a CLI ``servers`` mapping.
 
-    Bindings with an empty ``command`` are skipped: a CLI needs a command to
-    spawn a stdio MCP server, and an empty-command binding denotes a server the
-    binary already hosts itself.
-
-    If the command is path-like (contains a path separator) and exists on disk,
-    it is resolved to its absolute path to prevent execution ambiguity in the
-    agent's workspace. If it does not exist, a warning is logged.
-
-    A binding's ``env`` values are rendered **verbatim**, so a ``${VAR}``
-    reference reaches the config file unexpanded and the CLI resolves it from
-    the subprocess environment. Expanding here would write the credential into
-    the agent's workspace, which the harness copies wholesale into the run's
-    artifacts.
+    Bindings with an empty ``command`` are skipped (they denote in-process CLI
+    servers). Path-like commands that exist on disk are resolved to absolute
+    paths. ``env`` values are rendered verbatim so ``${VAR}`` references are
+    resolved by the CLI at launch rather than written into workspace artifacts.
 
     Args:
         mcp_servers: Bindings granted for the run.
 
     Returns:
         A ``{name: {"command": ..., "args": [...], "env": {...}, "cwd": ...}}``
-        mapping suitable for the agent's MCP-servers config section, carrying
-        only the keys a binding populates. Empty when no binding carries a
-        command.
+        mapping carrying only the keys a binding populates.
 
     Raises:
         ConfigError: If two bindings resolve to the same name.
@@ -124,13 +113,7 @@ def build_mcp_servers(mcp_servers: tuple[McpBinding, ...]) -> dict[str, dict]:
 def _ignore_escaping_links(
     bundle: Path,
 ) -> Callable[[str | os.PathLike[str], list[str]], set[str]]:
-    """Return a :func:`shutil.copytree` ``ignore`` callback dropping escaping links.
-
-    A skill bundle is data the harness copies into the agent's workspace, and
-    that workspace is collected wholesale into the run's artifacts. A symlink
-    resolving outside the bundle would pull host files along with it, so those
-    entries are skipped and named in the log.
-    """
+    """Return a :func:`shutil.copytree` ``ignore`` callback dropping escaping or broken links."""
     root = bundle.resolve()
 
     def _ignore(dirpath: str | os.PathLike[str], names: list[str]) -> set[str]:
@@ -140,8 +123,8 @@ def _ignore_escaping_links(
             if not entry.is_symlink():
                 continue
             try:
-                target = entry.resolve()
-            except OSError:
+                target = entry.resolve(strict=True)
+            except (OSError, RuntimeError):
                 skipped.add(name)
                 continue
             if not target.is_relative_to(root):
@@ -155,37 +138,29 @@ def _ignore_escaping_links(
 def materialize_skills(skills_root: Path, paths: tuple[str, ...]) -> list[str]:
     """Copy discovered skill bundles into a CLI's workspace skills tree.
 
-    For each ``SKILL.md`` found beneath ``paths`` (the same discovery the API
-    agent performs), its **containing directory** is copied to
-    ``skills_root/<name>/`` using the ``name`` from its frontmatter. The whole
-    directory rather than the one file, because a skill routinely instructs the
-    agent to read a sibling (``references/``, ``templates/``, ``scripts/``);
-    copying ``SKILL.md`` alone leaves those instructions pointing at nothing.
-
-    Symlinks are recreated rather than dereferenced, and any resolving outside
-    the bundle are dropped — see :func:`_ignore_escaping_links`. A ``SKILL.md``
-    sitting directly in a discovery root is skipped with a warning: its bundle
-    would be the entire tree, nesting every sibling skill inside it.
+    For each ``SKILL.md`` found beneath ``paths``, its containing directory is
+    copied to ``skills_root/<name>/`` so sibling files (``references/``,
+    ``templates/``, ``scripts/``) remain available. In-bundle symlinks are
+    recreated; broken or escaping links are dropped. A ``SKILL.md`` at a
+    discovery root that also contains child skills is skipped to avoid nesting
+    sibling skills inside it.
 
     Args:
         skills_root: The destination skills directory to populate.
-        paths: Skill source directories, discovered via the shared
-            :func:`~devops_bench.agents.shared.skills.iter_skills` walk
-            (expanduser, sorted order, escaping/duplicate names warned and
-            skipped, missing paths warned).
+        paths: Skill source directories discovered via :func:`iter_skills`.
 
     Returns:
         The names of the skills materialized, in discovery order.
     """
     roots = {Path(os.path.expanduser(path)).resolve() for path in paths if path}
+    discovered = list(iter_skills(paths))
+    bundles = [Path(skill.path).parent.resolve() for skill in discovered]
     written: list[str] = []
-    for skill in iter_skills(paths):
+    for skill, resolved_bundle in zip(discovered, bundles, strict=True):
         bundle = Path(skill.path).parent
-        if bundle.resolve() in roots:
-            # A ``SKILL.md`` at the top of a discovery path makes its "bundle"
-            # the whole tree, so copying it would nest every sibling skill
-            # inside this one — and each sibling is materialized again in its
-            # own right. Skills live one directory down; say so and skip.
+        if resolved_bundle in roots and any(
+            other != resolved_bundle and other.is_relative_to(resolved_bundle) for other in bundles
+        ):
             _log.warning(
                 "Skipping skill %r: its SKILL.md sits at the discovery root %s, so its "
                 "bundle would be every other skill in that tree",
@@ -199,11 +174,6 @@ def materialize_skills(skills_root: Path, paths: tuple[str, ...]) -> list[str]:
             bundle,
             dest_dir,
             dirs_exist_ok=True,
-            # Recreate links instead of dereferencing them, and drop any that
-            # leave the bundle. Dereferencing would copy the *contents* of
-            # whatever a link points at into the workspace, so a bundle holding
-            # `creds -> ~/.ssh/id_rsa` would write that key into the run's
-            # collected artifacts; a dangling link would abort the run.
             symlinks=True,
             ignore=_ignore_escaping_links(bundle),
         )

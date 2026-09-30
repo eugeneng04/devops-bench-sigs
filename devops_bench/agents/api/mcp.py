@@ -38,10 +38,11 @@ class MCPClient:
 
     Attributes:
         server_path: Command used to launch the MCP server over stdio.
-        env: Full environment the server is spawned with, or ``None`` to leave
-            the SDK's minimal default in place. A binding declaring ``env`` must
-            supply the whole environment here, not just its own keys — the SDK
-            replaces rather than merges.
+        env: Extra environment variables merged over the SDK's safe default
+            environment (``HOME``, ``LOGNAME``, ``PATH``, ``SHELL``, ``TERM``,
+            ``USER``), or ``None`` to leave that default untouched. Callers pass
+            only the binding's declared keys so the full runner environment is
+            never leaked to the server.
         cwd: Directory to spawn the server in, or ``None`` for the caller's.
         session: The active ``ClientSession`` once entered, else ``None``.
 
@@ -84,9 +85,9 @@ class MCPClient:
                 "MCP server_path is empty; set AGENT_TARGET/MCP_SERVER_PATH to the "
                 "MCP server command."
             )
-        # ``env=None`` leaves the SDK's minimal default environment in place;
-        # a supplied mapping replaces it outright, so the caller passes a full
-        # environment rather than just the binding's declared keys.
+        # ``stdio_client`` merges ``env`` over ``get_default_environment()``
+        # (``HOME``, ``LOGNAME``, ``PATH``, ``SHELL``, ``TERM``, ``USER``), so
+        # callers pass only the binding's declared keys (or ``None``).
         server_params = StdioServerParameters(
             command=parts[0], args=parts[1:], env=self.env, cwd=self.cwd
         )

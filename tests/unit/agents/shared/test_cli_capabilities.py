@@ -198,8 +198,7 @@ def test_agent_workdir_creates_and_cleans_up_temp_dir_when_no_path_supplied() ->
 
 
 def test_build_mcp_servers_renders_env_and_cwd() -> None:
-    """A binding's ``env``/``cwd`` reach the CLI's server entry, so a server
-    needing its own credential or working directory is launchable."""
+    """A binding's ``env`` and ``cwd`` are included in the rendered server entry."""
     binding = McpBinding(
         name="github",
         command=("npx", "server-github"),
@@ -220,9 +219,7 @@ def test_build_mcp_servers_renders_env_and_cwd() -> None:
 def test_build_mcp_servers_keeps_secret_references_unexpanded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The rendered entry must carry the reference, never the resolved value:
-    this mapping is written into the agent's workspace, which the harness
-    collects wholesale into the run's artifacts."""
+    """Rendered server entries preserve ``${VAR}`` references instead of resolved secrets."""
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_realsecret")
     binding = McpBinding(
         name="github", command=("npx",), env=(("GITHUB_TOKEN", "${GITHUB_TOKEN}"),)
@@ -239,9 +236,7 @@ def test_build_mcp_servers_omits_env_and_cwd_when_unset() -> None:
 
 
 def test_materialize_skills_copies_the_whole_bundle(tmp_path: Path) -> None:
-    """A skill's siblings come with it: ``SKILL.md`` routinely instructs the
-    agent to read ``references/``/``templates/``/``scripts/``, and copying the
-    one file leaves those instructions pointing at nothing."""
+    """Skill materialization copies sibling files and subdirectories alongside ``SKILL.md``."""
     src = tmp_path / "src" / "design-doc"
     (src / "templates").mkdir(parents=True)
     (src / "SKILL.md").write_text(
@@ -261,13 +256,7 @@ def test_materialize_skills_copies_the_whole_bundle(tmp_path: Path) -> None:
 
 
 def test_materialize_skills_recreates_links_without_copying_host_files(tmp_path: Path) -> None:
-    """Bundle copies must not dereference symlinks.
-
-    The workspace this writes into is collected wholesale into the run's
-    artifacts, so dereferencing a link would write the *contents* of whatever it
-    points at — a host credential, for instance — into those artifacts. An
-    in-bundle link is recreated as a link; one escaping the bundle is dropped.
-    """
+    """In-bundle symlinks are preserved as symlinks; symlinks escaping the bundle are dropped."""
     outside = tmp_path / "outside" / "id_rsa"
     outside.parent.mkdir(parents=True)
     outside.write_text("HOST PRIVATE KEY", encoding="utf-8")
@@ -289,8 +278,7 @@ def test_materialize_skills_recreates_links_without_copying_host_files(tmp_path:
 
 
 def test_materialize_skills_survives_a_dangling_link(tmp_path: Path) -> None:
-    """A broken link inside a bundle used to abort the whole run with
-    ``shutil.Error``; it is dropped along with the escaping ones."""
+    """Dangling symlinks inside a skill bundle are ignored without failing copytree."""
     src = tmp_path / "src" / "broken"
     src.mkdir(parents=True)
     (src / "SKILL.md").write_text(
@@ -303,12 +291,24 @@ def test_materialize_skills_survives_a_dangling_link(tmp_path: Path) -> None:
     assert written == ["broken"]
 
 
+def test_materialize_skills_survives_a_symlink_loop(tmp_path: Path) -> None:
+    """Symlink loops inside a skill bundle are ignored without raising ``RuntimeError``."""
+    src = tmp_path / "src" / "loopy"
+    src.mkdir(parents=True)
+    (src / "SKILL.md").write_text("---\nname: loopy\ndescription: d\n---\nbody\n", encoding="utf-8")
+    (src / "self_loop").symlink_to("self_loop")
+    dest = tmp_path / "dest"
+
+    written = materialize_skills(dest, (str(tmp_path / "src"),))
+
+    assert written == ["loopy"]
+    assert not (dest / "loopy" / "self_loop").exists(follow_symlinks=False)
+
+
 def test_materialize_skills_skips_a_skill_md_at_the_discovery_root(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A ``SKILL.md`` at the top of a granted path has the whole tree as its
-    bundle, so copying it would nest every sibling skill inside it — and each
-    sibling is materialized again in its own right. It is skipped and warned."""
+    """A ``SKILL.md`` at a discovery root that also contains child skills is skipped and warned."""
     src = tmp_path / "src"
     (src / "rotate").mkdir(parents=True)
     (src / "rotate" / "SKILL.md").write_text(
@@ -331,14 +331,36 @@ def test_materialize_skills_skips_a_skill_md_at_the_discovery_root(
 def test_materialize_skills_skips_a_root_skill_reached_through_a_symlinked_path(
     tmp_path: Path,
 ) -> None:
-    """The root comparison resolves both sides, so granting a path by way of a
-    symlink does not slip a root-level bundle past the guard."""
+    """A symlinked multi-skill discovery root still skips its root-level ``SKILL.md``."""
     real = tmp_path / "real"
-    real.mkdir()
+    (real / "rotate").mkdir(parents=True)
+    (real / "rotate" / "SKILL.md").write_text(
+        "---\nname: rotate\ndescription: d\n---\nbody\n", encoding="utf-8"
+    )
     (real / "SKILL.md").write_text(
         "---\nname: at-root\ndescription: d\n---\nbody\n", encoding="utf-8"
     )
     link = tmp_path / "link"
     link.symlink_to(real)
 
-    assert materialize_skills(tmp_path / "dest", (str(link),)) == []
+    assert materialize_skills(tmp_path / "dest", (str(link),)) == ["rotate"]
+
+
+def test_materialize_skills_copies_a_single_skill_bundle_granted_directly(
+    tmp_path: Path,
+) -> None:
+    """Granting a single skill directory directly (no child skills) materializes that bundle."""
+    bundle = tmp_path / "my-skill"
+    (bundle / "references").mkdir(parents=True)
+    (bundle / "SKILL.md").write_text(
+        "---\nname: my-skill\ndescription: d\n---\nSee references/guide.md\n",
+        encoding="utf-8",
+    )
+    (bundle / "references" / "guide.md").write_text("GUIDE", encoding="utf-8")
+    dest = tmp_path / "dest"
+
+    written = materialize_skills(dest, (str(bundle),))
+
+    assert written == ["my-skill"]
+    assert (dest / "my-skill" / "SKILL.md").exists()
+    assert (dest / "my-skill" / "references" / "guide.md").read_text() == "GUIDE"

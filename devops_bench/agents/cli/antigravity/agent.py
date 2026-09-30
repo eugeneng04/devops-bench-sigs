@@ -278,12 +278,6 @@ class AgyCliAgent(base.AgentHarness):
                     json.dumps(settings, indent=2), encoding="utf-8"
                 )
 
-            # Same gate openclaw runs (agy has no `mcp list` subcommand like
-            # gemini): a granted server that never starts leaves agy falling
-            # back to shell tools while the run is still scored as an MCP arm.
-            # preflight_mcp tears down the probed process group and waits for
-            # pipe EOF before returning, so the probe and agy's own launch
-            # never overlap.
             try:
                 preflight_mcp(
                     caps.mcp_servers,

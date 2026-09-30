@@ -289,14 +289,7 @@ for line in sys.stdin:
 def test_probe_returns_promptly_when_the_server_forks_a_surviving_grandchild(
     tmp_path: Path,
 ) -> None:
-    """A launcher (uvx/npx/sh -c/docker) execs the real server as a child.
-
-    Signalling only the direct child leaves that grandchild holding the inherited
-    stdout pipe, so the reader thread never reaches EOF and closing the stream
-    blocks on its lock — the probe used to hang for the grandchild's whole life
-    (2 minutes here) instead of returning. Regression test for that hang, which
-    also fired on the success path.
-    """
+    """Process-group signalling stops descendants that inherit the server's pipes."""
     binding = McpBinding(name="forker", command=_server(tmp_path, _FORKING_SERVER))
 
     started = time.monotonic()
@@ -307,12 +300,7 @@ def test_probe_returns_promptly_when_the_server_forks_a_surviving_grandchild(
 
 
 def test_probe_redacts_expanded_secrets_from_the_reported_stderr(tmp_path: Path) -> None:
-    """The probe holds the only expanded copy of a ``${VAR}`` credential.
-
-    Its failure message reaches ``AgentResult.errors`` and is persisted to the
-    run's results.json, and a server rejecting a credential routinely echoes it,
-    so the value must never survive into the message.
-    """
+    """Expanded ``${VAR}`` credentials echoed on stderr are scrubbed before reporting."""
     binding = McpBinding(
         name="leaky",
         command=_server(tmp_path, _SECRET_ECHO_SERVER),
@@ -327,11 +315,7 @@ def test_probe_redacts_expanded_secrets_from_the_reported_stderr(tmp_path: Path)
 
 
 def test_probe_reports_stderr_when_the_server_starts_then_hangs(tmp_path: Path) -> None:
-    """Timeout is the case the stderr explains, so it must carry it.
-
-    The stderr reader only reaches EOF once the process stops, so composing the
-    message before terminating produced a bare "timed out" with no cause.
-    """
+    """Stderr written before a timeout is flushed and included in the error."""
     binding = McpBinding(name="hangs", command=_server(tmp_path, _HANGS_AFTER_STDERR))
 
     with pytest.raises(McpUnreachableError, match="token rejected"):
@@ -339,8 +323,6 @@ def test_probe_reports_stderr_when_the_server_starts_then_hangs(tmp_path: Path) 
 
 
 def test_probe_fails_a_server_that_advertises_no_tools(tmp_path: Path) -> None:
-    """Handshaking with an empty tool list is the tool-less arm this probe exists
-    to catch: the model falls back to shell tools and the run still scores."""
     binding = McpBinding(name="empty", command=_server(tmp_path, _NO_TOOLS_SERVER))
 
     with pytest.raises(McpUnreachableError, match="advertised no tools"):
@@ -348,8 +330,6 @@ def test_probe_fails_a_server_that_advertises_no_tools(tmp_path: Path) -> None:
 
 
 def test_probe_launches_the_server_in_the_supplied_cwd(tmp_path: Path) -> None:
-    """The probe must launch a server where the CLI later will, so a relative
-    path in the binding's args resolves the same way in both."""
     run_dir = tmp_path / "workspace"
     run_dir.mkdir()
     binding = McpBinding(name="cwd", command=_server(tmp_path, _CWD_ECHO_SERVER))
@@ -360,11 +340,6 @@ def test_probe_launches_the_server_in_the_supplied_cwd(tmp_path: Path) -> None:
 
 
 def test_preflight_probes_servers_concurrently(tmp_path: Path) -> None:
-    """Servers are independent, so the budget is the slowest one, not the sum.
-
-    Sequential probing put N * timeout on a path that runs before every run in
-    the matrix.
-    """
     slow = tmp_path / "slow.py"
     slow.write_text("import time; time.sleep(30)", encoding="utf-8")
     bindings = tuple(
@@ -379,7 +354,6 @@ def test_preflight_probes_servers_concurrently(tmp_path: Path) -> None:
 
 
 def test_preflight_names_the_first_failure_in_binding_order(tmp_path: Path) -> None:
-    """Concurrency must not make the reported failure depend on a race."""
     good = _server(tmp_path, _FORKING_SERVER)
     bindings = (
         McpBinding(name="alpha", command=("/nonexistent/a",)),
@@ -392,15 +366,7 @@ def test_preflight_names_the_first_failure_in_binding_order(tmp_path: Path) -> N
 
 
 def test_probe_survives_a_stdout_burst_larger_than_the_line_cap(tmp_path: Path) -> None:
-    """A server logging far more than ``_MAX_STDOUT_LINES`` before its reply must
-    still hand that reply to the probe.
-
-    The reader thread holds a bounded queue so a chatty server cannot exhaust
-    memory, but the cap is a backlog limit, not a total: the consumer drains
-    concurrently. If the reader ever blocked on a full queue instead of dropping,
-    the server would stall behind its own pipe and the probe would report a
-    healthy server as unreachable.
-    """
+    """Oldest stdout log lines are evicted when the queue is full so the reply is preserved."""
     burst = _FAKE_SERVER.replace(
         "for line in sys.stdin:",
         'for _i in range(5000):\n    print("log line", _i, flush=True)\n\nfor line in sys.stdin:',
@@ -413,8 +379,6 @@ def test_probe_survives_a_stdout_burst_larger_than_the_line_cap(tmp_path: Path) 
 _SINGLE_INSTANCE_LAUNCHER = """
 import os, subprocess, sys
 child = subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])
-# Exit as soon as the probe closes stdin or sends SIGTERM, leaving the child
-# behind in the process group to test that _terminate still reaps it.
 sys.stdin.read()
 """
 
@@ -437,13 +401,7 @@ time.sleep(60)
 
 
 def test_probe_releases_exclusive_resources_before_a_second_launch(tmp_path: Path) -> None:
-    """Every server is launched twice per run (probe, then the CLI's real launch).
-
-    A launcher wrapper that exits on ``stdin`` EOF / ``SIGTERM`` while its
-    server child ignores ``SIGTERM`` would leave the probe's child holding an
-    exclusive lock or port when the real launch starts unless ``_terminate``
-    escalates ``SIGKILL`` to the process group after ``proc.wait()``.
-    """
+    """``_terminate`` escalates ``SIGKILL`` to the process group after the leader exits."""
     launcher = tmp_path / "launcher.py"
     launcher.write_text(_SINGLE_INSTANCE_LAUNCHER, encoding="utf-8")
     server = tmp_path / "single.py"
@@ -456,3 +414,16 @@ def test_probe_releases_exclusive_resources_before_a_second_launch(tmp_path: Pat
 
     assert probe_stdio_server(binding, timeout=10.0) == ("t",)
     assert probe_stdio_server(binding, timeout=10.0) == ("t",)
+
+
+_BINARY_BANNER_SERVER = (
+    'import sys\nsys.stdout.buffer.write(b"\\xff\\xfe banner\\n")\n'
+    'sys.stdout.buffer.flush()\nsys.stderr.buffer.write(b"\\xff\\xfe warn\\n")\n'
+    "sys.stderr.buffer.flush()\n" + _FAKE_SERVER
+)
+
+
+def test_probe_tolerates_non_utf8_bytes_on_stdout_and_stderr(tmp_path: Path) -> None:
+    binding = McpBinding(name="binary-banner", command=_server(tmp_path, _BINARY_BANNER_SERVER))
+
+    assert probe_stdio_server(binding, timeout=10.0) == ("alpha", "beta")

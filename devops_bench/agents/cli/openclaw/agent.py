@@ -100,13 +100,13 @@ def _node_version_key(bin_path: str) -> tuple[int, ...]:
 def _ensure_node_on_path(env_overlay: dict[str, str]) -> dict[str, str]:
     """Return ``env_overlay`` with the nvm Node bin dir prepended to ``PATH``.
 
-    The agent *turn* runs ``oc`` through a bash command that sources nvm, but the
-    ``oc sessions`` / ``export-trajectory`` extraction calls run ``oc`` as a direct
-    argv subprocess (``run()`` never uses a shell). On an nvm-managed host Node is
-    not on the inherited ``PATH``, so those calls fail with
-    ``exit 127: /usr/bin/env: 'node': No such file or directory`` and the
-    trajectory comes back **silently empty** (deflating every tool/trajectory
-    score). Prepend the nvm Node bin dir so the direct subprocess finds Node too.
+    The agent *turn* runs ``oc`` through a bash command that sources nvm, but
+    direct subprocesses — the MCP reachability probe (``preflight_mcp``) and the
+    ``oc sessions`` / ``export-trajectory`` extraction calls — spawn without a
+    shell. On an nvm-managed host Node/npx are not on the inherited ``PATH``, so
+    those calls fail with ``FileNotFoundError`` or ``exit 127: /usr/bin/env:
+    'node': No such file or directory``. Prepend the nvm Node bin dir so every
+    direct subprocess finds Node too.
 
     No-op when Node is already discoverable on ``PATH`` or nvm is absent.
     """
@@ -446,18 +446,12 @@ class OpenClawAgent(AgentHarness):
             env_overlay = _build_env(self.config)
 
             try:
-                # Inside the workdir so the probe launches each server exactly as
-                # oc will: a relative path in a binding's args resolves the same
-                # way in both, instead of probing green and failing under the CLI.
-                # openclaw has no `mcp list` equivalent, so this is the only gate.
                 preflight_mcp(
                     caps.mcp_servers,
-                    base_env={**os.environ, **env_overlay},
+                    base_env={**os.environ, **_ensure_node_on_path(env_overlay)},
                     cwd=workdir,
                 )
             except McpUnreachableError as exc:
-                # Fatal: a granted-but-dead server leaves oc running tool-less and
-                # exiting 0, which would score as a clean MCP arm.
                 return AgentResult.errored(f"MCP preflight failed: {exc}")
 
             materialize_skills(state_dir / _OPENCLAW_SKILLS_DIRNAME, caps.skills.paths)

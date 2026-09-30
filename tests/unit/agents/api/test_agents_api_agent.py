@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -842,13 +843,10 @@ def test_execute_honors_max_turns_zero(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.output == ""
 
 
-def _per_command_mcp(by_command: dict[str, _FakeMCPClient]):
-    """Build an ``MCPClient`` replacement handing each command its own client.
-
-    Multi-server behavior is only observable when the doubles have distinct
-    identities: a single shared client cannot show which server a call was
-    routed to.
-    """
+def _per_command_mcp(
+    by_command: dict[str, _FakeMCPClient],
+) -> Callable[..., _FakeMCPClient]:
+    """Build an ``MCPClient`` replacement handing each command its own client."""
 
     def _factory(command: str, **_kw: Any) -> _FakeMCPClient:
         assert command in by_command, f"unexpected server launch: {command!r}"
@@ -860,11 +858,7 @@ def _per_command_mcp(by_command: dict[str, _FakeMCPClient]):
 def test_execute_merges_tools_from_every_granted_server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Every launchable binding is opened and its tools advertised together.
-
-    Dropping servers 2..N would score the run as if the agent had the whole
-    grant while half its toolset was unreachable.
-    """
+    """Every launchable binding is opened and its tools advertised together."""
     fake = _FakeLLMClient([_Turn(text="ok")])
     first = _FakeMCPClient(tools=[SimpleNamespace(name="alpha")])
     second = _FakeMCPClient(tools=[SimpleNamespace(name="beta")])
@@ -884,7 +878,6 @@ def test_execute_merges_tools_from_every_granted_server(
     assert not result.has_errors()
     assert first.entered and second.entered
     assert first.exited and second.exited
-    # Advertised in grant order, both servers' tools present.
     assert [getattr(t, "name", "") for t in fake.format_tools_calls[0]] == ["alpha", "beta"]
 
 
@@ -921,11 +914,7 @@ def test_execute_routes_each_call_to_the_server_that_advertised_it(
 def test_execute_fails_when_two_servers_advertise_the_same_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A duplicate tool name across servers fails the run.
-
-    Routing to whichever server was listed first would score the arm against a
-    toolset nobody chose, so ambiguity is fatal rather than resolved by order.
-    """
+    """A duplicate tool name across distinct servers fails the run."""
     fake = _FakeLLMClient([_Turn(text="ok")])
     first = _FakeMCPClient(tools=[SimpleNamespace(name="shared")])
     second = _FakeMCPClient(tools=[SimpleNamespace(name="shared")])
@@ -946,21 +935,30 @@ def test_execute_fails_when_two_servers_advertise_the_same_tool(
     assert "MCP tool name conflict" in result.errors[0]
     assert "'one' and 'two'" in result.errors[0]
     assert "'shared'" in result.errors[0]
-    # Both sessions are torn down despite the failure.
     assert first.exited and second.exited
-    # The model was never called — the run fails before any provider spend.
     assert fake.calls == []
+
+
+def test_execute_deduplicates_repeated_tool_from_same_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single server listing the same tool name twice is deduplicated without error."""
+    fake = _FakeLLMClient([_Turn(text="ok")])
+    mcp = _FakeMCPClient(tools=[SimpleNamespace(name="dup"), SimpleNamespace(name="dup")])
+    monkeypatch.setattr(agent_mod, "get_model", lambda *a, **kw: fake)
+    monkeypatch.setattr(agent_mod, "MCPClient", _per_command_mcp({"server-a": mcp}))
+    caps = AllCapabilities(
+        mcp_servers=(McpBinding(name="one", command=("server-a",)),),
+    )
+    result = ApiAgent(AgentConfig(capabilities=caps)).run("p")
+    assert not result.has_errors()
+    assert [getattr(t, "name", "") for t in fake.format_tools_calls[0]] == ["dup"]
 
 
 def test_execute_fails_when_a_skill_and_a_server_share_a_tool_name(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A skill name colliding with a granted server's tool fails the run.
-
-    The model would be handed the same name twice, and the dispatcher's
-    skill-first rule would serve the skill while the server's tool never runs —
-    an MCP arm scored without the tool it granted.
-    """
+    """A skill name colliding with a granted server's tool fails the run."""
     skill_dir = tmp_path / "skills"
     (skill_dir / "demo").mkdir(parents=True)
     (skill_dir / "demo" / "SKILL.md").write_text('---\nname: "demo"\ndescription: x\n---\nbody\n')
@@ -980,7 +978,6 @@ def test_execute_fails_when_a_skill_and_a_server_share_a_tool_name(
     assert "MCP tool name conflict" in result.errors[0]
     assert "skill_demo" in result.errors[0]
     assert mcp.exited
-    # The model was never called — the run fails before any provider spend.
     assert fake.calls == []
 
 
@@ -1015,8 +1012,7 @@ def test_execute_tears_down_open_sessions_when_a_later_server_fails(
 def test_execute_allows_hosted_bindings_beside_launchable_ones(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A command-less binding denotes a server the CLI hosts itself, so this
-    agent has nothing to launch for it."""
+    """Command-less bindings are skipped while launchable bindings are opened."""
     fake = _FakeLLMClient([_Turn(text="ok")])
     mcp = _FakeMCPClient(tools=[])
     monkeypatch.setattr(agent_mod, "get_model", lambda *a, **kw: fake)
@@ -1359,15 +1355,9 @@ def _recording_mcp(captured: dict) -> type:
 def test_execute_threads_declared_env_and_cwd_to_the_mcp_child(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A binding's declared ``env`` and ``cwd`` must reach the server process.
-
-    ``${VAR}`` references resolve against the runner env, and the resolved pair
-    is layered *over* that env rather than replacing it: the SDK swaps the child
-    environment outright for any mapping it is given, so a bare ``{"TOKEN": ...}``
-    would launch the server without ``PATH`` and it would not start.
-    """
-    monkeypatch.setenv("PATH", "/usr/bin")
+    """Declared ``binding.env`` and ``binding.cwd`` reach ``MCPClient`` without leaking runner env."""
     monkeypatch.setenv("REAL_TOKEN", "s3cret")
+    monkeypatch.setenv("AGENT_API_KEY", "do-not-leak")
     captured: dict = {}
     fake = _FakeLLMClient([_Turn(text="done")])
     monkeypatch.setattr(agent_mod, "get_model", lambda *a, **kw: fake)
@@ -1386,16 +1376,15 @@ def test_execute_threads_declared_env_and_cwd_to_the_mcp_child(
     ApiAgent(AgentConfig(capabilities=caps)).run("p")
 
     assert captured["cwd"] == "/srv/work"
-    assert captured["env"]["GH_TOKEN"] == "s3cret"
-    assert captured["env"]["MODE"] == "read-only"
-    assert captured["env"]["PATH"] == "/usr/bin"
+    assert captured["env"] == {"GH_TOKEN": "s3cret", "MODE": "read-only"}
+    assert "AGENT_API_KEY" not in captured["env"]
+    assert "REAL_TOKEN" not in captured["env"]
 
 
 def test_execute_leaves_mcp_child_env_unset_when_binding_declares_none(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No declared env means ``env=None`` — the SDK's own minimal default, not
-    a copy of the runner env, so nothing incidental leaks into the server."""
+    """A binding with no ``env`` passes ``env=None`` to ``MCPClient``."""
     captured: dict = {}
     fake = _FakeLLMClient([_Turn(text="done")])
     monkeypatch.setattr(agent_mod, "get_model", lambda *a, **kw: fake)

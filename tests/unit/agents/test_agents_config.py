@@ -279,20 +279,56 @@ def test_from_env_blank_mcp_config_falls_back_to_the_shorthand() -> None:
             '{"mcpServers": {"a": {"command": "uvx", "cwd": 0}}}',
             "cwd: Input should be a valid string",
         ),
+        (
+            '{"mcpServers": {"a": {"command": "uvx", "arg": ["-y"]}}}',
+            "arg: Extra inputs are not permitted",
+        ),
+        (
+            '{"mcpServers": {"a": {"command": "uvx", "type": "http"}}}',
+            "only 'stdio' MCP servers are supported",
+        ),
+        (
+            '{"mcpServers": {"a": {"command": "uvx", "url": "https://example.com/mcp"}}}',
+            "HTTP/remote MCP servers",
+        ),
+        (
+            '{"mcpServers": {"a": {"command": "uvx", "disabled": true}}}',
+            "no enabled servers",
+        ),
         ('{"mcpServers": {}}', "is empty"),
         ("/nonexistent/bench-mcp.json", "unreadable"),
     ],
 )
 def test_from_env_malformed_mcp_config_fails_loud(raw: str, match: str) -> None:
-    """A broken capability grant raises rather than running an MCP arm with no
-    MCP server — the same validity concern the reachability probe addresses."""
     with pytest.raises(ConfigError, match=match):
         AgentConfig.from_env({"AGENT_MCP_CONFIG": raw})
 
 
+def test_from_env_mcp_config_skips_disabled_servers_and_accepts_standard_fields() -> None:
+    raw = json.dumps(
+        {
+            "mcpServers": {
+                "off": {"command": "uvx", "disabled": True},
+                "on": {
+                    "command": "uvx",
+                    "args": ["mcp-server-time"],
+                    "type": "stdio",
+                    "timeout": 30,
+                    "trust": True,
+                    "description": "time server",
+                    "alwaysAllow": ["get_time"],
+                },
+            }
+        }
+    )
+    cfg = AgentConfig.from_env({"AGENT_MCP_CONFIG": raw})
+
+    assert cfg.capabilities.mcp_servers == (
+        McpBinding(name="on", command=("uvx", "mcp-server-time")),
+    )
+
+
 def test_from_env_mcp_config_file_must_hold_a_json_object(tmp_path: Path) -> None:
-    """Only the inline form is recognized by its leading ``{``; a file is read
-    first and then validated, so a non-object document fails there."""
     config = tmp_path / "bench-mcp.json"
     config.write_text("[]")
 
@@ -302,16 +338,19 @@ def test_from_env_mcp_config_file_must_hold_a_json_object(tmp_path: Path) -> Non
 
 @pytest.mark.parametrize(
     "key",
-    ["GITHUB_TOKEN", "API_KEY", "CLIENT_SECRET", "DB_PASSWORD", "GCP_CREDENTIALS"],
+    [
+        "GITHUB_TOKEN",
+        "API_KEY",
+        "OPENAI_APIKEY",
+        "CLIENT_SECRET",
+        "DB_PASSWORD",
+        "DB_PASSWD",
+        "GCP_CREDENTIALS",
+        "GH_PAT",
+        "MCP_AUTH",
+    ],
 )
 def test_from_env_rejects_a_literal_in_a_secret_named_mcp_env_value(key: str) -> None:
-    """A pasted credential must fail the config, not ride into the artifacts.
-
-    The declared env is written into the agent's workspace config and the
-    harness collects that workspace wholesale into the run's results, so a
-    literal secret is persisted. A ``${VAR}`` reference is resolved only for the
-    server's own process.
-    """
     raw = json.dumps({"mcpServers": {"gh": {"command": "uvx", "env": {key: "ghp_literal"}}}})
 
     with pytest.raises(ConfigError, match="looks like a credential"):
@@ -323,20 +362,21 @@ def test_from_env_rejects_a_literal_in_a_secret_named_mcp_env_value(key: str) ->
     [
         ("GITHUB_TOKEN", "${GITHUB_TOKEN}"),
         ("AUTH_HEADER_KEY", "Bearer ${GH_PAT}"),
-        # Not credential-shaped: rejecting every literal would break ordinary
-        # configuration, which is the common case.
         ("NODE_ENV", "production"),
-        # Substrings inside a larger word are not credentials: boundaries are
-        # non-alphanumeric (``\b`` treats ``_`` as a word character).
         ("MAX_TOKENS", "4096"),
         ("KEYSTONE_REGION", "us-east-1"),
         ("TOKENIZER", "cl100k_base"),
-        # An empty value carries nothing to leak.
+        ("DISPATCH_MODE", "async"),
+        ("PATH", "/usr/local/bin:/usr/bin"),
+        ("GOOGLE_APPLICATION_CREDENTIALS", "/etc/gcp/service-account.json"),
+        ("SSH_KEY_PATH", "keys/id_ed25519"),
+        ("TOKEN_FILE", "token.txt"),
+        ("AUTH_URL", "https://auth.example.com"),
+        ("CREDENTIALS_DIR", "creds"),
         ("API_KEY", ""),
     ],
 )
 def test_from_env_accepts_references_and_non_secret_literals(key: str, value: str) -> None:
-    """The guard fires on secret-named keys holding a literal, and nothing else."""
     raw = json.dumps({"mcpServers": {"gh": {"command": "uvx", "env": {key: value}}}})
 
     cfg = AgentConfig.from_env({"AGENT_MCP_CONFIG": raw})
@@ -345,8 +385,6 @@ def test_from_env_accepts_references_and_non_secret_literals(key: str, value: st
 
 
 def test_from_env_undecodable_mcp_config_file_raises_config_error(tmp_path: Path) -> None:
-    """``from_env`` documents ``ConfigError`` as its only failure, so a file that
-    is not UTF-8 must not surface the raw ``UnicodeDecodeError``."""
     config = tmp_path / "bench-mcp.json"
     config.write_bytes(b'{"mcpServers": {"a": {"command": "\xff\xfe"}}}')
 

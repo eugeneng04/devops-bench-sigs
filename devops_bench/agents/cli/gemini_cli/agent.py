@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -48,7 +49,11 @@ from devops_bench.agents.shared.cli_capabilities import (
     build_mcp_servers,
     materialize_skills,
 )
-from devops_bench.agents.shared.mcp_probe import McpUnreachableError, preflight_mcp
+from devops_bench.agents.shared.mcp_probe import (
+    PROBE_TIMEOUT_SEC,
+    McpUnreachableError,
+    preflight_mcp,
+)
 from devops_bench.core import SubprocessError, get_logger
 from devops_bench.core.model_providers import resolve_provider
 from devops_bench.core.subprocess import run
@@ -70,16 +75,10 @@ _GEMINI_SKILLS_DIR = "skills"
 
 _log = get_logger("agents.cli.gemini_cli")
 
-# ANSI SGR sequences, stripped before parsing: the CLI colourises its status
-# words when FORCE_COLOR is set, which would otherwise defeat the row match.
 _ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
 _MCP_CONNECTED = "connected"
 _MCP_NOT_LISTED = "<not listed>"
-# Seconds for ``gemini mcp list``. It starts the binary and dials each server
-# but makes no model call, so it is fast relative to a run.
 _MCP_LIST_TIMEOUT_SEC = 120.0
-# Cap on the CLI output quoted back when ``gemini mcp list`` itself fails, so a
-# stack trace does not become the whole run's error message.
 _LISTING_TAIL_CHARS = 800
 
 
@@ -108,14 +107,8 @@ def _build_settings(mcp_servers: tuple[McpBinding, ...], *, skills_enabled: bool
 def _status_rows(listing: str, name: str) -> list[str]:
     """Return the status word of every ``gemini mcp list`` row for ``name``.
 
-    One row looks like ``✓ facts: /usr/bin/python server.py (stdio) - Connected``.
-    The pattern is built from the expected name rather than a generic
-    name-matching regex, because a generic one both misses names holding
-    characters outside a word-character class (config keys are arbitrary JSON
-    strings) and
-    conflates ``gke`` with ``gke:prod`` — under which a disabled ``gke`` could be
-    overwritten by a connected ``gke:prod`` and read as connected. Requiring
-    whitespace after the name's colon keeps the two apart.
+    Matches the exact escaped name followed by ``: `` so non-word characters work
+    and ``k8s`` is not conflated with ``k8s:prod``.
     """
     row = re.compile(rf"^\W*{re.escape(name)}:\s.*\s-\s+(\S+)\s*$", re.MULTILINE)
     return [match.group(1) for match in row.finditer(listing)]
@@ -131,28 +124,19 @@ def _mcp_gate_failure(
 ) -> str:
     """Return why the CLI cannot use ``expected`` in ``workdir``, or ``""``.
 
-    A reachable server is not the same as a *usable* one. Gemini gates MCP on
-    folder trust, and an untrusted workspace disables every configured server
-    **without emitting anything on the run's stderr** — the model simply has no
-    MCP tools and answers from the shell. ``gemini mcp list`` is the only view
-    that reports the post-trust state, so it is the gate here.
-
-    The row status must read ``Connected`` for every expected server. Anything
-    else — ``Disabled`` (untrusted), ``Disconnected`` (server failed), or a row
-    that no longer parses because the output format changed — is a failure, so
-    a future format change fails loud instead of passing silently.
+    Gemini gates MCP on folder trust and silently disables servers in untrusted
+    workspaces; ``gemini mcp list`` is the only view that reports the post-trust
+    connection state.
 
     Args:
         target: Path to the ``gemini`` binary.
         workdir: Workspace whose ``.gemini/settings.json`` is under test.
-        expected: Server names that must be connected.
-        env_overlay: Env overlay the run itself uses, so ``${VAR}`` references
-            in the settings resolve the same way here.
+        expected: Server names that must report ``Connected``.
+        env_overlay: Env overlay the run uses so ``${VAR}`` references resolve.
         timeout: Seconds before the listing is abandoned.
 
     Returns:
-        A human-readable reason, or ``""`` when every expected server is
-        connected.
+        A human-readable failure reason, or ``""`` when all servers are connected.
     """
     try:
         completed = run(
@@ -165,14 +149,9 @@ def _mcp_gate_failure(
     except (SubprocessError, OSError) as exc:
         return f"could not run 'gemini mcp list': {exc}"
 
-    # 0.56 prints the whole listing on stderr, not stdout; read both so the gate
-    # does not depend on which stream the CLI happens to use.
+    # gemini 0.56 prints the listing on stderr; read both streams.
     listing = _ANSI_SGR.sub("", f"{completed.stdout or ''}\n{completed.stderr or ''}")
 
-    # A non-zero exit means the CLI never got as far as dialling the servers —
-    # malformed settings.json, an unknown flag, a bad auth config. The listing is
-    # then an error message, and parsing it for status rows would report the
-    # generic "not listed" instead of the cause the CLI already printed.
     if completed.returncode != 0:
         detail = listing.strip()[-_LISTING_TAIL_CHARS:]
         return f"'gemini mcp list' exited {completed.returncode}: {detail or '<no output>'}"
@@ -183,8 +162,6 @@ def _mcp_gate_failure(
         if not statuses:
             broken[name] = _MCP_NOT_LISTED
         elif any(status.lower() != _MCP_CONNECTED for status in statuses):
-            # Every row for a name must agree; a duplicate that disagrees is a
-            # failure rather than something the last row gets to overwrite.
             broken[name] = "/".join(sorted(set(statuses)))
     if not broken:
         return ""
@@ -197,21 +174,18 @@ def _probe_failure_detail(
     *,
     env_overlay: dict[str, str],
     workdir: Path,
+    timeout: float = PROBE_TIMEOUT_SEC,
 ) -> str:
-    """Return why a server is unusable, as a suffix for the gate's message.
-
-    ``gemini mcp list`` reports *that* a server is unusable, never why. The stdio
-    probe supplies the cause (the server's own stderr), so it is run only once
-    the gate has already failed — on the happy path the CLI's own launch is the
-    single source of truth and the probe would be a redundant second launch of
-    every server, paid on every run of the matrix.
-    """
+    """Run the stdio probe after ``gemini mcp list`` fails to report the root cause."""
     try:
-        preflight_mcp(mcp_servers, base_env={**os.environ, **env_overlay}, cwd=workdir)
+        preflight_mcp(
+            mcp_servers,
+            base_env={**os.environ, **env_overlay},
+            timeout=timeout,
+            cwd=workdir,
+        )
     except McpUnreachableError as exc:
         return f"; {exc}"
-    # Reachable but unusable is the folder-trust case: the servers answer this
-    # probe fine and the CLI still refuses to enable them.
     return "; every server answered a direct stdio probe, so this is a CLI-side gate (folder trust)"
 
 
@@ -374,28 +348,57 @@ class GeminiCliAgent(AgentHarness):
                     json.dumps(settings, indent=2), encoding="utf-8"
                 )
 
+            turn_timeout = self.config.timeout_sec
             expected = tuple(build_mcp_servers(caps.mcp_servers))
             if expected:
-                reason = _mcp_gate_failure(target, workdir, expected, env_overlay=env_overlay)
+                deadline = (
+                    None
+                    if self.config.timeout_sec is None
+                    else time.monotonic() + self.config.timeout_sec
+                )
+                list_timeout = (
+                    _MCP_LIST_TIMEOUT_SEC
+                    if deadline is None
+                    else min(_MCP_LIST_TIMEOUT_SEC, max(0.0, deadline - time.monotonic()))
+                )
+                reason = _mcp_gate_failure(
+                    target,
+                    workdir,
+                    expected,
+                    env_overlay=env_overlay,
+                    timeout=list_timeout,
+                )
                 if reason:
+                    probe_timeout = (
+                        PROBE_TIMEOUT_SEC
+                        if deadline is None
+                        else min(PROBE_TIMEOUT_SEC, max(0.0, deadline - time.monotonic()))
+                    )
                     detail = _probe_failure_detail(
-                        caps.mcp_servers, env_overlay=env_overlay, workdir=workdir
+                        caps.mcp_servers,
+                        env_overlay=env_overlay,
+                        workdir=workdir,
+                        timeout=probe_timeout,
                     )
                     return AgentResult.errored(f"MCP preflight failed: {reason}{detail}")
+                if deadline is not None:
+                    turn_timeout = max(0.0, deadline - time.monotonic())
 
+            turn_start = time.monotonic()
             try:
                 completed = run(
                     argv,
                     extra_env=env_overlay,
                     cwd=workdir,
                     check=False,
-                    timeout=self.config.timeout_sec,
+                    timeout=turn_timeout,
                 )
             except SubprocessError as exc:
                 return AgentResult.errored(f"gemini subprocess error: {exc}")
             except OSError as exc:
                 # Missing / non-executable binary; core.subprocess.run does not wrap.
                 return AgentResult.errored(f"gemini binary unavailable: {exc}")
+            turn_latency = time.monotonic() - turn_start
 
         output, trajectory, tokens, parse_errors = parse_stream_json(completed.stdout or "")
         errors: list[str] = list(parse_errors)
@@ -412,5 +415,6 @@ class GeminiCliAgent(AgentHarness):
             trajectory=trajectory,
             tokens=tokens,
             errors=errors,
+            latency=turn_latency,
             metadata=metadata,
         )

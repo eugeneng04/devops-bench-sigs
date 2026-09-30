@@ -313,14 +313,14 @@ def _build_dispatch(
 def _open_server(binding: McpBinding) -> MCPClient:
     """Build the (not yet entered) client for one granted server.
 
-    ``shlex.join`` round-trips :class:`MCPClient`'s own ``shlex.split`` so a
-    spaced argv token (``("uv run", "mcp-server")``) is rebuilt as a single
-    quoted word. ``child_env`` owns the runner-env read so this module stays
-    free of one.
+    ``shlex.join`` round-trips :class:`MCPClient`'s ``shlex.split``, and only
+    declared env keys are passed because the ``mcp`` SDK merges ``env`` over its
+    safe default environment.
     """
+    declared = dict(binding.env)
     return MCPClient(
         shlex.join(binding.command),
-        env=child_env(binding) if binding.env else None,
+        env={k: v for k, v in child_env(binding).items() if k in declared} or None,
         cwd=binding.cwd or None,
     )
 
@@ -334,22 +334,23 @@ async def _route_tools(
         sessions: The open ``(binding, client)`` pairs, in grant order.
 
     Returns:
-        A ``(tools, routes)`` pair. ``tools`` is every server's advertised tool
-        in grant order, ready to concatenate with the skill tools;  ``routes``
-        maps a tool name to the client that serves it.
+        A ``(tools, routes)`` pair in grant order.
 
     Raises:
-        ToolNameConflictError: If two servers advertise the same tool name.
+        ToolNameConflictError: If two distinct servers advertise the same tool
+            name.
     """
     tools: list[Any] = []
     routes: dict[str, MCPClient] = {}
     owners: dict[str, str] = {}
-    for binding, mcp_client in sessions:
+    listings = await asyncio.gather(*(mcp_client.list_tools() for _, mcp_client in sessions))
+    for (binding, mcp_client), listed in zip(sessions, listings, strict=True):
         server = binding.name or "<unnamed>"
-        listed = await mcp_client.list_tools()
         for tool in listed.tools:
             name = getattr(tool, "name", "")
             if name in routes:
+                if routes[name] is mcp_client:
+                    continue
                 raise ToolNameConflictError(
                     f"servers {owners[name]!r} and {server!r} both advertise tool {name!r}; "
                     "a call to it would be ambiguous, so the grant is rejected rather than "
@@ -371,49 +372,33 @@ async def _run_async(
 ) -> tuple[LoopResult, list[str], list[str]]:
     """Drive the tool-use loop and return its ``(LoopResult, errors, skills)``.
 
-    Opens one session per granted server and discovers local skills when
-    ``skills_paths`` is non-empty — the two are independent, and either may be
-    empty. Every session's tools are advertised together, and a call is routed
-    back to the server that advertised it. The tool list is formatted here and
-    passed to :func:`run_tool_loop` pre-formatted.
-
     Args:
         client: Neutral LLM client.
         prompt: Task prompt seeding the loop.
-        mcp_bindings: The MCP servers to launch — each binding's ``command``,
-            declared ``env`` (``${VAR}`` references resolved against the runner
-            env) and ``cwd``. Empty skips MCP entirely.
+        mcp_bindings: The MCP servers to launch (empty skips MCP).
         skills_paths: Filesystem locations to discover local skills under.
-        rules_text: Operator-brief text (the ``AgentRules.text`` payload)
-            handed to the provider as the ``system_instruction``; ``None`` /
-            empty means "no preamble".
+        rules_text: Operator-brief text handed to the provider as
+            ``system_instruction``; ``None`` / empty means no preamble.
         max_turns: Safety cap on turns.
 
     Returns:
-        A ``(loop_result, errors, skill_names)`` tuple. ``errors`` carries any
-        per-tool dispatch failures recorded by the dispatcher.
+        A ``(loop_result, errors, skill_names)`` tuple.
 
     Raises:
         ToolNameConflictError: If two granted servers advertise the same tool,
-            or a discovered skill tool carries a granted server's tool name.
+            or a discovered skill tool collides with a server tool name.
     """
     errors: list[str] = []
     skill_tools, skill_resources, skill_names = await asyncio.to_thread(
         discover_skill_tools, skills_paths
     )
 
-    # One stack for every session, so a failure opening server N still tears
-    # down the N-1 already running rather than orphaning their subprocesses.
     async with contextlib.AsyncExitStack() as stack:
         sessions = [
             (binding, await stack.enter_async_context(_open_server(binding)))
             for binding in mcp_bindings
         ]
         mcp_tools, routes = await _route_tools(sessions)
-        # Skill names are checked against the routed MCP names for the same
-        # reason two servers are checked against each other: the model would be
-        # handed one name twice, and the dispatcher's skill-first rule would
-        # serve the skill while the MCP tool it shadows never runs.
         clash = sorted(routes.keys() & skill_resources.keys())
         if clash:
             raise ToolNameConflictError(

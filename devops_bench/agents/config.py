@@ -38,47 +38,39 @@ from devops_bench.core import ConfigError, get_env, get_int
 __all__ = ["AgentConfig"]
 
 
-# ``${VAR}`` reference in a declared MCP env value — the same form
-# :func:`~devops_bench.agents.shared.mcp_probe.expand_env` resolves for the probe
-# and every supported CLI resolves for the server it launches.
 _ENV_REF = re.compile(r"\$\{\w+\}")
 
-# Env keys whose value must be a reference, never a literal. A binding's ``env``
-# is written verbatim into the CLI's config file inside the agent's workspace,
-# and the harness collects that workspace wholesale into the run's artifacts, so
-# a pasted credential would be persisted with the results.
-#
-# Matched on non-alphanumeric boundaries rather than as raw substrings (and not
-# with ``\b``, which treats ``_`` as a word character and misses
-# ``SCREAMING_SNAKE_CASE``) so ordinary knobs like ``MAX_TOKENS``,
-# ``KEYSTONE_REGION``, or ``TOKENIZER`` are not mistaken for credentials.
+# Matched on non-alphanumeric boundaries (not `\b`, which treats `_` as a word
+# character) so knobs like `MAX_TOKENS` or `TOKENIZER` are not flagged.
 _SECRET_KEY_HINTS: tuple[str, ...] = (
     "TOKEN",
     "KEY",
+    "APIKEY",
     "SECRET",
     "PASSWORD",
+    "PASSWD",
     "CREDENTIAL",
     "CREDENTIALS",
+    "PAT",
+    "AUTH",
 )
 _SECRET_KEY_RE = re.compile(
     rf"(?:^|[^A-Za-z0-9])(?:{'|'.join(_SECRET_KEY_HINTS)})(?:$|[^A-Za-z0-9])",
     re.IGNORECASE,
 )
+_NON_SECRET_KEY_SUFFIXES: tuple[str, ...] = ("_PATH", "_FILE", "_URL", "_DIR")
 
 
 def _reject_literal_secrets(name: str, env: dict[str, str]) -> None:
-    """Fail when a secret-named env value carries a literal instead of ``${VAR}``.
+    """Raise ``ConfigError`` when a secret-named env key holds a literal instead of ``${VAR}``.
 
-    Args:
-        name: The server name, for the error message.
-        env: The server's declared ``env`` mapping.
-
-    Raises:
-        ConfigError: If a secret-named key holds a value with no ``${VAR}``
-            reference in it.
+    Keys ending in ``_PATH``/``_FILE``/``_URL``/``_DIR`` and absolute path
+    values (e.g. ``GOOGLE_APPLICATION_CREDENTIALS``) are exempted.
     """
     for key, value in env.items():
         if not value or _ENV_REF.search(value):
+            continue
+        if key.upper().endswith(_NON_SECRET_KEY_SUFFIXES) or value.startswith("/"):
             continue
         if _SECRET_KEY_RE.search(key):
             raise ConfigError(
@@ -89,41 +81,42 @@ def _reject_literal_secrets(name: str, env: dict[str, str]) -> None:
 
 
 class _McpServerSpec(BaseModel):
-    """One entry of the standard ``mcpServers`` document.
+    """One entry of the standard ``mcpServers`` document."""
 
-    Strict so a wrong JSON type fails the grant instead of being coerced: an
-    ``args`` of ``0`` silently becoming ``["0"]`` would launch the server with a
-    junk argument and report the resulting failure as unreachability.
-
-    Attributes:
-        command: The server binary. Required, and must hold a non-whitespace
-            character — a binding with no command is "no MCP", which is a grant
-            that scores as an MCP arm, and an all-whitespace one splits to the
-            same nothing.
-        args: Arguments appended to ``command``.
-        env: Declared child env; secret-named values must be ``${VAR}``
-            references, enforced by :func:`_reject_literal_secrets`.
-        cwd: Working directory the server is launched in; ``""`` for inherit.
-        tools: Tools to pre-approve, or ``None`` to inherit
-            ``AGENT_ALLOWED_TOOLS``. The distinction matters: an explicit ``[]``
-            grants none.
-    """
-
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(strict=True, extra="forbid")
 
     command: str = Field(min_length=1, pattern=r"\S")
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     cwd: str = ""
     tools: list[str] | None = None
+    disabled: bool = False
+    type: str = "stdio"
+    url: str | None = None
+    timeout: int | float | None = None
+    trust: bool | None = None
+    description: str | None = None
+    alwaysAllow: list[str] | None = None
 
     @model_validator(mode="before")
     @classmethod
     def _drop_nulls(cls, data: Any) -> Any:
-        """Treat an explicit ``null`` as absent so the field default applies."""
-        if isinstance(data, dict):
-            return {key: value for key, value in data.items() if value is not None}
-        return data
+        """Drop ``null`` fields and reject non-stdio / remote server entries."""
+        if not isinstance(data, dict):
+            return data
+        cleaned = {key: value for key, value in data.items() if value is not None}
+        transport = cleaned.get("type")
+        if transport is not None and transport != "stdio":
+            raise ValueError(
+                f"unsupported server type {transport!r}; only 'stdio' MCP servers are supported "
+                "(HTTP/remote servers are out of scope)"
+            )
+        if "url" in cleaned:
+            raise ValueError(
+                "HTTP/remote MCP servers ('url') are not supported; only 'stdio' servers with a "
+                "'command' are supported"
+            )
+        return cleaned
 
 
 def _parse_csv(raw: str | None) -> tuple[str, ...]:
@@ -134,23 +127,7 @@ def _parse_csv(raw: str | None) -> tuple[str, ...]:
 
 
 def _load_mcp_config(raw: str) -> dict:
-    """Load ``AGENT_MCP_CONFIG`` from inline JSON or from a file path.
-
-    A value starting with ``{`` is inline JSON; anything else is a path. Both
-    forms exist because the two call sites differ: a one-off local run passes
-    the document inline, while the matrix joins its env with ``;`` and evaluates
-    it over ssh, where a quoted JSON blob does not survive.
-
-    Args:
-        raw: The variable's value, already known to be non-empty.
-
-    Returns:
-        The parsed document.
-
-    Raises:
-        ConfigError: If the path is missing, undecodable, or the JSON is
-            malformed.
-    """
+    """Load ``AGENT_MCP_CONFIG`` from inline JSON (leading ``{``) or a file path."""
     text = raw.strip()
     if not text.startswith("{"):
         path = Path(os.path.expanduser(text))
@@ -170,33 +147,18 @@ def _load_mcp_config(raw: str) -> dict:
 
 
 def _parse_mcp_config(raw: str, default_tools: tuple[str, ...]) -> tuple[McpBinding, ...]:
-    """Build MCP bindings from the standard ``mcpServers`` document.
-
-    The schema is the one Claude Code (``--mcp-config``), Cursor, and the wider
-    ecosystem already read, so a server config can be copied between them
-    unchanged::
-
-        {"mcpServers": {"github": {"command": "npx",
-                                   "args": ["-y", "@modelcontextprotocol/server-github"],
-                                   "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"}}}}
-
-    ``tools`` is an optional per-server extension (ignored by other readers)
-    naming the tools to pre-approve; servers omitting it inherit
-    ``default_tools`` from ``AGENT_ALLOWED_TOOLS``.
+    """Build MCP bindings from a ``mcpServers`` JSON document or file path.
 
     Args:
         raw: The raw ``AGENT_MCP_CONFIG`` value (inline JSON or a path).
         default_tools: Tool names applied to servers that declare none.
 
     Returns:
-        One binding per entry, in document order.
-
-    A secret-named ``env`` value must be a ``${VAR}`` reference, not a literal —
-    see :func:`_reject_literal_secrets`.
+        One binding per enabled entry, in document order.
 
     Raises:
-        ConfigError: If the document is malformed, an entry has no ``command``,
-            or a secret-named ``env`` value holds a literal.
+        ConfigError: If the document is malformed, has no enabled servers, or
+            embeds a literal credential in a secret-named ``env`` key.
     """
     servers = _load_mcp_config(raw).get("mcpServers")
     if servers is None:
@@ -204,9 +166,6 @@ def _parse_mcp_config(raw: str, default_tools: tuple[str, ...]) -> tuple[McpBind
     if not isinstance(servers, dict):
         raise ConfigError("AGENT_MCP_CONFIG 'mcpServers' must be a JSON object")
     if not servers:
-        # An arm that grants nothing leaves AGENT_MCP_CONFIG unset. Setting it to
-        # an empty document instead yields a no-MCP run that still reports as an
-        # MCP arm — the silent-pass this whole path exists to prevent.
         raise ConfigError("AGENT_MCP_CONFIG 'mcpServers' is empty; unset the variable instead")
 
     bindings: list[McpBinding] = []
@@ -221,6 +180,8 @@ def _parse_mcp_config(raw: str, default_tools: tuple[str, ...]) -> tuple[McpBind
                 for err in exc.errors()
             )
             raise ConfigError(f"AGENT_MCP_CONFIG server {name!r} is invalid: {detail}") from exc
+        if spec.disabled:
+            continue
         _reject_literal_secrets(name, spec.env)
         bindings.append(
             McpBinding(
@@ -231,6 +192,8 @@ def _parse_mcp_config(raw: str, default_tools: tuple[str, ...]) -> tuple[McpBind
                 tools=tuple(spec.tools) if spec.tools is not None else default_tools,
             )
         )
+    if not bindings:
+        raise ConfigError("AGENT_MCP_CONFIG has no enabled servers; unset the variable instead")
     return tuple(bindings)
 
 
