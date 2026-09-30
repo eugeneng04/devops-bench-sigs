@@ -91,7 +91,7 @@ _CACHED_TOKEN_KEYS = (
     "cached_content_token_count",
 )
 _CACHE_WRITE_TOKEN_KEYS = ("cache_write", "cacheWrite", "cache_creation_input_tokens")
-_REASONING_TOKEN_KEYS = ("reasoning", "thoughts_token_count", "reasoning_tokens")
+_REASONING_TOKEN_KEYS = ("reasoning", "reasoningTokens", "thoughts_token_count", "reasoning_tokens")
 _TOTAL_TOKEN_KEYS = ("total", "totalTokens", "total_tokens", "total_token_count")
 
 # Runs of characters outside ``[a-z0-9]`` collapse to a single ``-``. Mirrors the
