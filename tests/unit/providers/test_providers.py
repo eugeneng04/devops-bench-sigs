@@ -202,8 +202,8 @@ def test_kind_ensure_account_credentials_is_noop() -> None:
 # -- sandbox network plans --------------------------------------------------
 
 
-def test_base_provider_defaults_to_a_plain_bridge() -> None:
-    """A provider that overrides nothing gets a plain-bridge plan."""
+def test_base_provider_refuses_to_be_sandboxed_without_an_override() -> None:
+    """A forgotten override fails as a plain refusal, not a run on the wrong cluster."""
 
     class _BareProvider(Provider):
         def ensure_account_credentials(self) -> None: ...
@@ -222,7 +222,8 @@ def test_base_provider_defaults_to_a_plain_bridge() -> None:
         ) -> dict[str, Any]:
             raise NotImplementedError
 
-    assert _BareProvider().sandbox_network_plan(ClusterInfo(name="c1")) == NetworkPlan()
+    with pytest.raises(SandboxError, match="does not implement sandbox_network_plan"):
+        _BareProvider().sandbox_network_plan(ClusterInfo(name="c1"))
 
 
 def test_kind_plan_joins_the_kind_network_and_rewrites_the_server() -> None:

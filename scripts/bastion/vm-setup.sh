@@ -83,28 +83,21 @@ else
     || echo "    WARN: gemini CLI install failed; gcli agent runs will not work until it's installed."
 fi
 
-# Block the link-local metadata endpoint (169.254.169.254) for containers
-# only: it would hand a sandboxed agent this VM's cloud-platform-scoped
-# service account token, voiding the scoped credentials. DOCKER-USER applies
-# to *forwarded* traffic only, so host processes — ambient (unsandboxed)
-# runs and the matrix — keep authenticating through the metadata server.
-#
-# Port 53 must stay open: on a GCP VM the metadata address is also the
-# resolver dockerd copies into default-bridge containers, so a blanket REJECT
-# breaks all container DNS (kind hides this — its embedded DNS at 127.0.0.11
-# forwards from the host namespace, where DOCKER-USER does not apply). The
-# token endpoints are HTTP on port 80, so they stay rejected, and a DNS
-# answer cannot carry a credential. Order matters (the ACCEPTs must sit above
-# the REJECT) and must not depend on what an earlier run or a debugging session
-# left behind, so all three are removed and re-inserted at the head every run.
-#
-# iptables rules do not survive a reboot and DOCKER-USER is created by
-# dockerd: re-run this script after a reboot. See docs/components/infra.md.
+# Block the metadata endpoint (169.254.169.254) for containers only: it would
+# hand a sandboxed agent this VM's cloud-platform token. DOCKER-USER applies to
+# forwarded traffic, so host processes (ambient runs, the matrix) are unaffected.
+# Port 53 stays open: the metadata address is also the resolver dockerd copies
+# into containers; the token endpoints are port 80 and stay rejected. The rules
+# are removed and re-inserted at the head every run so order never depends on
+# leftovers, and they do not survive a reboot: re-run after one. See infra.md.
 echo "==> metadata endpoint block (container egress)"
 if ! command -v iptables >/dev/null 2>&1; then
-  echo "    WARN: iptables not found; containers can still reach the metadata server."
+  echo "    ERROR: iptables not found; containers could reach the metadata server." >&2
+  echo "    Install iptables and re-run — refusing to finish setup with the boundary open." >&2
+  exit 1
 elif ! sudo iptables -L DOCKER-USER -n >/dev/null 2>&1; then
   echo "    WARN: no DOCKER-USER chain yet (is dockerd running?); re-run after Docker starts."
+  echo "    Do NOT start sandboxed runs until a re-run installs the metadata block."
 else
   reject="-d 169.254.169.254 -j REJECT"
   accept_udp="-d 169.254.169.254 -p udp --dport 53 -j ACCEPT"
@@ -119,7 +112,9 @@ else
       && sudo iptables -I DOCKER-USER 1 $accept_tcp; then
     echo "    containers can no longer reach 169.254.169.254."
   else
-    echo "    WARN: could not install the rules; containers may still reach the metadata server."
+    echo "    ERROR: could not install the metadata rules; containers could reach the" >&2
+    echo "    metadata server. Refusing to finish setup with the boundary open." >&2
+    exit 1
   fi
   echo "    DNS to 169.254.169.254 still permitted (port 53 only)."
 fi

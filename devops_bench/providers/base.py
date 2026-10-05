@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
-from devops_bench.core import ClusterInfo, NetworkPlan, Registry
+from devops_bench.core import ClusterInfo, NetworkPlan, Registry, SandboxError
 
 __all__ = ["PROVIDERS", "Provider", "ResolveContext"]
 
@@ -106,14 +106,20 @@ class Provider(ABC):
     def sandbox_network_plan(self, cluster_info: ClusterInfo) -> NetworkPlan:
         """Describe how a sandboxed agent container reaches this cluster.
 
-        The default suits any endpoint reachable from a bridge-networked
-        container; the sandbox also rewrites a loopback server to
-        ``host.docker.internal`` on top of whatever is returned. Override
-        only when that generic step cannot infer what is needed: a Docker
-        network to join, an in-network hostname, or a context pin.
+        Every provider must override this with a plan pinned via
+        ``kubectl_context`` to the context this cluster wrote; add a Docker
+        network or in-network hostname only when the generic loopback rewrite
+        cannot infer the endpoint.
+
+        Raises:
+            SandboxError: Always, from this default; an un-overridden provider
+                cannot be sandboxed.
         """
-        del cluster_info
-        return NetworkPlan()
+        raise SandboxError(
+            f"provider {type(self).__name__} does not implement sandbox_network_plan; a "
+            f"sandboxed run needs a plan pinned to the context cluster {cluster_info.name!r} "
+            "wrote — override it, or run this provider unsandboxed"
+        )
 
     def cleanup(
         self,
