@@ -263,11 +263,10 @@ a container (`BENCH_SANDBOX_IMAGE`) that sees the run workspace, the task's
 seeded fixtures, a generated kubeconfig, and an explicit env overlay — and not
 the repo checkout, `results/`, your `$HOME`, gcloud config, Terraform state, or
 the Docker socket. With the switch unset the harness behaves exactly as it did
-before the sandbox existed. The design was shaped by two observed incidents:
-an agent that used the admin kubeconfig to run a privileged pod and read the
-bench checkout through the node's disk, and an agent that mined the harness
-VM's cloud identity from the metadata endpoint when its model credential was
-missing.
+before the sandbox existed. The design closes two escape routes: an agent using
+the admin kubeconfig to run a privileged pod and read the bench checkout through
+the node's disk, and an agent minting the host's cloud identity from the
+metadata endpoint when its model credential is missing.
 
 ### The cluster credential
 
@@ -352,7 +351,7 @@ Overlapping controls, applied at the same point:
    bound cluster-wide, so the agent can write to `kube-system` on every
    provider, and policy 2 deliberately skips it — which made
    `kubectl run --privileged -n kube-system` an admitted request on a cluster
-   carrying the full set. A boundary probe caught this; it is not hypothetical.
+   carrying the full set.
    The policy matches every kind that can produce a pod, not `pods` alone, since
    a `Deployment` reaches the same place with its pod created by the ReplicaSet
    controller. It matches `pods/exec`, `pods/attach`, `pods/portforward`,
@@ -406,7 +405,7 @@ agent creates: PSA `baseline` and policy 2 are not identical, and a label the
 labeller failed to apply leaves a gap. `bench-system` is labelled like any other
 namespace and is deliberately **not** exempt from the policy, since the agent
 can create pods there. Together these deny the privileged-pod-plus-`hostPath`
-escape that was used to read the benchmark's own answer key off a node's disk.
+escape that can read the benchmark's own answer key off a node's disk.
 
 **The cluster must be Kubernetes 1.30 or newer.** Four of the five controls are
 `ValidatingAdmissionPolicy` objects, and `admissionregistration.k8s.io/v1` only
@@ -487,7 +486,7 @@ installs, and the supplement grants only `get`/`list`/`watch` on
 gets on a given CRD is therefore whatever that operator chose to aggregate into
 `edit`, which is usually nothing.
 
-`opa-remediation` is the measured instance. Kyverno v1.12.7 ships
+`opa-remediation` is an example. Kyverno v1.12.7 ships
 `kyverno:rbac:view:policies` labelled `aggregate-to-view` and
 `kyverno:rbac:admin:policies` labelled `aggregate-to-admin`, with no
 `aggregate-to-edit` on either. Aggregation flows view into edit and edit into
@@ -509,7 +508,7 @@ A key-based provider needs nothing special: the key is in the resolved overlay
 and crosses the boundary by value like any other variable.
 
 A **keyless** backend does not have that luxury. The sandbox strips
-`CLOUDSDK_CONFIG` and `GOOGLE_APPLICATION_CREDENTIALS`, and on the bastion the
+`CLOUDSDK_CONFIG` and `GOOGLE_APPLICATION_CREDENTIALS`, and on the host the
 link-local metadata endpoint is blocked for containers (see
 [infrastructure](infra.md)) — and Application Default Credentials is exactly
 that chain. So each keyless backend needs its own *mint-and-inject recipe*: mint
@@ -571,3 +570,25 @@ host processes with the operator's own ADC.
 
 Want to wrap a different agent? See
 [Add an agent harness](../how-to/add-an-agent-harness.md).
+
+### Concurrent sandbox runs and external user IDs
+
+A caller may set `BENCH_AGENT_SANDBOX_OWNER` to a unique alphanumeric attempt ID
+(underscores allowed). Agent container names then include that ID; startup
+recovery only reaps containers belonging to the same owner. Never reuse an owner
+for concurrent attempts. Without an owner, startup recovery is a no-op; legacy
+orphans require explicit operator recovery.
+
+For host IDs above Docker's signed 32-bit limit, the sandbox runs as 1000:1000.
+Ownership remapping covers the workspace, fixture mounts and the generated
+single-cluster kubeconfig, then restores the host ownership after execution.
+The agent's kubeconfig mount remains read-only. Provider authentication uses
+explicit overlays; host credential files are not copied into the sandbox.
+
+
+OpenClaw's per-run catalog also registers `gemini-3.8-flash` with the `google`
+or `google-vertex` provider, and `claude-fable-5-1` with `anthropic-vertex`.
+Select them with `AGENT_MODEL` and `AGENT_PROVIDER`; the harness pins the matching
+transport in the isolated run configuration. Model IDs follow the
+[Gemini documentation](https://ai.google.dev/gemini-api/docs/latest-model) and
+[Claude on Vertex documentation](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/partner-models/claude/fable-5-1).

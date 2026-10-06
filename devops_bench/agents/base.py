@@ -14,21 +14,12 @@
 
 """Agent-under-test interface and the agent-selection registry.
 
-This module defines the template-method :class:`AgentHarness` consumed by every
-concrete agent. The base owns latency bookkeeping and a broad safety net so a
-single agent crash never aborts the benchmark. Subclasses implement
-:meth:`AgentHarness._execute` to do the provider-specific work and return an
-:class:`AgentResult`.
-
-Each concrete harness lives in a sibling subpackage (``cli.gemini_cli`` /
-``cli.openclaw``) and self-registers under its canonical key via
-``@AGENTS.register``. External packages register theirs through the
-``devops_bench.agents`` entry-point group instead, so a downstream harness
-resolves by key with no import of its module here. Keys on both paths must be
-lowercase — the harness lowercases the configured agent type before lookup — so
-an uppercase one is rejected at registration rather than left unreachable.
-Heavy imports (``deepeval``, provider SDKs) stay function-local — ``import
-devops_bench.agents`` pulls only this module.
+:class:`AgentHarness` is the template method every concrete agent implements via
+:meth:`AgentHarness._execute`; the base owns latency bookkeeping and the safety
+net that keeps one agent crash from aborting the benchmark. Harnesses
+self-register under a lowercase key via ``@AGENTS.register``; external packages
+use the ``devops_bench.agents`` entry-point group. Heavy imports stay
+function-local so ``import devops_bench.agents`` pulls only this module.
 """
 
 from __future__ import annotations
@@ -51,17 +42,7 @@ __all__ = ["AgentHarness", "AGENTS"]
 
 
 def _reject_non_lowercase_key(key: str) -> str | None:
-    """Reject an agent key that a configured agent type could never match.
-
-    The harness lowercases the configured agent type before looking it up, so a
-    key carrying any uppercase character is unreachable — and the failure is
-    silent in the worst way: the configured name shows up verbatim in the
-    ``available:`` list of the resulting :class:`NotRegisteredError`. Rejecting
-    at registration turns that into an actionable message at the point the key
-    is introduced.
-
-    Args:
-        key: Candidate registry key.
+    """Reject a key with uppercase characters: lookups lowercase the agent type first.
 
     Returns:
         None when ``key`` is acceptable, else the reason it was rejected.
@@ -72,9 +53,7 @@ def _reject_non_lowercase_key(key: str) -> str | None:
 
 
 #: Registry of concrete :class:`AgentHarness` subclasses, keyed by agent type.
-#: ``entry_point_group`` lets external packages register a harness without
-#: touching this tree; the key policy holds those external keys to the same
-#: lowercase contract the in-tree ones follow.
+#: External packages register through the entry-point group under the same key policy.
 AGENTS: Registry[type[AgentHarness]] = Registry(
     "agents",
     entry_point_group="devops_bench.agents",
@@ -87,59 +66,37 @@ _log = get_logger("agents.base")
 class AgentHarness(ABC):
     """Template-method base class for an agent driven during a benchmark run.
 
-    The base owns three concerns common to every agent:
-
-    1. **Latency bookkeeping** — :meth:`run` measures wall-clock seconds and
-       stamps ``AgentResult.latency`` so subclasses never re-implement it.
-    2. **Broad safety net** — any unexpected exception from :meth:`_execute`
-       (including subclass bugs and provider SDK crashes) is caught and
-       converted to ``AgentResult.errored(...)``; one agent fault never aborts
-       the benchmark.
-    3. **Optional tracing** — when ``deepeval`` is installed, the run is wrapped
-       in an ``@observe`` span. The import stays function-local so the agents
-       package can be imported on a host without ``deepeval``.
-
-    Concrete subclasses live in sibling modules and self-register a canonical
-    key via ``@AGENTS.register(...)``. They override :meth:`_execute` to build
-    argv / drive the loop, run, parse, and return an :class:`AgentResult`. They
-    handle their own *known* errors (subprocess failures, parse misses) by
-    populating ``AgentResult.errors`` — the safety net is only for unexpected
-    exceptions.
+    :meth:`run` stamps ``AgentResult.latency``, converts any unexpected exception
+    from :meth:`_execute` into ``AgentResult.errored``, and wraps the call in a
+    ``deepeval`` span when that package is installed. Subclasses report their
+    *known* errors through ``AgentResult.errors``; the safety net is for the rest.
 
     Args:
-        config: Typed configuration. ``None`` substitutes a default
-            ``AgentConfig()`` (use the agent's built-in defaults).
+        config: Typed configuration; ``None`` means a default ``AgentConfig()``.
     """
 
-    #: Whether every agent-owned subprocess goes through :meth:`run_agent_cmd`.
-    #: :meth:`run` refuses a sandboxed config on an unmigrated harness — its
-    #: direct calls would run on the host while the operator believes otherwise.
+    #: Whether every agent-owned subprocess goes through :meth:`run_agent_cmd`;
+    #: :meth:`run` refuses a sandboxed config on a harness that has not declared it.
     supports_sandbox: bool = False
 
     def __init__(self, config: AgentConfig | None = None) -> None:
         self.config = config or AgentConfig()
 
     def run(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
-        """Execute the agent against ``prompt`` and return a typed result.
-
-        Template method: wraps :meth:`_execute` in the latency stamp and the
-        safety net. ``agent.run(prompt) -> AgentResult`` is the only entry point
-        the harness calls.
+        """Execute the agent against ``prompt``; the only entry point the harness calls.
 
         Args:
             prompt: Task prompt handed to the agent.
-            workspace_path: Harness-owned working directory the agent should
-                execute in, when the harness supplies one (so files the agent
-                writes can be diffed and collected afterward). ``None`` lets
-                the agent fall back to its own throwaway working directory.
+            workspace_path: Harness-owned working directory whose writes are
+                collected afterward; ``None`` lets the agent use a throwaway one.
 
         Returns:
-            An :class:`AgentResult` with ``latency`` always populated. A
-            subclass crash produces ``AgentResult.errored(msg)``.
+            An :class:`AgentResult` with ``latency`` populated; a subclass crash
+            becomes ``AgentResult.errored``.
 
         Raises:
-            SandboxError: Sandboxed config on an unmigrated harness, or the
-                executor refused mid-run. Not converted to an errored result:
+            SandboxError: A sandboxed config on a harness without sandbox support,
+                or an executor refusal. Never converted to an errored result, since
                 a containment failure must not score as agent performance.
         """
         if self.config.sandbox is not None and not self.supports_sandbox:
@@ -182,37 +139,22 @@ class AgentHarness(ABC):
     ) -> CompletedProcess:
         """Run an agent-owned command through the sandbox seam.
 
-        This is the one dispatch point that decides whether the agent binary
-        (and anything else run on its behalf, e.g. a post-run trajectory
-        export) executes on the host or inside the sandbox container. When
-        ``config.sandbox`` is set the command is wrapped by
+        With ``config.sandbox`` set the command runs in
         :class:`~devops_bench.agents.sandbox.SandboxExecutor`; otherwise it is
-        handed through unchanged — same arguments, same defaults, same return
-        shape as :func:`devops_bench.core.subprocess.run` — so with the flag
-        off a call site swapped onto this method behaves byte-for-byte as its
-        direct ``run(...)`` call did.
-
-        A sandbox that cannot run raises ``SandboxError`` (see its docstring
-        for why that is fatal rather than a fallback); :meth:`run` re-raises
-        it so the eval harness records a failed, unscored run.
+        handed through with the signature and defaults of
+        :func:`devops_bench.core.subprocess.run`. A sandbox that cannot run raises
+        ``SandboxError``, which :meth:`run` re-raises.
 
         Args:
             cmd: Command and arguments, never a shell string.
-            cwd: Working directory; inside the sandbox it must lie under the
-                run workspace (it is remapped to the container path).
-            env: Full-environment replacement. Only meaningful on the host
-                path; the sandbox rejects it rather than forwarding a whole
-                host environment across the boundary.
-            extra_env: The resolved per-run overlay. On the host path it is
-                overlaid on the process env; in the sandbox it is the *only*
+            cwd: Working directory; sandboxed it must lie under the run workspace.
+            env: Full-environment replacement; the sandbox rejects it.
+            extra_env: The resolved per-run overlay; sandboxed it is the only
                 environment that crosses, by value, after the deny filter.
             check / capture / text / timeout / input: As in
-                ``core.subprocess.run``. ``input`` is rejected in the sandbox
-                (the container runs without stdin, by design).
-            host_run: Callable used on the unsandboxed path. When omitted,
-                the concrete harness module's own ``run`` import is used (the
-                symbol its unit tests patch), falling back to
-                ``core.subprocess.run``.
+                ``core.subprocess.run``; the sandbox rejects a non-empty ``input``.
+            host_run: Callable for the unsandboxed path; defaults to the harness
+                module's own ``run`` import (the symbol its tests patch).
 
         Returns:
             The completed process, in either mode.
@@ -230,9 +172,7 @@ class AgentHarness(ABC):
                 input=input,
             )
         if host_run is None:
-            # Default to the harness module's own ``run`` import — the symbol
-            # its unit tests patch. A harness that forgot host_run= would
-            # otherwise bypass those patches and hit the real subprocess.
+            # The harness module's own ``run`` import, so its unit-test patches still apply.
             candidate = getattr(sys.modules.get(type(self).__module__), "run", None)
             host_run = candidate if callable(candidate) else _host_subprocess_run
         return host_run(
@@ -249,35 +189,22 @@ class AgentHarness(ABC):
 
     @abstractmethod
     def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
-        """Run the agent and return its typed result.
-
-        Subclass extension point. Implementations build the provider-specific
-        invocation, parse the output into the canonical trajectory, and return
-        an :class:`AgentResult`. Subclasses handle their own *known* errors by
-        populating ``AgentResult.errors``; the base's safety net catches only
-        unexpected exceptions.
+        """Run the agent and return its typed result; known errors go in ``AgentResult.errors``.
 
         Args:
             prompt: Task prompt handed to the agent.
-            workspace_path: Harness-owned working directory, or ``None`` when
-                the harness has not supplied one. A subclass with no local
-                filesystem workspace (e.g. a pure API agent) may ignore it.
+            workspace_path: Harness-owned working directory, or ``None``; an agent
+                with no local workspace may ignore it.
 
         Returns:
-            An :class:`AgentResult` (``latency`` may be left zero — the base
-            fills it in).
+            An :class:`AgentResult`; ``latency`` may be left zero for the base to fill.
         """
 
 
 def _maybe_observe(
     func: Callable[[str, Path | None], AgentResult],
 ) -> Callable[[str, Path | None], AgentResult]:
-    """Return ``func`` wrapped in ``deepeval.tracing.observe`` when available.
-
-    The wrap is performed once per ``run()`` call rather than at import time so
-    the agents package can be imported on hosts without ``deepeval``. Import
-    failures degrade gracefully — the run proceeds untraced.
-    """
+    """Return ``func`` wrapped in ``deepeval.tracing.observe`` when importable, else as is."""
     try:
         from deepeval.tracing import observe
     except ImportError:

@@ -150,8 +150,7 @@ def test_parse_session_jsonl_emits_canonical_trajectory():
 
 
 def test_parse_old_session_total_includes_cached_tokens():
-    # Regression: total must include cached (input + output + cached), matching
-    # the DB-path convention, not input + output alone.
+    # Total includes cached (input + output + cached), matching the DB-path convention.
     session = _jsonl(
         {"sessionId": "s"},
         {
@@ -403,15 +402,49 @@ def test_agy_cli_agent_execute_flow(mock_run, mock_home, tmp_path):
 
 
 @mock.patch.object(pathlib.Path, "home")
+def test_agy_cli_agent_sandboxed_argv_uses_container_spellings(mock_home, tmp_path, monkeypatch):
+    """Sandboxed, argv[0] and --gemini_dir must be container spellings, never host paths."""
+    from devops_bench.agents import sandbox as sandbox_mod
+
+    mock_home.return_value = tmp_path
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    config = agents_config.AgentConfig(
+        target="/bin/agy",
+        model="gemini-3.5-flash",
+        capabilities=capabilities.AllCapabilities(),
+        sandbox=sandbox_mod.SandboxSpec(image="img", workspace=str(workspace)),
+    )
+    agent = agy_mod.AgyCliAgent(config)
+
+    captured: dict[str, list[str]] = {}
+
+    def fake_run_agent_cmd(cmd, **kwargs):
+        captured["argv"] = [str(a) for a in cmd]
+        _write_sample_transcript(pathlib.Path(kwargs["cwd"]))
+        return SimpleNamespace(args=list(cmd), returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(agent, "run_agent_cmd", fake_run_agent_cmd)
+
+    result = agent._execute("run task", workspace_path=workspace)
+
+    argv = captured["argv"]
+    assert argv[0] == "agy"
+    assert "/bin/agy" not in argv
+    assert f"--gemini_dir={sandbox_mod.CONTAINER_WORKSPACE}/.gemini" in argv
+    assert result.errors == []
+
+
+@mock.patch.object(pathlib.Path, "home")
 @mock.patch.object(devops_subprocess, "run")
 def test_agy_cli_agent_execute_defaults_the_location_to_global(
     mock_run: mock.MagicMock,
     mock_home: mock.MagicMock,
     tmp_path: pathlib.Path,
 ) -> None:
-    # Nothing in the env chain: the run must land on "global", not a region —
-    # the -preview model ids 404 on regional endpoints. A gcloud compute/region
-    # is a Compute setting, so it must not be consulted even when one is set.
+    # No location anywhere resolves to "global" (regional endpoints 404 for -preview
+    # ids); a gcloud compute/region is a Compute setting and is never consulted.
     mock_home.return_value = tmp_path
     agy_done = SimpleNamespace(args=["agy"], returncode=0, stdout="", stderr="")
 
@@ -443,9 +476,8 @@ def test_agy_cli_agent_execute_ignores_the_cluster_zone_for_routing(
     mock_home: mock.MagicMock,
     tmp_path: pathlib.Path,
 ) -> None:
-    # GCP_LOCATION is the deployers' cluster *zone* and is not read for routing;
-    # the Vertex-specific spelling decides. The overlay still *writes* the zone
-    # spelling for agy's own GCP tooling, now carrying the routed location.
+    # GCP_LOCATION is the deployers' cluster zone and is not read for routing; the
+    # overlay still writes that spelling for agy's own tooling, carrying the routed location.
     mock_home.return_value = tmp_path
     mock_run.return_value = SimpleNamespace(args=["agy"], returncode=0, stdout="", stderr="")
     mock_run.side_effect = lambda *args, **kwargs: (
@@ -466,11 +498,8 @@ def test_agy_cli_agent_execute_ignores_the_cluster_zone_for_routing(
 def _write_sample_transcript(
     cwd: pathlib.Path, *, db_turns: list[bytes] | None = None, transcript: str | None = None
 ) -> None:
-    """Lay down agy's on-disk session layout: transcript + conversation DB.
-
-    ``db_turns`` populates a conversation DB with usage records; ``None`` writes
-    an empty file (no usage). ``transcript`` defaults to ``SAMPLE_SESSION``.
-    """
+    """Lay down agy's session layout (transcript + conversation DB); ``db_turns=None``
+    writes an empty DB, ``transcript`` defaults to ``SAMPLE_SESSION``."""
     root_dir = cwd / ".gemini" / "antigravity-cli"
     conv_dir = root_dir / "conversations"
     conv_dir.mkdir(parents=True, exist_ok=True)
@@ -569,11 +598,8 @@ def _pb_lfield(field_num: int, payload: bytes) -> bytes:
 
 
 def _usage_blob(inp, cached, reasoning, output, *, f3=None):
-    """Build a gen_metadata blob with a usage record at wire path .1.4.
-
-    Fields: f2=input, f5=cached, f9=reasoning, f10=output, f3=f9+f10.
-    Zero-valued scalars are omitted, mirroring proto3 wire encoding.
-    """
+    """Build a gen_metadata blob with a usage record at wire path .1.4 (f2=input, f5=cached,
+    f9=reasoning, f10=output, f3=f9+f10); zero scalars omitted as in proto3."""
     stats = b""
     if inp:
         stats += _pb_vfield(2, inp)
@@ -682,9 +708,8 @@ def test_db_token_state_pending_when_usage_not_flushed(tmp_path):
 
 
 def test_db_token_state_pending_on_transient_read_error(tmp_path, monkeypatch):
-    # A locked/half-written DB during agy's async post-exit flush raises a
-    # transient sqlite error; it must be retryable ("pending"), not terminal
-    # ("absent"), so the poll loop waits for the flush to finish.
+    # A locked DB during agy's async post-exit flush is a transient sqlite error:
+    # "pending" (retry), not "absent" (terminal).
     db = tmp_path / "conv.db"
     _make_conv_db(db, [_usage_blob(100, 0, 9, 5)])
 
@@ -711,9 +736,8 @@ def test_db_token_state_absent_for_missing_or_nonconversation_db(tmp_path):
 def test_agy_cli_agent_execute_flow_timeout_recovers_partial_transcript(
     mock_run, mock_home, tmp_path
 ):
-    # Regression test: core.subprocess.run raises SubprocessError on a timeout
-    # even with check=False. The transcript agy wrote before being killed
-    # must still be recovered instead of being lost with the tempdir.
+    # core.subprocess.run raises SubprocessError on timeout even with check=False;
+    # the transcript written before the kill must still be recovered.
     mock_home.return_value = tmp_path
 
     def side_effect(*args, **kwargs):

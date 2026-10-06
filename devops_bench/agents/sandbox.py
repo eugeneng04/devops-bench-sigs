@@ -14,18 +14,14 @@
 
 """Run the agent-under-test inside a container with a scoped view of the world.
 
-Ambient CLI agents inherit the operator's filesystem and environment: the
-benchmark's answer material, cloud credentials, admin kubeconfig. This module
-is the boundary. The container sees the per-run workspace at ``/workspace``
-(``HOME`` under it), the task's seeded fixtures, a single-cluster kubeconfig
-read-only at ``/creds/kubeconfig``, and a deny-filtered env overlay passed as
-name-only ``-e`` flags. A sandbox that cannot be built raises
-:class:`~devops_bench.core.errors.SandboxError` rather than running ambient.
-
-The container is bridge-attached; what it may reach on the host is governed by
-the host's ``DOCKER-USER`` rules (bastion setup), not here. The kubeconfig's
-credential is the scoped ServiceAccount token from
-:mod:`devops_bench.k8s.agent_credentials`; the model credential comes from
+The container sees the per-run workspace at ``/workspace`` (``HOME`` under it),
+the task's seeded fixtures, a single-cluster kubeconfig read-only at
+``/creds/kubeconfig``, and a deny-filtered env overlay passed as name-only ``-e``
+flags; never the operator's filesystem, cloud credentials or admin kubeconfig. A
+sandbox that cannot be built raises :class:`~devops_bench.core.errors.SandboxError`
+rather than running ambient. Host reachability is the host setup's
+``DOCKER-USER`` rules, not this module's; the cluster credential comes from
+:mod:`devops_bench.k8s.agent_credentials`, the model credential from
 :mod:`devops_bench.core.model_providers`.
 """
 
@@ -55,6 +51,7 @@ __all__ = [
     "SandboxExecutor",
     "spec_from_env",
     "build_network_plan",
+    "container_path",
     "discover_fixture_mounts",
     "filter_boundary_env",
     "container_name_for_workspace",
@@ -67,6 +64,9 @@ _log = get_logger("agents.sandbox")
 # Opt-in so sandboxed runs can be A/B'd against ambient; unset is the pre-sandbox behavior.
 SANDBOX_ENV = "BENCH_AGENT_SANDBOX"
 IMAGE_ENV = "BENCH_SANDBOX_IMAGE"
+# Optional attempt id scoping container names and the stray sweep; validated at opt-in.
+OWNER_ENV = "BENCH_AGENT_SANDBOX_OWNER"
+_OWNER_PATTERN = re.compile(r"[A-Za-z0-9_]{1,128}")
 CONTAINER_RUNTIME = "docker"
 _SANDBOX_ENABLED_VALUES = frozenset({CONTAINER_RUNTIME, "1", "true"})
 # Anything outside these two sets raises rather than silently running ambient.
@@ -80,6 +80,15 @@ FIXTURES_ENV = "BENCH_AGENT_FIXTURES"
 CONTAINER_WORKSPACE = "/workspace"
 CONTAINER_HOME = f"{CONTAINER_WORKSPACE}/home"
 CONTAINER_KUBECONFIG = "/creds/kubeconfig"
+
+# Docker refuses ``--user`` ids above int32 max (exit 125); IdP-minted ids can exceed it.
+# Dropping ``--user`` would run the agent as root, so such ids are remapped (_needs_id_remap).
+_MAX_CONTAINER_ID = 2**31 - 1
+
+# In-range unprivileged id for the remap: the ``node`` user of the node:22-slim
+# base the sandbox images build on.
+_REMAP_UID = 1000
+_REMAP_GID = 1000
 
 # A name match authorizes a kill, so this must never match a container we did not start.
 _CONTAINER_NAME_PREFIX = "devops-bench-agent-"
@@ -124,9 +133,10 @@ def _overlaps_bench_checkout(path: Path) -> bool:
 class SandboxSpec:
     """Everything the executor needs to wrap one run's agent in ``docker run``.
 
-    :func:`spec_from_env` yields the image only; the eval harness fills in the
-    rest per task. ``fixture_mounts`` maps host path -> container path (RW);
-    ``env_allowlist`` lets named vars cross despite a deny rule.
+    :func:`spec_from_env` yields the image and owner; the eval harness fills in
+    the rest per task. ``fixture_mounts`` maps host path -> container path (RW);
+    ``env_allowlist`` lets named vars cross despite a deny rule; ``owner`` scopes
+    container names and the stray sweep to one attempt.
     """
 
     image: str = ""
@@ -135,13 +145,18 @@ class SandboxSpec:
     kubeconfig: Path | None = None
     fixture_mounts: Mapping[str, str] = field(default_factory=dict)
     env_allowlist: tuple[str, ...] = ()
+    owner: str = ""
 
 
 def spec_from_env(env: Mapping[str, str] | None = None) -> SandboxSpec | None:
-    """Read the sandbox opt-in; ``None`` when off, :class:`SandboxError` on a typo."""
+    """Read the sandbox opt-in and owner; ``None`` when off, :class:`SandboxError` on a typo."""
     raw = (get_env(SANDBOX_ENV, env=env) or "").strip().lower()
     if raw in _SANDBOX_ENABLED_VALUES:
-        return SandboxSpec(image=(get_env(IMAGE_ENV, env=env) or "").strip())
+        owner = (get_env(OWNER_ENV, env=env) or "").strip()
+        # Checked here so a typo refuses the batch instead of erroring every task.
+        if owner and not _OWNER_PATTERN.fullmatch(owner):
+            raise SandboxError(f"{OWNER_ENV}={owner!r} must be 1-128 characters of [A-Za-z0-9_]")
+        return SandboxSpec(image=(get_env(IMAGE_ENV, env=env) or "").strip(), owner=owner)
     if raw in _SANDBOX_DISABLED_VALUES:
         return None
     raise SandboxError(
@@ -287,6 +302,28 @@ def discover_fixture_mounts(cluster_name: str | None) -> dict[str, str]:
     return mounts
 
 
+def container_path(workspace: str | os.PathLike[str], path: str | os.PathLike[str]) -> str:
+    """Map a host path under ``workspace`` to the path the container sees.
+
+    Module-level because harnesses translate env values (e.g. ``OPENCLAW_STATE_DIR``)
+    before handing them over, and must agree with the executor's ``cwd`` mapping.
+    Raises :class:`SandboxError` outside the workspace: the mount set is the
+    boundary and only widens through an explicit spec field.
+    """
+    resolved = Path(path).resolve()
+    root = Path(workspace).resolve()
+    if resolved == root:
+        return CONTAINER_WORKSPACE
+    try:
+        relative = resolved.relative_to(root)
+    except ValueError as exc:
+        raise SandboxError(
+            f"host path {resolved} is outside the sandbox workspace {root} "
+            "and has no container mapping; refusing to widen the mount set"
+        ) from exc
+    return f"{CONTAINER_WORKSPACE}/{relative.as_posix()}"
+
+
 def _env_denied(name: str) -> bool:
     return name in _DENIED_ENV_NAMES or name.startswith(_DENIED_ENV_PREFIXES)
 
@@ -342,22 +379,81 @@ class SandboxExecutor:
             )
         self.spec = spec
         self._workspace = Path(spec.workspace)
-        self.container_name = container_name_for_workspace(self._workspace)
+        self.container_name = container_name_for_workspace(self._workspace, spec.owner)
 
     def map_host_path(self, path: str | os.PathLike[str]) -> str:
-        """Map a workspace-relative host path into the container; raise outside it."""
-        resolved = Path(path).resolve()
-        workspace = self._workspace.resolve()
-        if resolved == workspace:
-            return CONTAINER_WORKSPACE
+        """Map a host path under this executor's workspace to its container path."""
+        return container_path(self._workspace, path)
+
+    def _needs_id_remap(self) -> bool:
+        """Whether either host id exceeds Docker's int32 ``--user`` limit; always False off Linux."""
+        if not sys.platform.startswith("linux"):
+            return False
+        return os.getuid() > _MAX_CONTAINER_ID or os.getgid() > _MAX_CONTAINER_ID
+
+    def _remap_mounts(self) -> list[tuple[str, str]]:
+        """Host -> container path for every mount a chown pass must cover.
+
+        Fixtures live outside the workspace, so the workspace alone is not enough.
+        """
+        spec = self.spec
+        return [
+            (str(spec.workspace), CONTAINER_WORKSPACE),
+            (str(spec.kubeconfig), CONTAINER_KUBECONFIG),
+            *spec.fixture_mounts.items(),
+        ]
+
+    @property
+    def _chown_container_name(self) -> str:
+        return f"{self.container_name}-chown"
+
+    def _chown_argv(self, uid: int, gid: int, *, from_uid: int) -> list[str]:
+        """``docker run`` argv for a root container (same image, no ``--user``) that
+        chowns every remap mount to ``uid:gid``; only root can chown ids past int32.
+
+        ``--from`` limits each pass to entries the previous pass is responsible
+        for, so a fixture entry owned by anyone else keeps its owner.
+        """
+        argv = [CONTAINER_RUNTIME, "run", "--rm", "--name", self._chown_container_name]
+        targets: list[str] = []
+        for host_path, mount_path in self._remap_mounts():
+            argv += ["-v", f"{host_path}:{mount_path}"]
+            targets.append(mount_path)
+        argv += [self.spec.image, "chown", "-R", f"--from={from_uid}", f"{uid}:{gid}", *targets]
+        return argv
+
+    def _chown_before_remap(self) -> None:
+        """Chown workspace and fixtures to the remap id before the agent starts.
+
+        Fatal: an unprivileged agent cannot write a workspace it does not own.
+        """
+        argv = self._chown_argv(_REMAP_UID, _REMAP_GID, from_uid=os.getuid())
         try:
-            relative = resolved.relative_to(workspace)
-        except ValueError as exc:
+            run(argv, check=True, timeout=_HOUSEKEEPING_TIMEOUT_SEC)
+        except (OSError, SubprocessError) as exc:
             raise SandboxError(
-                f"host path {resolved} is outside the sandbox workspace {workspace} "
-                "and has no container mapping; refusing to widen the mount set"
+                f"could not chown the workspace/fixtures to {_REMAP_UID}:{_REMAP_GID} before "
+                "the id-remapped agent container; refusing to hand it a workspace it cannot write"
             ) from exc
-        return f"{CONTAINER_WORKSPACE}/{relative.as_posix()}"
+
+    def _chown_after_remap(self) -> None:
+        """Chown workspace and fixtures back to the host uid/gid after the agent exits.
+
+        Best-effort: a failure must not mask the agent result, so it is logged with
+        the exact repair command.
+        """
+        uid, gid = os.getuid(), os.getgid()
+        argv = self._chown_argv(uid, gid, from_uid=_REMAP_UID)
+        try:
+            run(argv, check=True, timeout=_HOUSEKEEPING_TIMEOUT_SEC)
+        except (OSError, SubprocessError):
+            _log.error(
+                "could not chown the workspace/fixtures back to %s:%s; they stay owned by "
+                "the remap id. Repair manually: %s",
+                uid,
+                gid,
+                " ".join(argv),
+            )
 
     def wrap_argv(
         self,
@@ -384,7 +480,10 @@ class SandboxExecutor:
         for host_entry in spec.network.extra_hosts:
             argv += ["--add-host", host_entry]
         if sys.platform.startswith("linux"):
-            argv += ["--user", f"{os.getuid()}:{os.getgid()}"]
+            uid, gid = (
+                (_REMAP_UID, _REMAP_GID) if self._needs_id_remap() else (os.getuid(), os.getgid())
+            )
+            argv += ["--user", f"{uid}:{gid}"]
         argv += ["-v", f"{spec.workspace}:{CONTAINER_WORKSPACE}"]
         argv += ["-v", f"{spec.kubeconfig}:{CONTAINER_KUBECONFIG}:ro"]
         for host_path, container_path in spec.fixture_mounts.items():
@@ -412,8 +511,9 @@ class SandboxExecutor:
     ) -> CompletedProcess:
         """Run ``cmd`` in the sandbox container; mirrors ``core.subprocess.run``.
 
-        ``env`` and ``input`` are rejected (credential-inheritance channel; no
-        stdin). Docker's own launch failures raise :class:`SandboxError` rather
+        ``env`` is rejected (credential-inheritance channel), as is a non-empty
+        ``input`` (no ``-i``, so it would be lost; an empty one is a no-op).
+        Docker's own launch failures raise :class:`SandboxError` rather
         than masquerading as an agent exit code. The container is reaped by name
         on every exit path, since ``--rm`` does not fire when the client is
         killed by the host-side timeout.
@@ -428,14 +528,19 @@ class SandboxExecutor:
                 "SandboxExecutor never forwards a full environment; pass the "
                 "resolved overlay via extra_env"
             )
-        if input is not None:
+        if input:
             raise SandboxError(
-                "the sandboxed agent runs without stdin (no -i, by design); input= is unsupported"
+                "the sandboxed agent runs without stdin (no -i, by design); a non-empty "
+                "input= would be silently dropped"
             )
         # Filter once so the client env matches the names wrap_argv emits.
         crossing = filter_boundary_env(extra_env, self.spec.env_allowlist)
         wrapped = self.wrap_argv(cmd, cwd=cwd, extra_env=crossing)
+        remap = self._needs_id_remap()
         try:
+            # Inside the try so a partial or timed-out chown still gets the handback.
+            if remap:
+                self._chown_before_remap()
             try:
                 completed = run(
                     wrapped,
@@ -463,12 +568,21 @@ class SandboxExecutor:
                 )
             return completed
         finally:
-            kill_container(self.container_name)
+            try:
+                kill_container(self.container_name)
+            finally:
+                if remap:
+                    # A timed-out chown helper must not keep running during the handback.
+                    kill_container(self._chown_container_name)
+                    self._chown_after_remap()
 
 
-def container_name_for_workspace(workspace: Path) -> str:
-    """Deterministic container name tied 1:1 to the run's workspace directory."""
-    return f"{_CONTAINER_NAME_PREFIX}{workspace.name}"
+def container_name_for_workspace(workspace: Path, owner: str = "") -> str:
+    """Deterministic container name tied 1:1 to the run's workspace directory.
+
+    ``owner`` (:attr:`SandboxSpec.owner`) adds a segment scoping the name to one attempt.
+    """
+    return f"{_CONTAINER_NAME_PREFIX}{owner + '-' if owner else ''}{workspace.name}"
 
 
 def kill_container(name: str) -> None:
@@ -484,16 +598,26 @@ def kill_container(name: str) -> None:
         _log.info("reaped sandbox container %s", name)
 
 
-def sweep_stray_containers() -> None:
+def sweep_stray_containers(*, owner: str = "", parallel: bool = False) -> None:
     """Best-effort reap of containers a prior crashed run left behind. Never raises.
 
-    Matches only this benchmark's name prefix — but that prefix is shared
-    across harness processes, so parallel harnesses must not sweep (see the
-    eval harness's ``BENCH_PARALLEL`` gate).
+    An ``owner`` scopes the sweep to that attempt. Without one the shared prefix
+    cannot tell a stray from a sibling harness's live container, so ``parallel`` skips it.
     """
+    if not owner and parallel:
+        _log.info(
+            "BENCH_PARALLEL set and no %s: skipping the stray sandbox-container "
+            "sweep; reap leftovers manually with `%s ps --filter name=%s` once no "
+            "benchmark is running",
+            OWNER_ENV,
+            CONTAINER_RUNTIME,
+            _CONTAINER_NAME_PREFIX,
+        )
+        return
+    prefix = f"{_CONTAINER_NAME_PREFIX}{owner}-" if owner else _CONTAINER_NAME_PREFIX
     try:
         listed = run(
-            [CONTAINER_RUNTIME, "ps", "-q", "--filter", f"name=^{_CONTAINER_NAME_PREFIX}"],
+            [CONTAINER_RUNTIME, "ps", "--format", "{{.Names}}"],
             check=False,
             timeout=_HOUSEKEEPING_TIMEOUT_SEC,
         )
@@ -502,5 +626,6 @@ def sweep_stray_containers() -> None:
         return
     if listed.returncode != 0:
         return
-    for container_id in (listed.stdout or "").split():
-        kill_container(container_id)
+    for name in (listed.stdout or "").splitlines():
+        if name.startswith(prefix):
+            kill_container(name)

@@ -12,14 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Targeted unit tests for ``DefaultEvalHarness`` internals not covered elsewhere.
-
-Tests in this file exercise the harness-level wiring beyond the agent /
-scenario / metrics seams (those have their own files): the scenario-drain
-timed-out path, the constructor-arg-driven deployment / namespace defaults,
-the cached granted-skill-paths snapshot, and the narrowed builtin-agent
-import behavior.
-"""
+"""Unit tests for ``DefaultEvalHarness`` wiring beyond the agent, scenario and metrics seams."""
 
 from __future__ import annotations
 
@@ -62,9 +55,8 @@ def isolated_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "NAMESPACE",
     ):
         monkeypatch.delenv(var, raising=False)
-    # The pre-run inventory scans Path.home(); unit runs must not depend on
-    # whatever happens to live in the developer's real home directory. The
-    # dedicated inventory test re-enables it against a controlled fake home.
+    # The pre-run inventory scans Path.home(); unit runs must not depend on the real
+    # home. The inventory tests re-enable it against a fake home.
     monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "0")
 
 
@@ -82,9 +74,8 @@ def test_drain_scenario_stamps_timed_out_when_thread_still_alive(
     """A scenario thread that outlives the join budget is flagged on the report."""
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
 
-    # Drive the join budget to ~0 so the thread is "still alive" on return
-    # without sleeping in the test. The harness reads the module global at
-    # call time, so patching the attribute on the module flexes the path.
+    # Drive the join budget to ~0 so the thread is still alive on return without
+    # sleeping; the harness reads the module global at call time.
     monkeypatch.setattr(harness_default, "_SCENARIO_JOIN_SEC", 0.01)
 
     class _StuckScenario:
@@ -128,13 +119,7 @@ def test_drain_scenario_returns_empty_when_no_scenario_scheduled(
 def test_default_target_deployment_and_namespace_are_ctor_args(
     isolated_env: None,
 ) -> None:
-    """A non-Hypercompute embedder can override the legacy defaults at ctor.
-
-    No env vars set; the harness's overrides flow through to
-    ``replace_placeholders`` so a task with
-    ``{{TARGET_DEPLOYMENT_NAME}}``/``{{NAMESPACE}}`` resolves to the
-    embedder's values rather than the legacy literals.
-    """
+    """Constructor overrides flow through ``replace_placeholders`` instead of the defaults."""
     harness = DefaultEvalHarness(
         project_id="p",
         cluster_name="c",
@@ -149,12 +134,8 @@ def test_default_target_deployment_and_namespace_are_ctor_args(
 
 
 def test_success_record_carries_substituted_safety_checklists(isolated_env: None) -> None:
-    """Safety checklists get the same placeholder substitution as expected_output.
-
-    The judge reads these strings verbatim, so an unresolved
-    ``{{TARGET_DEPLOYMENT_NAME}}`` would be graded as literal text and the
-    constraint would never match what the agent actually did.
-    """
+    """Safety checklists get the same placeholder substitution as expected_output; the
+    judge reads them verbatim."""
     harness = DefaultEvalHarness(
         project_id="p",
         cluster_name="c",
@@ -200,12 +181,7 @@ def test_success_record_falls_back_to_raw_safety_checklists(isolated_env: None) 
 
 
 def test_failed_record_carries_substituted_safety_checklists(isolated_env: None) -> None:
-    """A run that dies mid-execution still records resolved checklists.
-
-    The checklists are substituted before the agent runs, so a failure carries
-    the same resolved strings a success would rather than raw ``{{...}}`` text
-    landing in results.json.
-    """
+    """A run that dies mid-execution still records resolved checklists, not raw ``{{...}}``."""
     harness = DefaultEvalHarness(
         project_id="p",
         cluster_name="c",
@@ -243,12 +219,8 @@ def test_failed_record_falls_back_to_raw_safety_checklists(isolated_env: None) -
 def test_granted_skill_paths_snapshot_captured_once(
     isolated_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``_granted_skill_paths`` snapshots once at __init__, not per record.
-
-    Removes the env-drift surface: a mid-run change to
-    ``AGENT_SKILLS_PATHS`` must NOT show up in record records, because
-    the harness is the single source of truth for what was granted.
-    """
+    """``_granted_skill_paths`` snapshots once at __init__; a mid-run env change must not
+    show up in records."""
     monkeypatch.setenv("AGENT_SKILLS_PATHS", "/skills/a,/skills/b")
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
     assert harness._granted_skill_paths == ("/skills/a", "/skills/b")  # noqa: SLF001
@@ -262,14 +234,8 @@ def test_granted_skill_paths_snapshot_captured_once(
 def test_build_agent_config_returns_identical_snapshot_across_calls(
     isolated_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``build_agent_config`` is a pure accessor over the __init__ snapshot.
-
-    Two back-to-back calls must return the **same object identity** so the
-    agent the harness constructs cannot differ from the config the
-    record's ``capabilities_granted`` was derived from. A previous version
-    re-read ``AgentConfig.from_env()`` per call, opening a desync window
-    that mid-batch env mutation could exploit.
-    """
+    """``build_agent_config`` returns the same __init__ snapshot object on every call, so
+    the agent and ``capabilities_granted`` cannot desync."""
     monkeypatch.setenv("AGENT_SKILLS_PATHS", "/skills/a")
     monkeypatch.setenv("BENCH_USE_MCP", "true")
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
@@ -284,13 +250,8 @@ def test_build_agent_config_returns_identical_snapshot_across_calls(
 def test_capabilities_granted_matches_agent_config_even_after_env_mutation(
     isolated_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``capabilities_granted`` exactly mirrors the agent's actual config.
-
-    This is the consistency invariant the senior reviewer flagged: env
-    mutated AFTER ``DefaultEvalHarness(...)`` construction must not desync
-    what the agent was built with from what the record claims it was
-    built with. Both come from the single ``__init__`` snapshot.
-    """
+    """``capabilities_granted`` mirrors the agent's actual config even when the env is
+    mutated after construction; both come from the __init__ snapshot."""
     monkeypatch.setenv("AGENT_SKILLS_PATHS", "/skills/granted")
     monkeypatch.setenv("AGENT_MCP_SERVER", "/path/to/mcp")
     monkeypatch.setenv("AGENT_ALLOWED_TOOLS", "tool_a")
@@ -317,9 +278,8 @@ def test_capabilities_granted_matches_agent_config_even_after_env_mutation(
         task, RuntimeError("boom")
     )
 
-    # The record's ``skills`` and ``capabilities_granted.skills`` come
-    # from the same snapshot the agent was built from. The post-init env
-    # mutation must NOT leak through.
+    # Both come from the snapshot the agent was built from; the post-init mutation
+    # must not leak through.
     expected_skills = list(config.capabilities.skills.paths)
     assert expected_skills == ["/skills/granted"]
     for record in (success, failed):
@@ -336,12 +296,8 @@ def test_capabilities_granted_matches_agent_config_even_after_env_mutation(
 def test_run_one_returns_failed_record_when_get_deployer_raises(
     isolated_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A deployer-factory failure becomes a failed record, not a batch crash.
-
-    ``get_deployer`` runs inside ``_run_one``'s try, so an unknown deployer
-    type fails just this task (status ``failed``) instead of aborting the whole
-    batch evaluation.
-    """
+    """A deployer-factory failure fails just this task (``get_deployer`` runs inside
+    ``_run_one``'s try), not the whole batch."""
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
 
     def _boom(*_args: Any, **_kwargs: Any) -> Any:
@@ -369,14 +325,8 @@ class _WorkspaceWritingAgent(AgentHarness):
 def test_run_one_collects_files_the_agent_writes_to_its_workspace(
     isolated_env: None, tmp_path: Path
 ) -> None:
-    """Generated-file collection diffs the agent's real workspace, not the launch cwd.
-
-    Regression test: the harness used to snapshot/diff ``Path(os.getcwd())`` while
-    each CLI agent wrote into its own private ``tempfile.TemporaryDirectory`` that
-    was gone by the time artifacts were collected, so ``generated_files`` came back
-    empty. The harness now owns a per-run workspace and threads it to the agent via
-    ``RunContext.workspace_path``, so a file the agent writes there is collected.
-    """
+    """Generated-file collection diffs the harness-owned per-run workspace the agent
+    writes to (``RunContext.workspace_path``), not the launch cwd."""
     AGENTS.register("fake-workspace-writer")(_WorkspaceWritingAgent)
     try:
         harness = DefaultEvalHarness(
@@ -414,9 +364,8 @@ class _HomeWritingAgent(AgentHarness):
 def test_run_one_collects_home_deliverables_but_not_agent_state(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Sandboxed: ~ deliverables land in generated_files, but dot-entries
-    (agent runtime state, the folder-trust seed) do not — a collected home
-    .gemini would collide with the workspace's own .gemini copy."""
+    """Sandboxed: ~ deliverables land in generated_files, dot-entries (runtime state, the
+    folder-trust seed) do not, so a home .gemini cannot collide with the workspace copy."""
     AGENTS.register("fake-home-writer")(_HomeWritingAgent)
     try:
         harness = _sandboxed_harness(
@@ -465,12 +414,7 @@ def test_run_one_ambient_home_writes_are_collected_once(isolated_env: None, tmp_
 def test_run_one_warns_when_a_verification_entry_fails_to_parse(
     isolated_env: None, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A typo'd verification entry logs a warning instead of vanishing silently.
-
-    Regression test: parse errors used to be recorded on the record but never
-    logged, so a task whose objective count silently dropped left no trace
-    anywhere except a key buried in results.json.
-    """
+    """A malformed verification entry logs a warning as well as landing on the record."""
     AGENTS.register("fake-workspace-writer-parse-warn")(_WorkspaceWritingAgent)
     try:
         harness = DefaultEvalHarness(
@@ -518,22 +462,14 @@ def test_run_one_warns_when_a_verification_entry_fails_to_parse(
 def test_run_one_evaluates_verification_on_the_exception_path_when_infra_is_up(
     isolated_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A failed record still carries a real verification report once infra is up.
-
-    The exception path used to skip verification unconditionally. Now that
-    ``infra_up`` and ``entries`` are tracked, a crash after provisioning still
-    runs verification, so a failed record is scored instead of silently
-    dropping every objective.
-    """
+    """A crash after provisioning still runs verification, so the failed record is scored."""
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
 
-    def _boom(prompt: str, ctx: Any) -> Any:
+    def _boom(prompt: str, ctx: Any, **_kwargs: Any) -> Any:
         raise RuntimeError("agent crashed")
 
-    # ``execute_agent`` is patched directly, not the agent itself: AgentHarness.run()
-    # has its own safety net that converts an agent crash into an errored
-    # AgentResult rather than raising, which would never reach _run_one's
-    # exception path.
+    # ``execute_agent`` is patched directly: AgentHarness.run()'s safety net would turn
+    # an agent crash into an errored result and never reach _run_one's exception path.
     monkeypatch.setattr(harness, "execute_agent", _boom)
     canned_report = [{"name": "web-ready", "success": True, "status": "pass"}]
     monkeypatch.setattr(harness, "_run_verification", lambda entries, **kwargs: canned_report)
@@ -556,6 +492,7 @@ def test_run_one_evaluates_verification_on_the_exception_path_when_infra_is_up(
     record, _ = harness._run_one(task, tmp_path)  # noqa: SLF001
 
     assert record["status"] == "failed"
+    assert "agent crashed" in (record["error"] or "")  # the double's error, not a TypeError
     assert record["verification_report"] == canned_report
     assert record["verification_status"] == "evaluated"
 
@@ -563,15 +500,10 @@ def test_run_one_evaluates_verification_on_the_exception_path_when_infra_is_up(
 def test_run_one_reports_evaluated_on_the_exception_path_with_no_entries_declared(
     isolated_env: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """No entries declared but infra came up: still reads as "evaluated", not "not_evaluated".
-
-    A task with no verification_spec has nothing to verify, not a broken
-    environment. The exception path must record the same status the success
-    path would for the same case: verification ran trivially over nothing.
-    """
+    """No entries declared but infra up reads as "evaluated", the same as the success path."""
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
 
-    def _boom(prompt: str, ctx: Any) -> Any:
+    def _boom(prompt: str, ctx: Any, **_kwargs: Any) -> Any:
         raise RuntimeError("agent crashed")
 
     monkeypatch.setattr(harness, "execute_agent", _boom)
@@ -587,6 +519,7 @@ def test_run_one_reports_evaluated_on_the_exception_path_with_no_entries_declare
     record, _ = harness._run_one(task, tmp_path)  # noqa: SLF001
 
     assert record["status"] == "failed"
+    assert "agent crashed" in (record["error"] or "")  # the double's error, not a TypeError
     assert record["verification_report"] == []
     assert record["verification_status"] == "evaluated"
 
@@ -637,13 +570,8 @@ def test_run_one_skips_verification_entirely_under_no_infra(
 def test_ensure_builtin_agents_swallows_only_import_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Optional-SDK absence is swallowed; real bugs re-raise.
-
-    ``ImportError`` / ``MissingDependencyError`` are the narrow-catch
-    classes — anything else (``SyntaxError``, ``RuntimeError`` at module
-    top, etc.) must bubble out so the operator sees the real failure
-    instead of a silent ``debug`` log.
-    """
+    """``ImportError`` / ``MissingDependencyError`` are swallowed; anything else bubbles out
+    so the operator sees the real failure."""
 
     # Case 1: ImportError is swallowed — function returns normally.
     def fake_import_missing_sdk(name: str) -> Any:
@@ -743,9 +671,8 @@ def test_resolve_deployment_and_namespace_precedence_and_types(
 
 # --- results.json schema (Decision D3) ---
 
-# Pinned symmetric key set. Every key must be present on *both* the success and
-# failed record, so a downstream parser iterating one shape never KeyErrors on
-# the other.
+# Pinned symmetric key set: every key is present on both record shapes so a parser
+# iterating one never KeyErrors on the other.
 _RESULTS_JSON_REQUIRED_KEYS: frozenset[str] = frozenset(
     {
         "input",
@@ -840,11 +767,8 @@ def test_success_record_keys_match_golden(isolated_env: None) -> None:
 
 
 def test_records_snapshot_the_task_display_metadata(isolated_env: None) -> None:
-    """Both record shapes carry the task's display metadata verbatim.
-
-    Snapshotting it on the record is what lets a row render with the titles
-    that were true when it ran, without joining back to the task file.
-    """
+    """Both record shapes carry the task's display metadata verbatim, so a row renders
+    without joining back to the task file."""
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
     task = Task.from_dict(
         {
@@ -958,16 +882,8 @@ def _run_with_fake_agent(tmp_path: Path, agent_key: str) -> dict[str, Any]:
 def test_run_flags_sensitive_access_and_gates_it_without_a_judge(
     isolated_env: None, tmp_path: Path
 ) -> None:
-    """A task.yaml read in the trajectory is flagged, then gated to zero.
-
-    End to end through ``run()``, with no judge configured — ``get_judge_model()``
-    raises in this environment, which is the point. The integrity gate is
-    deterministic, so an unrelated judge outage must not be able to unscore it:
-    before the fallback in ``_score``, that exception aborted the whole batch and
-    a cheating run kept a null ``outcomeScore``, dropping out of leaderboard
-    aggregates entirely. ``validated`` stays untouched either way — the gate
-    publishes a zero, it does not invalidate the row.
-    """
+    """A task.yaml read is flagged and gated to zero through ``run()`` with no judge
+    configured: the deterministic gate survives a judge outage and leaves ``validated`` alone."""
     record = _run_with_fake_agent(tmp_path, "fake-sensitive-reader")
 
     report = record["cheating_report"]
@@ -1153,11 +1069,8 @@ def _sandboxed_harness(
 def test_run_fails_fast_on_an_unmigrated_agent_when_sandboxed(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One loud refusal at batch start, not a provisioned cluster per task
-    that each dies with the per-task SandboxError (which stays as depth).
-
-    Uses a purpose-built unmigrated fake rather than a real harness: which
-    builtins are migrated changes as the stack lands them."""
+    """One loud refusal at batch start, not a provisioned cluster per task; uses a
+    purpose-built unmigrated fake since the migrated set changes."""
     from devops_bench.core import SandboxError
 
     class _UnmigratedAgent(AgentHarness):
@@ -1167,10 +1080,37 @@ def test_run_fails_fast_on_an_unmigrated_agent_when_sandboxed(
     AGENTS.register("fake-unmigrated")(_UnmigratedAgent)
     try:
         harness = _sandboxed_harness(monkeypatch, tmp_path, agent_type="fake-unmigrated")
+        task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
         with pytest.raises(SandboxError, match="not been migrated"):
-            harness.run([])
+            harness.run([task])
     finally:
         AGENTS._items.pop("fake-unmigrated", None)  # noqa: SLF001
+
+
+def test_exempt_only_batch_skips_the_sandbox_preflight(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A batch of only requires_unsandboxed tasks runs ambient, so an agent without
+    sandbox support must not be refused for it."""
+    monkeypatch.setattr(harness_default.agent_sandbox, "sweep_stray_containers", lambda **kw: None)
+
+    class _UnmigratedAgent(AgentHarness):
+        def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
+            return AgentResult(output="done", trajectory=[])
+
+    AGENTS.register("fake-unmigrated-exempt")(_UnmigratedAgent)
+    try:
+        harness = _sandboxed_harness(
+            monkeypatch, tmp_path, agent_type="fake-unmigrated-exempt", no_infra=True
+        )
+        task = Task.from_dict(
+            {"task_id": "t", "name": "demo", "prompt": "p", "requires_unsandboxed": True}
+        )
+        results = harness.run([task])
+    finally:
+        AGENTS._items.pop("fake-unmigrated-exempt", None)  # noqa: SLF001
+    assert len(results) == 1
+    assert results[0]["status"] != "failed"
 
 
 def test_agent_config_snapshot_carries_the_sandbox_opt_in(
@@ -1270,9 +1210,8 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
 def test_prepare_sandbox_spec_without_a_cluster_skips_the_plan_and_credential(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """no_infra / noop deployer: no network plan is built (a stale kind
-    context matching the configured name must not leak its admin cert) and
-    the mounted kubeconfig is a credential-free stub."""
+    """no_infra / noop deployer: no network plan (a stale context matching the configured
+    name must not leak its admin cert) and a credential-free stub kubeconfig."""
     from devops_bench.core import ClusterInfo
 
     harness = _sandboxed_harness(monkeypatch, tmp_path)
@@ -1322,9 +1261,8 @@ def test_build_agent_config_overlays_an_explicit_sandbox_spec(
 def test_inventory_sandbox_home_records_rules_per_task(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The sandbox home replaces the operator home as the inventory root:
-    a leftover seeded there is flagged, and a fresh home yields the empty
-    ruleset (correct by construction, not a skipped scan)."""
+    """The sandbox home replaces the operator home as the inventory root: a leftover there
+    is flagged, a fresh home yields the empty ruleset."""
     monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "1")
     harness = _sandboxed_harness(monkeypatch, tmp_path)
 
@@ -1341,9 +1279,8 @@ def test_inventory_sandbox_home_records_rules_per_task(
 def test_inventory_covers_fixture_mounts_at_their_container_paths(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Fixture mounts only materialize inside the container, so the host-side
-    home scan cannot see them; each mounted name must get a container-path
-    rule, and the prompt filter must drop exactly the ones the task names."""
+    """Fixture mounts only exist inside the container, so each mounted name gets a
+    container-path rule and the prompt filter drops exactly the named ones."""
     import re
 
     from devops_bench.cheat_detection import filter_rules_for_prompt
@@ -1373,40 +1310,29 @@ def test_inventory_covers_fixture_mounts_at_their_container_paths(
     assert {r.source for r in surviving} == {"stale-notes-c1.md"}
 
 
-def test_stray_container_sweep_is_skipped_under_parallel(
-    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("parallel", [True, False])
+def test_stray_container_sweep_is_told_about_parallel(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, parallel: bool
 ) -> None:
-    """The sweep matches on the shared name prefix and cannot tell a stray
-    from a sibling harness's live container, so BENCH_PARALLEL must skip it."""
-    monkeypatch.setenv("BENCH_PARALLEL", "1")
+    """The sweep runs once per batch and is handed BENCH_PARALLEL to apply itself."""
+    if parallel:
+        monkeypatch.setenv("BENCH_PARALLEL", "1")
+    else:
+        monkeypatch.delenv("BENCH_PARALLEL", raising=False)
     harness = _sandboxed_harness(monkeypatch, tmp_path)
     swept: list[bool] = []
     monkeypatch.setattr(
-        harness_default.agent_sandbox, "sweep_stray_containers", lambda: swept.append(True)
+        harness_default.agent_sandbox,
+        "sweep_stray_containers",
+        lambda *, owner, parallel: swept.append(parallel),
     )
     harness.run([])
-    assert swept == []
-
-
-def test_stray_container_sweep_runs_when_not_parallel(
-    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv("BENCH_PARALLEL", raising=False)
-    harness = _sandboxed_harness(monkeypatch, tmp_path)
-    swept: list[bool] = []
-    monkeypatch.setattr(
-        harness_default.agent_sandbox, "sweep_stray_containers", lambda: swept.append(True)
-    )
-    harness.run([])
-    assert swept == [True]
+    assert swept == [parallel]
 
 
 class _BatchContaminatingAgent(AgentHarness):
-    """Task 1 leaves a deliverable in the home; task 2 reads it back.
-
-    Class-level state because the registry constructs its own instance per
-    task, and the point of the test is what carries *between* those tasks.
-    """
+    """Task 1 leaves a deliverable in the home; task 2 reads it back. Class-level state
+    because the registry constructs one instance per task."""
 
     home: Path
     calls: int = 0
@@ -1434,12 +1360,8 @@ class _BatchContaminatingAgent(AgentHarness):
 def test_inventory_is_resnapshotted_between_tasks(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Task 1's deliverable is an answer key for task 2, and must be covered.
-
-    A single run-start snapshot cannot see it — the file does not exist yet
-    when the batch begins — so this pins that the home is re-inventoried
-    before each task rather than once per invocation.
-    """
+    """Task 1's deliverable is an answer key for task 2, so the home is re-inventoried
+    before each task rather than once per batch."""
     fake_home = tmp_path / "home"
     fake_home.mkdir()
     monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
@@ -1474,13 +1396,8 @@ def test_inventory_is_resnapshotted_between_tasks(
 
 
 class _CollidingDeliverableAgent(AgentHarness):
-    """Call 1 writes a deliverable; call 2 reads its content back.
-
-    The read returns the file's lines in ``result``, so only a content
-    fingerprint can catch it when the second task's prompt names the entry
-    and the path rule is therefore dropped. Class-level state because the
-    registry constructs its own instance per task.
-    """
+    """Call 1 writes a deliverable; call 2 reads its content back, which only a content
+    fingerprint catches once the prompt names the entry; class-level state as above."""
 
     home: Path
     calls: int = 0
@@ -1540,12 +1457,8 @@ def _run_colliding_batch(
 def test_prompt_named_mid_batch_entry_is_caught_by_content_fingerprint(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A different task reading task 1's deliverable flags on content alone.
-
-    The reader's prompt names the entry, so its path rule is dropped — the
-    fingerprint built from task 1's file is the only remaining coverage, and
-    it must exist for a *differently named* task.
-    """
+    """A different task reading task 1's deliverable flags on content alone: its prompt
+    names the entry, so only the fingerprint remains."""
     results = _run_colliding_batch(tmp_path, monkeypatch, second_task_name="reader")
 
     assert results[0]["cheating_report"]["status"] == "clean"
@@ -1559,14 +1472,99 @@ def test_prompt_named_mid_batch_entry_is_caught_by_content_fingerprint(
 def test_same_task_repeat_is_not_fingerprinted(
     isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An honest repeat of the same task must not flag on shared wording.
-
-    Fingerprints are unfilterable, so fingerprinting task 1's report would
-    flag a later iteration of the *same* task that merely reproduced its own
-    deliverable's lines. Identical batch to the test above except the second
-    task's name — that one difference is the whole exemption.
-    """
+    """An honest repeat of the same task must not flag on shared wording; the only
+    difference from the test above is the second task's name."""
     results = _run_colliding_batch(tmp_path, monkeypatch, second_task_name="writer")
 
     assert results[0]["cheating_report"]["status"] == "clean"
     assert results[1]["cheating_report"]["status"] == "clean"
+
+
+# --- requires_unsandboxed: a task the boundary would make impossible ---------
+
+
+def test_sandbox_exempt_task_gets_a_config_with_no_sandbox(isolated_env: None) -> None:
+    """The field is cleared, not merely left skeletal: the agent's gate reads it."""
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c")
+    from dataclasses import replace as _replace
+
+    harness._agent_config = _replace(  # noqa: SLF001
+        harness._agent_config,  # noqa: SLF001
+        sandbox=harness_default.agent_sandbox.SandboxSpec(image="img"),
+    )
+
+    assert harness.build_agent_config(sandbox_exempt=True).sandbox is None
+    assert harness.build_agent_config().sandbox is not None
+
+
+def test_sandbox_exempt_task_gets_the_ambient_inventory(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exempt task runs against the real home, so it needs the ambient inventory."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    (fake_home / "old-notes.txt").write_text("leftover from a previous run\n", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+    monkeypatch.setenv("BENCH_CHEAT_INVENTORY", "1")
+    monkeypatch.delenv("BENCH_PARALLEL", raising=False)
+    monkeypatch.setattr(harness_default.agent_sandbox, "sweep_stray_containers", lambda **kw: None)
+
+    class _SandboxAwareLeftoverReader(_LeftoverReadingAgent):
+        supports_sandbox = True
+
+    AGENTS.register("fake-exempt-reader")(_SandboxAwareLeftoverReader)
+    try:
+        harness = _sandboxed_harness(
+            monkeypatch, tmp_path, agent_type="fake-exempt-reader", no_infra=True
+        )
+        task = Task.from_dict(
+            {"task_id": "t", "name": "demo", "prompt": "p", "requires_unsandboxed": True}
+        )
+        results = harness.run([task])
+    finally:
+        AGENTS._items.pop("fake-exempt-reader", None)  # noqa: SLF001
+
+    report = results[0]["cheating_report"]
+    assert report["status"] == "flagged"
+    assert "prior-run-artifact" in report["categories"]
+
+
+def test_build_agent_config_rejects_a_spec_together_with_exempt(isolated_env: None) -> None:
+    harness = DefaultEvalHarness(project_id="p", cluster_name="c")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        harness.build_agent_config(
+            harness_default.agent_sandbox.SandboxSpec(image="img"), sandbox_exempt=True
+        )
+
+
+def test_secret_rotation_declares_requires_unsandboxed() -> None:
+    """Checked through the real loader: ``Task`` drops unknown keys silently, so a
+    raw-YAML assertion alone would stay green while the harness saw ``False``."""
+    import pathlib
+
+    import yaml as _yaml
+
+    from devops_bench.tasks.loader import FileSystemTaskLoader
+
+    tasks = FileSystemTaskLoader().load_tasks("tasks/gcp/secret-rotation/task.yaml")
+    assert len(tasks) == 1
+    assert tasks[0].requires_unsandboxed is True
+
+    spec = _yaml.safe_load(
+        pathlib.Path("tasks/gcp/secret-rotation/task.yaml").read_text(encoding="utf-8")
+    )
+    assert spec.get("requires_unsandboxed") is True
+
+
+def test_no_other_task_opts_out_of_the_sandbox() -> None:
+    """Exactly one exemption; a second would need its own justification."""
+    import pathlib
+
+    import yaml as _yaml
+
+    exempt = [
+        p.parent.name
+        for p in sorted(pathlib.Path("tasks").glob("*/*/task.yaml"))
+        if (_yaml.safe_load(p.read_text(encoding="utf-8")) or {}).get("requires_unsandboxed")
+    ]
+    assert exempt == ["secret-rotation"]

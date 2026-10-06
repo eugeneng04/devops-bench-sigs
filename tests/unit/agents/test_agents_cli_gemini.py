@@ -218,8 +218,8 @@ def test_build_env_keyless_writes_no_key_var(monkeypatch: pytest.MonkeyPatch) ->
 def test_build_env_vertex_accepts_the_gcp_project_and_location_spellings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The GCP_* spellings are what the antigravity harness and the bastion
-    # matrix export, so a host configured for one agent works for the other.
+    # The GCP_* spellings are shared with the antigravity harness, so a host
+    # configured for one agent works for the other.
     monkeypatch.setenv("GCP_PROJECT", "proj-a")
     monkeypatch.setenv("GCP_VERTEX_LOCATION", "europe-west4")
     env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
@@ -230,10 +230,8 @@ def test_build_env_vertex_accepts_the_gcp_project_and_location_spellings(
 def test_build_env_vertex_ignores_the_deployers_cluster_zone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # GCP_LOCATION belongs to the deployers and holds a cluster *zone*;
-    # scripts/bastion/vm-setup.sh exports us-central1-a into the bastion
-    # profile. Routing model traffic there would hit an endpoint that does not
-    # exist, so it must not be read at all — fall through to the default.
+    # GCP_LOCATION is the deployers' cluster zone, not a model endpoint; routing
+    # must never read it and falls through to the default.
     monkeypatch.setenv("GCP_PROJECT_ID", "proj-a")
     monkeypatch.setenv("GCP_LOCATION", "us-central1-a")
     env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
@@ -264,18 +262,16 @@ def test_build_env_vertex_reads_the_repo_wide_project_spelling(
 def test_build_env_vertex_defaults_the_location_to_global(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # No location anywhere: "global", not a region — the -preview model ids
-    # this benchmark runs are only published on the global endpoint and 404
-    # from a regional one (docs/appendix/known_issues.md).
+    # No location anywhere resolves to "global": the -preview ids are only published
+    # on the global endpoint (docs/appendix/known_issues.md).
     monkeypatch.setenv("GCP_PROJECT_ID", "proj-a")
     env = _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
     assert env["GOOGLE_CLOUD_LOCATION"] == "global"
 
 
 def test_build_env_vertex_without_a_project_fails_early() -> None:
-    # gemini-cli rejects GOOGLE_GENAI_USE_VERTEXAI=true without
-    # GOOGLE_CLOUD_PROJECT (or an express-mode GOOGLE_API_KEY), so the run
-    # could never start; fail at config time naming the variables we read.
+    # gemini-cli rejects GOOGLE_GENAI_USE_VERTEXAI=true without a project (or an
+    # express-mode GOOGLE_API_KEY); fail at config time naming the variables read.
     with pytest.raises(ConfigError, match="GCP_PROJECT_ID"):
         _build_env(AgentConfig(model="gemini-2.5-pro", provider="google-vertex"))
 
@@ -294,11 +290,8 @@ def test_build_env_vertex_express_mode_needs_no_project(
 def test_build_env_non_vertex_pins_the_vertex_switch_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The overlay rides on the inherited environment, so merely omitting the
-    # routing vars cannot shield a Gemini-API run from an operator shell that
-    # exports GOOGLE_GENAI_USE_VERTEXAI=true. The switch must be pinned "false"
-    # (an overlay value beats the ambient one); project/location stay out of
-    # the overlay — without the switch the SDK does not read them for routing.
+    # The overlay rides on the inherited env, so the switch must be pinned "false" to
+    # beat an ambient GOOGLE_GENAI_USE_VERTEXAI=true; project/location stay out.
     monkeypatch.setenv("GOOGLE_GENAI_USE_VERTEXAI", "true")
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-a")
     env = _build_env(AgentConfig(model="gemini-2.5-pro", api_key="abc"))
@@ -435,6 +428,22 @@ def test_execute_returns_typed_result_with_trajectory(monkeypatch: pytest.Monkey
     assert captured["argv"][-2:] == ["-p", "ping"]
 
 
+def test_execute_sandboxed_uses_the_in_image_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sandboxed, argv[0] is the image's gemini even when AGENT_TARGET is a host path."""
+    captured: dict = {}
+
+    def fake_cmd(self: GeminiCliAgent, argv: list[str], **kwargs: object) -> SimpleNamespace:
+        captured["argv"] = argv
+        return SimpleNamespace(stdout=SAMPLE_STREAM, stderr="", returncode=0)
+
+    monkeypatch.setattr(GeminiCliAgent, "run_agent_cmd", fake_cmd)
+    agent = GeminiCliAgent(
+        AgentConfig(target="/opt/host/bin/gemini", sandbox=SandboxSpec(image="img"))
+    )
+    agent.run("ping")
+    assert captured["argv"][0] == "gemini"
+
+
 def test_execute_records_non_zero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(argv, **kwargs):
         return SimpleNamespace(stdout="", stderr="boom", returncode=2)
@@ -531,11 +540,8 @@ def test_parse_stream_json_accepts_args_field_when_input_absent() -> None:
 
 
 def test_parse_stream_json_real_cli_schema() -> None:
-    """The live Gemini CLI schema: ``tool_name``/``tool_id``/``parameters`` on
-    tool_use, the answer streamed across ``message`` (role=assistant) events,
-    and token usage under ``result.stats`` — none of which the legacy field
-    names cover. Captured from gemini-cli 0.47 + gke-mcp 0.13.
-    """
+    """The current Gemini CLI schema: ``tool_name``/``tool_id``/``parameters`` on tool_use,
+    the answer across ``message`` events, token usage under ``result.stats``."""
     blob = _stream(
         {"type": "init", "session_id": "s1", "model": "gemini-3.1-pro-preview"},
         {"type": "message", "role": "user", "content": "list files"},
@@ -633,15 +639,12 @@ def test_legacy_session_glob_is_gone() -> None:
     assert not hasattr(gemini_mod, "extract_trajectory_from_session")
 
 
-# ---------------------------------------------------------------------------
-# PR3 — capability negotiation and binding consumption
-# ---------------------------------------------------------------------------
+# Capability negotiation and binding consumption.
 
 
 def test_gemini_agent_satisfies_mcp_skills_and_rules_protocols() -> None:
-    """Gemini declares MCP, Skills and Rules: it writes ``mcpServers`` into a
-    workspace ``settings.json``, materializes workspace skills under
-    ``.gemini/skills``, and auto-loads ``GEMINI.md``."""
+    """Gemini declares MCP, Skills and Rules: ``mcpServers`` in a workspace settings.json,
+    skills under ``.gemini/skills``, ``GEMINI.md`` auto-loaded."""
     agent = GeminiCliAgent(AgentConfig())
     assert isinstance(agent, SupportsMcp)
     assert isinstance(agent, SupportsSkills)
@@ -698,23 +701,14 @@ def test_gemini_agent_mirrors_capability_bindings_onto_mixin_attributes() -> Non
     assert agent.rules == AgentRules(text="be a sre")
 
 
-# ---------------------------------------------------------------------------
-# Rules delivery: GEMINI.md actually reaches the binary's working directory.
-# ---------------------------------------------------------------------------
+# Rules delivery: GEMINI.md reaches the binary's working directory.
 
 
 def test_execute_writes_gemini_md_with_rules_text_before_subprocess(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When rules.text is bound, GEMINI.md exists with that text in the cwd
-    handed to the subprocess — at the *moment* `run` is called.
-
-    Snapshotting inside the fake `run` is load-bearing: the agent uses a
-    `TemporaryDirectory` context manager whose cleanup runs after `_execute`
-    returns, so a post-hoc filesystem check on the cwd would race with
-    cleanup. Reading the file from inside `run` proves the binary would see
-    it on startup, which is what the CLI's auto-load relies on.
-    """
+    """GEMINI.md holds the rules text in the cwd at the moment ``run`` is called; the
+    snapshot happens inside the fake because the temp cwd is cleaned up after ``_execute``."""
     captured: dict = {}
 
     def fake_run(argv, **kwargs):
@@ -771,17 +765,14 @@ def test_execute_cleans_up_temp_working_dir_after_run(monkeypatch: pytest.Monkey
     assert not os.path.exists(captured["cwd"])
 
 
-# ---------------------------------------------------------------------------
 # MCP server wiring: settings.json mcpServers reach the binary's cwd.
-# ---------------------------------------------------------------------------
 
 
 def test_execute_seeds_container_home_folder_trust_when_sandboxed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The container HOME is fresh, so the user-level folder-trust disable the
-    bastion relies on does not exist there — without seeding it a sandboxed
-    MCP arm silently runs without MCP while still recording MCP as granted."""
+    """The container HOME is fresh, so the folder-trust seed must be written or a sandboxed
+    MCP arm silently runs without MCP while recording it as granted."""
     import json as _json
 
     from devops_bench.agents.capabilities import AllCapabilities, McpBinding
@@ -806,9 +797,8 @@ def test_execute_seeds_container_home_folder_trust_when_sandboxed(
 def test_execute_seeds_folder_trust_even_without_mcp_or_skills(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A baseline or rules-only sandboxed arm needs the seed too: untrusted,
-    the CLI also drops GEMINI.md and downgrades --approval-mode, not just
-    the workspace MCP settings."""
+    """A baseline or rules-only sandboxed arm needs the seed too: untrusted, the CLI drops
+    GEMINI.md and downgrades --approval-mode."""
     from devops_bench.agents.sandbox import SandboxSpec
 
     agent = GeminiCliAgent(AgentConfig(target="gemini", sandbox=SandboxSpec(image="img")))
@@ -835,17 +825,6 @@ def test_execute_does_not_seed_folder_trust_when_unsandboxed(
     )
     agent._execute("p", workspace_path=tmp_path)  # noqa: SLF001
     assert not (tmp_path / "home" / ".gemini").exists()
-
-
-def test_execute_refuses_a_host_home_target_when_sandboxed(tmp_path: Path) -> None:
-    """expanduser resolves ~ against the HOST home; the resulting path cannot
-    exist in the image, so refuse loudly instead of a confusing exec failure."""
-    from devops_bench.agents.sandbox import SandboxSpec
-    from devops_bench.core import SandboxError
-
-    agent = GeminiCliAgent(AgentConfig(target="~/bin/gemini", sandbox=SandboxSpec(image="img")))
-    with pytest.raises(SandboxError, match="host home"):
-        agent._execute("p", workspace_path=tmp_path)  # noqa: SLF001
 
 
 def test_build_settings_combines_mcp_servers_and_skills_flag() -> None:
@@ -951,14 +930,8 @@ def test_execute_warns_and_skips_missing_skill_paths(monkeypatch: pytest.MonkeyP
     assert captured["exists"] is False
 
 
-# ---------------------------------------------------------------------------
-# Parallel isolation: each run gets its own throwaway cwd, never a shared one.
-# This is what makes concurrent gemini runs safe on a single host — the binary
-# reads/writes its workspace `.gemini` from cwd, so two runs sharing a cwd would
-# clobber each other's settings/skills. The refactored arm also parses the
-# trajectory from stdout (see parse_stream_json tests), so it never touches the
-# shared `~/.gemini/tmp/.../chats` dir the legacy arm relies on.
-# ---------------------------------------------------------------------------
+# Parallel isolation: each run gets its own throwaway cwd, since the binary reads and
+# writes its workspace .gemini from cwd and the trajectory is parsed from stdout.
 
 
 def test_execute_runs_in_isolated_temp_cwd_not_user_home(monkeypatch: pytest.MonkeyPatch) -> None:

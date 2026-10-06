@@ -12,14 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for :mod:`devops_bench.evalharness.hold`.
-
-Fake leaves stand in for real cluster I/O so these tests run fast and never
-touch kubectl. ``_FlipThenRestore`` is the ``_Countdown``-shaped test double
-from ``tests/unit/verification/test_combinators.py``, adapted to the exact
-shape of the motivating bug: fails once, mid-run, then recovers before the
-run ends.
-"""
+"""Unit tests for :mod:`devops_bench.evalharness.hold`; fake leaves stand in for cluster I/O."""
 
 from __future__ import annotations
 
@@ -62,12 +55,8 @@ class _AlwaysPass(BaseVerifier):
 
 @VERIFIERS.register("sg_flip")
 class _FlipThenRestore(BaseVerifier):
-    """Fails on sample number ``fail_at`` only, holds on every other sample.
-
-    Models a safeguard that is violated mid-run and
-    restored before the run ends, so a check that only samples at the end
-    never sees it.
-    """
+    """Fails on sample ``fail_at`` only: a safeguard violated mid-run and restored before
+    the end, which an end-only check never sees."""
 
     type: Literal["sg_flip"] = "sg_flip"
     fail_at: int = 2
@@ -259,10 +248,10 @@ def test_mode_hold_parses_like_any_other_mode() -> None:
 def test_run_one_stops_and_joins_the_safeguard_monitor_when_the_agent_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Regression: an agent exception must not leak the monitor's background thread."""
+    """An agent exception must not leak the monitor's background thread."""
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
 
-    def _boom(prompt: str, ctx: Any, sandbox_spec: Any = None) -> Any:
+    def _boom(prompt: str, ctx: Any, **_kwargs: Any) -> Any:
         raise RuntimeError("agent crashed")
 
     monkeypatch.setattr(harness, "execute_agent", _boom)
@@ -288,6 +277,7 @@ def test_run_one_stops_and_joins_the_safeguard_monitor_when_the_agent_raises(
     record, _ = harness._run_one(task, tmp_path)  # noqa: SLF001
 
     assert record["status"] == "failed"
+    assert "agent crashed" in (record["error"] or "")  # the double's error, not a TypeError
     assert not any(t.name == "safeguard-monitor" for t in threading.enumerate())
 
 
@@ -299,7 +289,7 @@ def test_run_one_does_not_start_the_safeguard_monitor_under_no_infra(
         SafeguardMonitor, "start", lambda self: started.append("started"), raising=True
     )
     harness = DefaultEvalHarness(project_id="p", cluster_name="c", no_infra=True)
-    monkeypatch.setattr(harness, "execute_agent", lambda prompt, ctx: {"output": "ok"})
+    monkeypatch.setattr(harness, "execute_agent", lambda prompt, ctx, **kw: {"output": "ok"})
     monkeypatch.setattr(harness, "_run_verification", lambda entries, **kwargs: [])
     task = Task.from_dict(
         {
@@ -416,7 +406,7 @@ def test_hold_verdict_a_single_sample_that_errored_is_still_an_error() -> None:
 
 
 def test_hold_verdict_a_window_that_errors_then_recovers_and_ends_clean_is_a_pass() -> None:
-    """Regression: an error absorbed mid-window must not sink an otherwise clean hold."""
+    """An error absorbed mid-window must not sink an otherwise clean hold."""
     obs = HoldObservation()
     _fold_sample(obs, _result(success=False, status="error", reason="transient blip"), 0.0)
     _fold_sample(obs, _result(success=True, reason="held"), 1.0)
@@ -428,12 +418,8 @@ def test_hold_verdict_a_window_that_errors_then_recovers_and_ends_clean_is_a_pas
 
 
 def test_hold_verdict_a_single_trailing_error_after_clean_samples_is_a_pass() -> None:
-    """A single errored sample at the end of the window is absorbed as noise.
-
-    The trailing-error rule fires only on a sustained run of
-    HOLD_TRAILING_ERROR_SAMPLES consecutive errors, so a lone trailing error
-    is treated the same as any other absorbed error.
-    """
+    """A single trailing errored sample is absorbed; the trailing-error rule needs
+    HOLD_TRAILING_ERROR_SAMPLES consecutive errors."""
     obs = HoldObservation()
     _fold_sample(obs, _result(success=True, reason="held"), 0.0)
     _fold_sample(obs, _result(success=False, status="error", reason="transient blip"), 1.0)
@@ -445,7 +431,7 @@ def test_hold_verdict_a_single_trailing_error_after_clean_samples_is_a_pass() ->
 
 
 def test_hold_verdict_a_window_ending_on_two_consecutive_errors_is_an_error() -> None:
-    """Regression: a window that never recovers by its end must not read as a pass."""
+    """A window that never recovers by its end must not read as a pass."""
     obs = HoldObservation()
     _fold_sample(obs, _result(success=True, reason="held"), 0.0)
     _fold_sample(obs, _result(success=False, status="error", reason="blip one"), 1.0)
@@ -459,11 +445,7 @@ def test_hold_verdict_a_window_ending_on_two_consecutive_errors_is_an_error() ->
 
 
 def test_hold_verdict_a_sustained_trailing_error_reports_the_last_error_reason() -> None:
-    """The trailing-error verdict carries the final sample's own reason.
-
-    The reason used here shares no words with the verdict's fixed text, so
-    the assertion proves the sample's reason reached the verdict.
-    """
+    """The trailing-error verdict carries the final sample's own reason."""
     obs = HoldObservation()
     _fold_sample(obs, _result(success=True, reason="held"), 0.0)
     _fold_sample(obs, _result(success=False, status="error", reason="blip one"), 1.0)
@@ -505,14 +487,8 @@ def test_hold_verdict_a_violation_is_a_fail_regardless_of_later_recovery() -> No
 
 
 def test_hold_verdict_a_violation_followed_by_a_trailing_error_is_still_a_fail() -> None:
-    """Regression: a confirmed violation must not be masked by a trailing error sample.
-
-    A violation is a positive observation; losing observability afterward
-    does not un-observe it. Scoring nulls a task entirely on ``error`` but
-    scores ``fail`` as a fail, so violated must be checked before the
-    last-sample-error case or a genuine violation would drop out of scoring
-    instead of failing the task.
-    """
+    """A confirmed violation is not masked by a trailing error: ``error`` nulls the task
+    but ``fail`` scores it, so violated is checked first."""
     obs = HoldObservation()
     _fold_sample(obs, _result(success=False, reason="replicas dropped to 2"), 3.5)
     _fold_sample(obs, _result(success=False, status="error", reason="never recovered"), 4.5)
@@ -572,9 +548,8 @@ def test_run_hold_window_stops_early_when_the_callers_deadline_is_reached() -> N
     )
     elapsed = time.monotonic() - start
 
-    # The window itself asked for 10s; the shared deadline cut it off much
-    # sooner, proving the caller's deadline bounds the window rather than
-    # the window overrunning the shared verification budget.
+    # The window asked for 10s but the shared deadline cut it off: the caller's
+    # deadline bounds the window.
     assert elapsed < 5.0
     assert obs.sample_count >= 1
 
@@ -590,12 +565,8 @@ def test_run_hold_window_with_an_already_passed_deadline_takes_no_samples() -> N
 
 
 def test_run_verification_raises_when_an_objective_hold_entry_has_no_hold_window_sec() -> None:
-    """Regression: a missing hold_window_sec must not reach a float parameter unchecked.
-
-    VerificationEntry's own validation normally rejects this at spec-parse
-    time; ``model_copy`` bypasses that validation here to simulate an entry
-    reaching verification with the invariant already broken.
-    """
+    """A missing hold_window_sec must not reach a float parameter unchecked; ``model_copy``
+    bypasses spec-time validation to simulate the broken invariant."""
     entry = _objective_hold_entry({"type": "sg_always_pass"})
     broken_entry = entry.model_copy(update={"hold_window_sec": None})
     harness = DefaultEvalHarness(project_id="p", cluster_name="c")
@@ -610,13 +581,8 @@ def test_run_verification_raises_when_an_objective_hold_entry_has_no_hold_window
 def test_objective_hold_entry_is_routed_to_run_hold_window_not_the_live_monitor(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Regression: role: objective, mode: hold must never reach the live monitor.
-
-    Sampling an objective through SafeguardMonitor would evaluate it before
-    the agent has done anything and latch a spurious violation on the first
-    sample. The live monitor must only ever be constructed with the
-    safeguard-role subset of an entry's hold entries.
-    """
+    """role: objective, mode: hold never reaches the live monitor, which would latch a
+    spurious violation before the agent has acted."""
     monitor_entries: list[list[VerificationEntry]] = []
     orig_init = SafeguardMonitor.__init__
 
@@ -630,7 +596,7 @@ def test_objective_hold_entry_is_routed_to_run_hold_window_not_the_live_monitor(
     monkeypatch.setattr(
         harness,
         "execute_agent",
-        lambda prompt, ctx, sandbox_spec=None: AgentResult(output="ok", trajectory=[]),
+        lambda prompt, ctx, **kw: AgentResult(output="ok", trajectory=[]),
     )
     task = Task.from_dict(
         {

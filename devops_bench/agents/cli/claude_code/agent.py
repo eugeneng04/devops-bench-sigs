@@ -14,31 +14,12 @@
 
 """Claude Code CLI agent harness driving the ``claude`` binary.
 
-Runs ``claude`` in headless mode (``-p --output-format stream-json --verbose``)
-and extracts the canonical trajectory from the official event stream on stdout
-(see :mod:`~devops_bench.agents.cli.claude_code.parsing`) — no session-file
-reads off disk.
-
-Capability wiring uses Claude Code's native cwd-based channels, written into the
-per-run working directory before invocation:
-
-* **Rules** — ``config.capabilities.rules.text`` → ``CLAUDE.md``, auto-loaded
-  from the cwd as the startup context.
-* **Skills** — ``config.capabilities.skills.paths`` are materialized under
-  ``<cwd>/.claude/skills/<name>/SKILL.md``, Claude Code's skill-discovery root.
-* **MCP servers** — command-bearing bindings become a ``{"mcpServers": ...}``
-  document at ``<cwd>/.claude/mcp-config.json``, passed via ``--mcp-config``.
-  ``--strict-mcp-config`` is always set — including on a baseline arm with no
-  bindings — so any stray project ``.mcp.json`` is ignored and no trust prompt
-  fires. A bound run first checks the binary against
-  :data:`_MCP_WAIT_MIN_VERSION`.
-
-Auth is env-driven, matching the bench contract: ``config.api_key`` →
-``ANTHROPIC_API_KEY`` for the direct API, or keyless Vertex / Bedrock via ADC /
-AWS credentials. ``CLAUDE_CONFIG_DIR`` is redirected to a fresh per-run temp dir
-so Claude Code's mutable global state never races across concurrent evals (see
-:func:`_claude_config_dir` for the OAuth-debug escape hatch, which ``--parallel``
-overrides).
+Runs ``claude -p --output-format stream-json --verbose`` and parses the stdout
+event stream (:mod:`~.parsing`). Capabilities use the CLI's cwd channels:
+``CLAUDE.md`` for rules, ``.claude/skills/`` for skills, and ``--mcp-config``
+with ``--strict-mcp-config`` always set so a stray ``.mcp.json`` never leaks
+tools into a baseline arm. Auth is env-driven; ``CLAUDE_CONFIG_DIR`` is a fresh
+per-run dir so global state never races across concurrent runs.
 """
 
 from __future__ import annotations
@@ -80,16 +61,11 @@ _CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
 
 _log = get_logger("agents.cli.claude_code")
 
-# Child stderr is unbounded and reaches the persisted result record (both
-# ``metadata`` and ``errors``), so every path clips it to the same tail.
+# Child stderr is unbounded and reaches the persisted record, so clip it everywhere.
 _STDERR_TAIL_CHARS = 2000
 
-# Under ``-p`` the CLI reads a piped prompt from stdin and waits out a 3s
-# timeout before giving up when stdin stays open with nothing on it — which is
-# what an inherited stdin looks like. Handing it an empty string closes the pipe
-# immediately: ~3.7s saved per task, and no "no stdin data received" warning
-# polluting ``metadata["stderr"]`` (and, on a non-zero exit, the error message,
-# where it would displace the real cause).
+# Under -p the CLI waits a few seconds on an open, silent stdin and logs a warning;
+# an empty string closes the pipe at once.
 _CLOSED_STDIN = ""
 
 
@@ -98,11 +74,8 @@ def _stderr_tail(stderr: str | None) -> str:
     return (stderr or "").strip()[-_STDERR_TAIL_CHARS:]
 
 
-# ``--mcp-config`` under ``-p`` only waits for still-pending servers to connect
-# before the first turn from this version on. An older binary accepts the flag
-# and starts the turn anyway, so an MCP-augmented arm can run with none of its
-# tools attached and still be scored as augmented — the same silent
-# contamination ``--strict-mcp-config`` prevents from the other direction.
+# From this version ``--mcp-config`` under -p waits for servers before the first
+# turn; older binaries start anyway and score an MCP arm with no tools attached.
 _MCP_WAIT_MIN_VERSION = (2, 1, 221)
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
@@ -111,13 +84,8 @@ _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 def _claude_version(target: str) -> tuple[int, int, int] | None:
     """Parse ``claude --version``, or ``None`` when it cannot be determined.
 
-    An unreadable version is not an error: ``config.target`` may be a wrapper
-    script with its own ``--version`` surface, and refusing to run on a probe
-    that merely failed to parse would be worse than the risk it guards.
-
-    Cached per target: a matrix run drives one binary across every task, and the
-    version cannot change under a live process. An inconclusive probe caches too,
-    so a wrapper without a ``--version`` surface is not re-spawned per task.
+    Unreadable is not an error (``config.target`` may be a wrapper script).
+    Cached per target, inconclusive probes included.
     """
     try:
         completed = run([target, "--version"], check=False, timeout=30)
@@ -139,30 +107,18 @@ def _build_argv(
 ) -> list[str]:
     """Build the ``claude`` headless invocation for ``prompt``.
 
-    ``--verbose`` is mandatory (the CLI rejects ``stream-json`` under ``-p``
-    without it) and ``--dangerously-skip-permissions`` keeps headless runs from
-    blocking on confirmation prompts.
-
-    ``--strict-mcp-config`` is passed unconditionally, not just alongside
-    ``--mcp-config``: it pins the run to exactly the bound servers, and for a
-    baseline arm that set is empty. Without it, a stray ``.mcp.json`` in the task
-    workspace (the CLI's cwd) is loaded and silently grants MCP tools to the
-    un-augmented arm, contaminating the very comparison the bench measures.
-
-    The prompt is the trailing positional after ``--``. The CLI's option parser
-    would otherwise read a prompt whose first token begins with ``-`` as a flag
-    and abort the run.
+    ``--verbose`` is required for ``stream-json`` under ``-p``;
+    ``--dangerously-skip-permissions`` avoids confirmation prompts;
+    ``--strict-mcp-config`` is always passed so a stray ``.mcp.json`` cannot
+    grant tools to a baseline arm. The prompt trails ``--`` so a leading ``-``
+    is not parsed as a flag.
 
     Args:
         target: Path to the ``claude`` binary (already user-expanded).
-        prompt: Task prompt, passed as an argv value (never through a shell).
-        model: Model id for ``--model``, or ``None`` to use the CLI default.
-        max_turns: Cap for ``--max-turns``; ``None`` or non-positive uses the
-            CLI default (the CLI rejects ``0``, so it is treated as unset).
+        prompt: Task prompt, passed as an argv value.
+        model: Model id for ``--model``, or ``None`` for the CLI default.
+        max_turns: Cap for ``--max-turns``; ``None`` or non-positive means unset.
         mcp_config_path: Absolute path to the MCP config document, or ``None``.
-
-    Returns:
-        The argv list ready to hand to ``core.subprocess.run``.
     """
     argv = [
         target,
@@ -186,33 +142,25 @@ def _build_argv(
 def _build_env(config: AgentConfig, *, config_dir: str | None) -> dict[str, str]:
     """Build the env overlay that makes the Claude Code run model-agnostic.
 
-    ``config.api_key`` routes onto the provider's key env var(s) via the shared
-    contract (default ``anthropic``); Vertex / Bedrock backends set their
-    ``CLAUDE_CODE_USE_*`` switch, with Vertex mapping the repo's ambient
-    ``GCP_PROJECT_ID`` / ``GCP_VERTEX_LOCATION`` onto the CLI's equivalents. The
-    model is never set here — it flows through the ``--model`` argv flag.
+    ``config.api_key`` lands on the provider's key var(s); Vertex and Bedrock
+    set their ``CLAUDE_CODE_USE_*`` switch and routing vars. The model flows
+    through ``--model``, not here.
 
     Args:
         config: Resolved :class:`AgentConfig` for this run.
-        config_dir: Per-run ``CLAUDE_CONFIG_DIR`` path, or ``None`` when the
-            operator exported their own (then the ambient value is left intact).
-
-    Returns:
-        A mapping suitable for ``core.subprocess.run``'s ``extra_env``.
+        config_dir: Per-run ``CLAUDE_CONFIG_DIR``, or ``None`` to keep the operator's.
 
     Raises:
         ConfigError: If ``config.provider`` is not a known provider.
     """
-    # Resolve unconditionally so an unknown provider fails loud even on a keyless
-    # (Vertex/Bedrock) run, not only when a key happens to be set.
+    # Resolve unconditionally so an unknown provider fails loud even keyless.
     spec = resolve_provider(config.provider, default="anthropic")
     overlay: dict[str, str] = {
         # Headless hygiene: no background telemetry/error traffic, no autoupdate.
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "DISABLE_AUTOUPDATER": "1",
     }
-    # Guard on truthiness: run() overlays extra_env onto os.environ, so writing
-    # an empty key would clobber an ambient ANTHROPIC_API_KEY.
+    # An empty key would clobber an ambient one through the env overlay.
     if config.api_key:
         for var in spec.api_key_envs:
             overlay[var] = config.api_key
@@ -221,16 +169,14 @@ def _build_env(config: AgentConfig, *, config_dir: str | None) -> dict[str, str]
         project = os.environ.get("GCP_PROJECT_ID")
         if project:
             overlay["ANTHROPIC_VERTEX_PROJECT_ID"] = project
-        # Prefer the repo var, then an operator-set native CLOUD_ML_REGION, so we
-        # only fall back to "global" when neither is set (never clobber it).
+        # Repo var, then the CLI's native CLOUD_ML_REGION, then "global".
         region = os.environ.get("GCP_VERTEX_LOCATION") or os.environ.get("CLOUD_ML_REGION")
         overlay["CLOUD_ML_REGION"] = region or "global"
     elif spec.backend == "bedrock":
         overlay["CLAUDE_CODE_USE_BEDROCK"] = "1"
     if config_dir is not None:
         overlay[_CONFIG_DIR_ENV] = config_dir
-    # Operator-supplied extra_env is applied last and deliberately wins over the
-    # harness-set keys above (its escape hatch for backend/region overrides).
+    # Operator extra_env is applied last and wins (the override escape hatch).
     if config.extra_env:
         overlay.update(config.extra_env)
     return overlay
@@ -240,16 +186,9 @@ def _build_env(config: AgentConfig, *, config_dir: str | None) -> dict[str, str]
 def _claude_config_dir() -> Iterator[str | None]:
     """Yield a fresh per-run ``CLAUDE_CONFIG_DIR``, or ``None`` if operator-set.
 
-    A non-empty ambient ``CLAUDE_CONFIG_DIR`` is the operator's escape hatch
-    (e.g. to reuse a cached OAuth login for local debugging); it is left
-    untouched and ``None`` is yielded so no per-run temp dir is created or
-    injected. An empty ambient value is ignored so per-run isolation still
-    applies (the CLI treats an empty var as unset and would race on ~/.claude).
-
-    The hatch is refused under ``BENCH_PARALLEL``. Several benchmark processes
-    on one host would then share a single mutable config dir — the collision
-    class :mod:`devops_bench.core.run_env` exists to prevent — and the operator
-    has already declared concurrency, so isolation outranks the login cache.
+    A non-empty ambient value is the operator's escape hatch (a cached login) and
+    is left alone; an empty one counts as unset. Under ``BENCH_PARALLEL`` the
+    hatch is refused, since concurrent runs would share one mutable config dir.
     """
     if os.environ.get(_CONFIG_DIR_ENV):
         if not get_bool("BENCH_PARALLEL", False):
@@ -260,9 +199,8 @@ def _claude_config_dir() -> Iterator[str | None]:
             "one mutable Claude config dir; using a per-run dir instead",
             _CONFIG_DIR_ENV,
         )
-    # ignore_cleanup_errors: Claude Code may leave straggler state/lock files or
-    # MCP-server children; a cleanup OSError must not turn a completed run into
-    # an errored one via the base safety net.
+    # ignore_cleanup_errors: straggler lock files or MCP children must not turn a
+    # completed run into an errored one.
     with tempfile.TemporaryDirectory(prefix="claude-config-", ignore_cleanup_errors=True) as tmpdir:
         yield tmpdir
 
@@ -271,17 +209,16 @@ def _claude_config_dir() -> Iterator[str | None]:
 class ClaudeCodeAgent(AgentHarness):
     """Claude Code CLI agent harness driving the ``claude`` binary.
 
-    The binary path is resolved from ``config.target``, falling back to
-    ``"claude"`` on ``$PATH``. Model / API key flow from ``config.model`` (via
-    ``--model``) / ``config.api_key`` (via the env overlay) — never hardcoded.
-
-    ``__init__`` assigns ``self.mcp_servers``, ``self.skills`` and ``self.rules``
-    from the granted config bindings, which is what makes
-    ``isinstance(agent, SupportsMcp / SupportsSkills / SupportsRules)`` return
-    ``True`` for orchestrator-side capability negotiation (the Protocols are
-    structural).
-
+    The binary comes from ``config.target``, else ``claude`` on ``PATH``; model
+    via ``--model``, key via the env overlay. ``__init__`` assigns
+    ``mcp_servers``/``skills``/``rules`` so the agent satisfies the ``Supports*``
+    protocols. Sandboxed runs are refused until the host paths are ported (see
+    ``supports_sandbox``).
     """
+
+    # Refused at preflight: argv[0], --mcp-config and CLAUDE_CONFIG_DIR still cross
+    # in host spelling. TODO(sandbox): translate them like antigravity/openclaw, then flip.
+    supports_sandbox = False
 
     def __init__(self, config: AgentConfig | None = None) -> None:
         AgentHarness.__init__(self, config)
@@ -316,9 +253,7 @@ class ClaudeCodeAgent(AgentHarness):
                 claude_dir.mkdir(parents=True, exist_ok=True)
                 mcp_path = claude_dir / _CLAUDE_MCP_FILE
                 mcp_path.write_text(json.dumps({"mcpServers": servers}, indent=2), encoding="utf-8")
-                # A binding's argv can carry a server credential, and this file
-                # lands in the run workspace the harness later collects, so do
-                # not leave it at the umask default (0o644 on most machines).
+                # A binding's argv can carry a credential and this file is collected.
                 mcp_path.chmod(0o600)
                 mcp_config_path = str(mcp_path)
                 version = _claude_version(target)
@@ -342,22 +277,20 @@ class ClaudeCodeAgent(AgentHarness):
             with _claude_config_dir() as config_dir:
                 env_overlay = _build_env(self.config, config_dir=config_dir)
                 try:
-                    completed = run(
+                    # Through the sandbox seam: containerised when config.sandbox is
+                    # set, otherwise identical to the previous direct run(...).
+                    completed = self.run_agent_cmd(
                         argv,
                         extra_env=env_overlay,
                         cwd=workdir,
                         check=False,
                         timeout=self.config.timeout_sec,
                         input=_CLOSED_STDIN,
+                        host_run=run,
                     )
                 except SubprocessError as exc:
-                    # Under ``check=False`` the only way ``run`` raises is a
-                    # timeout, so report it as one rather than as an exit -1 that
-                    # reads like a crash. str(exc) embeds the child's full
-                    # stderr, so rebuild the message from the clipped tail rather
-                    # than interpolating it. The timeout carries the partial
-                    # stream-json captured before the kill; fall through so the
-                    # trajectory is recovered rather than dropped.
+                    # Under check=False this is a timeout: report it as one from the
+                    # clipped stderr, and fall through to recover the partial stream.
                     stderr = _stderr_tail(exc.stderr)
                     returncode = exc.returncode
                     stdout = exc.stdout or ""
@@ -365,8 +298,7 @@ class ClaudeCodeAgent(AgentHarness):
                     if stderr:
                         reason += f": {stderr}"
                 except OSError as exc:
-                    # Spawn failure core.subprocess.run does not wrap: usually a
-                    # missing / non-executable binary, but also a vanished cwd.
+                    # Spawn failure: missing binary or vanished cwd.
                     return AgentResult.errored(f"failed to spawn claude: {exc}")
                 else:
                     stderr = _stderr_tail(completed.stderr)
@@ -382,8 +314,7 @@ class ClaudeCodeAgent(AgentHarness):
         errors: list[str] = list(parse_errors)
         metadata: dict = {}
         if stderr:
-            # Keep stderr for diagnosis even on a clean exit — e.g. MCP startup
-            # warnings that leave the process returncode at 0.
+            # Kept on a clean exit too (e.g. MCP startup warnings).
             metadata["stderr"] = stderr
         if reason is not None:
             errors.append(reason)

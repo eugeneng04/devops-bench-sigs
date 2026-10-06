@@ -193,6 +193,10 @@ class Task(BaseModel):
             the display metadata (``title``, ``summary``, ``category``, and a
             ``title`` and ``description`` on every verification entry), because
             the leaderboard renders validated tasks and nothing else.
+        requires_unsandboxed: Opt this task out of the agent sandbox even when the
+            run asks for one, for a task whose objective needs an ambient cloud
+            credential the sandbox withholds (``gcp/secret-rotation``). Declared on
+            the task so the exemption travels with it.
     """
 
     model_config = _STRICT
@@ -216,6 +220,7 @@ class Task(BaseModel):
     # Closed set: a typo'd level must fail validation, not silently enforce.
     agent_pod_security: Literal["baseline", "privileged"] = "baseline"
     validated: bool = False
+    requires_unsandboxed: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -245,6 +250,7 @@ class Task(BaseModel):
                 "documentation": [],
                 "agent_pod_security": "baseline",
                 "validated": False,
+                "requires_unsandboxed": False,
             },
         )
 
@@ -287,10 +293,7 @@ class Task(BaseModel):
             group = entry.get("group")
             if group is None:
                 continue
-            # Raw mappings, so the value can be anything YAML produced. A
-            # non-string is unhashable or meaningless as a key, and would be
-            # rejected by parse_entries anyway; say so here instead of raising
-            # a TypeError from the membership test.
+            # Raw YAML value: reject a non-string here rather than TypeError on the lookup.
             if not isinstance(group, str):
                 raise ValueError(f"verification entry {label!r}: group must be a string")
             # Stripped here as VerificationEntry strips it, so the two agree.
@@ -353,6 +356,7 @@ class Task(BaseModel):
         validated = raw.get("validated", False)
         tags = raw.get("tags", [])
         check_groups = raw.get("check_groups", {})
+        requires_unsandboxed = raw.get("requires_unsandboxed", False)
 
         return cls.model_validate(
             {
@@ -378,6 +382,9 @@ class Task(BaseModel):
                     "baseline" if agent_pod_security is None else _text(str(agent_pod_security))
                 ),
                 "validated": False if validated is None else validated,
+                "requires_unsandboxed": (
+                    False if requires_unsandboxed is None else requires_unsandboxed
+                ),
             }
         )
 

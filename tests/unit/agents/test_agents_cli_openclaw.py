@@ -75,8 +75,8 @@ def _tool_result(
     }
 
 
-# Mirrors the real ``oc sessions export-trajectory`` events.jsonl schema:
-# dotted ``type`` with a nested ``data`` payload (captured from oc 2026.6.9).
+# Mirrors the ``oc sessions export-trajectory`` events.jsonl schema: dotted ``type``
+# with a nested ``data`` payload.
 SAMPLE_EVENTS = _events(
     _tool_call("1", "kubectl_get_pods", {"namespace": "default"}),
     _tool_result("1", "pod-a Running\n"),
@@ -114,11 +114,7 @@ def test_parse_trajectory_export_folds_call_result_pairs() -> None:
 
 
 def test_parse_trajectory_export_sums_usage_across_turns() -> None:
-    """Token usage is summed across every model.completed, not just the last.
-
-    OpenClaw reports usage per turn (per model call); a multi-turn session that
-    kept only the final ``model.completed`` would undercount to a single call.
-    """
+    """Token usage is summed across every model.completed, not just the last turn."""
     blob = _events(
         {"type": "model.completed", "data": {"usage": {"input": 100, "output": 20, "total": 120}}},
         _tool_call("1", "kubectl_get_pods", {}),
@@ -182,13 +178,8 @@ def test_parse_trajectory_export_surfaces_decode_errors() -> None:
 
 
 def test_parse_trajectory_export_drops_unpaired_result_and_surfaces_error() -> None:
-    """Orphan tool.result is dropped from trajectory, recorded on errors.
-
-    Mirrors the API agent's ``_fold_with_extraction_errors`` policy and the
-    Gemini ``parse_stream_json`` policy so every agent feeds the metrics seam
-    one shape — only real ToolCalls the model issued ride on
-    ``AgentResult.trajectory``; orphans are diagnostics, not trajectory entries.
-    """
+    """An orphan tool.result is dropped from the trajectory and recorded on errors, as
+    the other agents do, so the metrics seam sees one shape."""
     blob = _events(_tool_result("ghost", "?"))
     trajectory, _tokens, _output, errors = parse_trajectory_export(blob)
     # Orphan must NOT appear in the canonical trajectory.
@@ -306,13 +297,8 @@ def _install_oc_run(
     fake_bash: Callable[..., Any],
     fake_core_run: Callable[..., Any] | None = None,
 ) -> None:
-    """Install a fake ``core.subprocess.run`` on the agent module.
-
-    The agent turn arrives as ``["/bin/bash", "-c", <command>]`` and is routed
-    to ``fake_bash(<command>, **kwargs)`` so fakes keep asserting on the bash
-    command string; any other argv is the direct ``oc`` extraction call and
-    goes to ``fake_core_run`` (defaulting to an empty ``oc sessions``).
-    """
+    """Install a fake ``core.subprocess.run``: the bash agent turn goes to
+    ``fake_bash(<command>)``, any other argv (the ``oc`` extraction call) to ``fake_core_run``."""
     core = fake_core_run or (lambda argv, **kwargs: _make_subprocess_result(json.dumps([]), "", 0))
 
     def dispatch(argv, **kwargs):
@@ -324,12 +310,8 @@ def _install_oc_run(
 
 
 def _bundle_writer(events_jsonl: str) -> Callable[..., Any]:
-    """Build a fake core-subprocess.run that writes an export bundle's events.jsonl.
-
-    ``oc sessions`` returns one session row; ``oc sessions export-trajectory``
-    writes ``events.jsonl`` (the real trajectory filename) into the bundle dir
-    under the ``--workspace`` it was handed.
-    """
+    """Fake core-subprocess.run: ``oc sessions`` returns one row and export-trajectory
+    writes ``events.jsonl`` into the bundle dir under the ``--workspace`` it was handed."""
     sessions_payload = json.dumps(
         [{"key": "agent:operator:test", "model": "google/gemini-2.5-pro"}]
     )
@@ -351,11 +333,7 @@ def _bundle_writer(events_jsonl: str) -> Callable[..., Any]:
 def test_execute_happy_path_emits_canonical_trajectory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """oc agent succeeds, oc sessions yields one row, export-trajectory parses cleanly.
-
-    The final answer comes from the bundle (``model.completed.assistantTexts``),
-    not the noisy bash stdout.
-    """
+    """Happy path: the final answer comes from the bundle, not the noisy bash stdout."""
 
     def fake_bash(cmd, **kwargs):
         return _make_subprocess_result(stdout="OK\n", returncode=0)
@@ -374,9 +352,7 @@ def test_execute_happy_path_emits_canonical_trajectory(
 def test_execute_prefers_bundle_output_over_noisy_stdout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The agent's final answer (events.jsonl assistantTexts) must win over
-    `oc --log-level debug` noise — otherwise the judge grades debug spew.
-    """
+    """The bundle's assistantTexts win over ``--log-level debug`` noise on stdout."""
     noisy_stdout = "[DEBUG] starting oc...\n[INFO] sessionFile=/tmp/.openclaw/...\n[DEBUG] turn 1\n"
 
     def fake_bash(cmd, **kwargs):
@@ -484,16 +460,12 @@ def test_legacy_local_runner_is_gone() -> None:
     assert not hasattr(oc_mod, "run_openclaw_agent_local")
 
 
-# ---------------------------------------------------------------------------
-# Capability negotiation: OpenClaw wires MCP + skills via oc's native channels
-# ---------------------------------------------------------------------------
+# Capability negotiation: OpenClaw wires MCP + skills via oc's native channels.
 
 
 def test_openclaw_satisfies_mcp_skills_and_rules_protocols() -> None:
-    """OpenClaw declares MCP, Skills and Rules: it writes ``mcp.servers`` into an
-    isolated ``OPENCLAW_CONFIG_PATH``, materializes managed skills under
-    ``<OPENCLAW_STATE_DIR>/skills``, and prepends the operator brief to the
-    prompt."""
+    """OpenClaw declares MCP, Skills and Rules: mcp.servers in an isolated config, managed
+    skills under the state dir, the operator brief prepended to the prompt."""
     agent = OpenClawAgent(AgentConfig())
     assert isinstance(agent, SupportsRules)
     assert isinstance(agent, SupportsMcp)
@@ -521,9 +493,7 @@ def test_openclaw_agent_mirrors_rules_binding_onto_mixin_attribute() -> None:
     assert agent.rules == AgentRules(text="be precise")
 
 
-# ---------------------------------------------------------------------------
-# Rules delivery: the bound text actually reaches the spawned `oc` command.
-# ---------------------------------------------------------------------------
+# Rules delivery: the bound text reaches the spawned `oc` command.
 
 
 def test_prepend_rules_passes_prompt_through_when_rules_empty() -> None:
@@ -542,10 +512,8 @@ def test_prepend_rules_separates_brief_from_prompt_with_blank_line() -> None:
 def test_execute_prepends_bound_rules_to_oc_prompt(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The rules text must land inside the bash command string the agent
-    spawns — specifically inside the ``-m '<prompt>'`` segment that ``oc
-    agent`` reads. We capture the command and assert both the original prompt
-    and the rules text are present, with the rules ahead of the prompt."""
+    """The rules text lands inside the ``-m '<prompt>'`` segment of the spawned bash
+    command, ahead of the prompt."""
     captured: dict = {}
 
     def fake_bash(cmd, **kwargs):
@@ -582,15 +550,12 @@ def test_execute_does_not_prepend_rules_when_empty(
 
     OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("just the prompt")
     cmd = captured["cmd"]
-    # The agent shlex-quotes the prompt; "just the prompt" appears verbatim
-    # inside single quotes in the `-m` segment — and no extra blank-line
-    # prefix surrounds it.
+    # The prompt is shlex-quoted and appears verbatim in the -m segment, with no
+    # blank-line prefix.
     assert "-m 'just the prompt'" in cmd
 
 
-# ---------------------------------------------------------------------------
 # MCP server wiring: mcp.servers reach an isolated OPENCLAW_CONFIG_PATH.
-# ---------------------------------------------------------------------------
 
 
 def test_build_openclaw_config_wraps_servers_under_mcp() -> None:
@@ -624,10 +589,31 @@ def test_build_openclaw_config_merges_mcp_and_model_override() -> None:
     assert cfg["agents"]["defaults"]["models"] == {"google/gemini-3.5-flash": {}}
 
 
-# ---------------------------------------------------------------------------
-# Model catalog override: models oc doesn't ship by default get registered in
-# the per-run isolated config, for both google-genai and google-vertex.
-# ---------------------------------------------------------------------------
+def test_build_openclaw_config_threads_host_kubeconfig_into_mcp_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUBECONFIG", "/home/op/.devops-bench/runs/r1/kubeconfig")
+    cfg = _build_openclaw_config(AgentConfig(), (McpBinding(name="gke", command=("gke-mcp",)),))
+    assert cfg["mcp"]["servers"]["gke"]["env"] == {
+        "KUBECONFIG": "/home/op/.devops-bench/runs/r1/kubeconfig"
+    }
+
+
+def test_build_openclaw_config_uses_container_kubeconfig_when_sandboxed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The MCP server runs in the container, where the credential is at the bind path."""
+    from devops_bench.agents import sandbox as sandbox_mod
+
+    monkeypatch.setenv("KUBECONFIG", "/home/op/.devops-bench/runs/r1/kubeconfig")
+    cfg = _build_openclaw_config(
+        AgentConfig(sandbox=sandbox_mod.SandboxSpec(image="img")),
+        (McpBinding(name="gke", command=("gke-mcp",)),),
+    )
+    assert cfg["mcp"]["servers"]["gke"]["env"] == {"KUBECONFIG": sandbox_mod.CONTAINER_KUBECONFIG}
+
+
+# Model catalog override: ids oc does not ship get registered in the per-run config.
 
 
 def test_model_override_empty_for_catalog_known_model() -> None:
@@ -640,10 +626,8 @@ def test_model_override_empty_when_no_model() -> None:
 
 
 def test_model_override_genai_pins_generative_ai_transport() -> None:
-    """google-genai: the entry pins ``api: google-generative-ai`` so oc routes it
-    through the google-genai transport (a per-run provider entry replaces oc's
-    built-in one, so the transport must be carried) and needs no ``baseUrl``.
-    Allowlists ``google/<model>``."""
+    """google-genai pins ``api: google-generative-ai`` (a per-run provider entry replaces
+    oc's built-in one), needs no ``baseUrl``, and allowlists ``google/<model>``."""
     override = _build_model_override(AgentConfig(model="gemini-3.5-flash", provider="google"))
     google = override["models"]["providers"]["google"]
     assert google["api"] == "google-generative-ai"
@@ -711,12 +695,18 @@ def test_build_env_unknown_provider_raises_even_when_keyless() -> None:
         _build_env(AgentConfig(provider="google-vertyx"))
 
 
-def test_model_override_raises_for_unpinned_transport() -> None:
-    """A catalog-override model whose provider has no pinned transport fails loud
-    rather than shipping a transport-less entry (which would 401 via the OpenAI
-    fallback). A full-id with an unknown wire reaches this path."""
+def test_model_override_raises_for_unpinned_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An override without a transport pin fails loud; only reachable if the tables disagree."""
+    monkeypatch.setitem(oc_mod._CATALOG_OVERRIDES, "mystery", frozenset({"gemini-3.5-flash"}))
     with pytest.raises(ConfigError):
         _build_model_override(AgentConfig(model="mystery/gemini-3.5-flash"))
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "anthropic-bedrock"])
+def test_model_override_leaves_other_providers_catalog_alone(provider: str) -> None:
+    """Unlisted providers resolve through oc's own catalog, as before the Claude ids."""
+    assert _build_model_override(AgentConfig(model="claude-opus-5", provider=provider)) == {}
+    assert _build_model_override(AgentConfig(model="mystery/gemini-3.5-flash")) == {}
 
 
 def _empty_sessions_run(argv: list[str], **kwargs: Any) -> SimpleNamespace:
@@ -727,9 +717,8 @@ def _empty_sessions_run(argv: list[str], **kwargs: Any) -> SimpleNamespace:
 def test_execute_writes_mcp_servers_into_isolated_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A command-bearing MCP binding lands in ``<cwd>/openclaw.json`` and
-    ``OPENCLAW_CONFIG_PATH`` is pointed at it (read inside the fake to beat
-    temp-dir cleanup)."""
+    """A command-bearing MCP binding lands in ``<cwd>/openclaw.json`` via
+    ``OPENCLAW_CONFIG_PATH`` (read inside the fake, before temp-dir cleanup)."""
     captured: dict = {}
 
     def fake_bash(cmd, **kwargs):
@@ -909,3 +898,141 @@ def test_execute_cleans_up_temp_working_dir_after_run(
     OpenClawAgent(AgentConfig(target=str(tmp_path / "oc"))).run("p")
     assert captured["cwd"] is not None
     assert not os.path.exists(captured["cwd"])
+
+
+def test_native_openai_key_crosses_explicit_overlay(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    assert _build_env(AgentConfig(provider="openai"))["OPENAI_API_KEY"] == "test-key"
+
+
+@pytest.mark.parametrize(
+    "model,provider",
+    [("gemini-3.7-flash", "google-vertex"), ("claude-sonnet-5", "anthropic-vertex")],
+)
+def test_fleet_models_registered(model: str, provider: str) -> None:
+    assert (
+        _build_model_override(AgentConfig(model=model, provider=provider))["models"]["providers"][
+            provider
+        ]["models"][0]["id"]
+        == model
+    )
+
+
+def test_vertex_auth_profile_seeded_for_headless_run() -> None:
+    command = oc_mod._build_local_command(
+        AgentConfig(provider="anthropic-vertex"), "hi", "operator", "oc"
+    )
+    assert "models auth paste-api-key" in command
+
+
+_FAKE_EMULATOR_ENV = {
+    "GCE_METADATA_HOST": "host.docker.internal:41234",
+    "GCE_METADATA_IP": "host.docker.internal:41234",
+    "METADATA_SERVER_DETECTION": "assume-present",
+}
+
+
+def _sandboxed(tmp_path: Path, **fields: Any) -> AgentConfig:
+    """An AgentConfig carrying a task-completed sandbox spec rooted at ``tmp_path``."""
+    from devops_bench.agents import sandbox as sandbox_mod
+
+    return AgentConfig(sandbox=sandbox_mod.SandboxSpec(image="img", workspace=tmp_path), **fields)
+
+
+def _install_fake_emulator(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Stub the shared Vertex credential recipe; returns the calls it received."""
+    calls: list[dict[str, Any]] = []
+
+    def fake_credential_env(spec: Any, *, project: str | None = None, **kw: Any) -> dict[str, str]:
+        calls.append({"backend": spec.backend, "project": project})
+        return dict(_FAKE_EMULATOR_ENV)
+
+    monkeypatch.setattr(oc_mod, "sandbox_credential_env", fake_credential_env)
+    return calls
+
+
+def test_sandbox_vertex_overlay_uses_metadata_without_host_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Metadata auth on AND pointed at the emulator, else the SDK reaches the real VM SA."""
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "test-project")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/private/host.json")
+    calls = _install_fake_emulator(monkeypatch)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    overlay = oc_mod._sandbox_provider_env(
+        _sandboxed(tmp_path, provider="anthropic-vertex"), state_dir
+    )
+    assert overlay["GOOGLE_CLOUD_PROJECT"] == "test-project"
+    assert overlay["ANTHROPIC_VERTEX_USE_GCP_METADATA"] == "1"
+    assert overlay["GOOGLE_CLOUD_API_KEY"] == "gcp-vertex-credentials"
+    assert overlay["GCE_METADATA_HOST"] == "host.docker.internal:41234"
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in overlay
+    assert calls == [{"backend": "vertex", "project": "test-project"}]
+
+
+def test_sandbox_overlay_keeps_the_shim_out_of_the_artifact_diff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No new top-level workspace entry for the artifact diff; container path, not a literal."""
+    _install_fake_emulator(monkeypatch)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    before = set(p.name for p in tmp_path.iterdir())
+    overlay = oc_mod._sandbox_provider_env(
+        _sandboxed(tmp_path, provider="google-vertex"), state_dir
+    )
+    assert set(p.name for p in tmp_path.iterdir()) == before
+    assert (state_dir / "node-fetch-shim" / "register.mjs").is_file()
+    assert overlay["NODE_OPTIONS"] == "--import=/workspace/state/node-fetch-shim/register.mjs"
+
+
+def test_sandbox_overlay_refuses_to_run_without_a_completed_spec(tmp_path: Path) -> None:
+    from devops_bench.core import SandboxError
+
+    with pytest.raises(SandboxError):
+        oc_mod._sandbox_provider_env(AgentConfig(provider="google-vertex"), tmp_path)
+
+
+def test_sandbox_google_vertex_overlay_gets_the_same_credential_recipe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("GCP_PROJECT_ID", "p-from-repo-var")
+    calls = _install_fake_emulator(monkeypatch)
+    overlay = oc_mod._sandbox_provider_env(_sandboxed(tmp_path, provider="google-vertex"), tmp_path)
+    assert overlay["GCE_METADATA_HOST"] == "host.docker.internal:41234"
+    assert "ANTHROPIC_VERTEX_USE_GCP_METADATA" not in overlay
+    assert calls == [{"backend": "vertex", "project": "p-from-repo-var"}]
+
+
+@pytest.mark.parametrize(
+    "provider,api_key",
+    [("google-vertex", "express-key"), ("google", "k"), ("anthropic", "k")],
+)
+def test_sandbox_overlay_skips_the_emulator_for_keyed_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, provider: str, api_key: str
+) -> None:
+    """A key crosses by value; the emulator is only for keyless Vertex."""
+    calls = _install_fake_emulator(monkeypatch)
+    config = _sandboxed(tmp_path, provider=provider, api_key=api_key)
+    overlay = oc_mod._sandbox_provider_env(config, tmp_path)
+    assert "GCE_METADATA_HOST" not in overlay
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "model,provider,transport",
+    [
+        ("gemini-3.8-flash", "google", "google-generative-ai"),
+        ("gemini-3.8-flash", "google-vertex", "google-vertex"),
+        ("claude-fable-5-1", "anthropic-vertex", "anthropic-messages"),
+    ],
+)
+def test_latest_models_have_per_run_catalog_and_transport(
+    model: str, provider: str, transport: str
+) -> None:
+    override = _build_model_override(AgentConfig(model=model, provider=provider))
+    entry = override["models"]["providers"][provider]
+    assert entry["models"] == [{"id": model, "name": model}]
+    assert entry["api"] == transport
+    assert override["agents"]["defaults"]["models"] == {f"{provider}/{model}": {}}

@@ -14,21 +14,10 @@
 
 """Gemini CLI agent harness driving the ``gemini`` binary.
 
-Trajectory extraction reads the official ``--output-format stream-json`` event
-stream from stdout (see :mod:`~devops_bench.agents.cli.gemini_cli.parsing`) — no
-``~/.gemini/tmp/...`` disk reads, no session-id glob, no internal-schema parsing.
-
-Capability wiring is delivered through the Gemini CLI's native workspace
-mechanisms, written into the per-run working directory before invocation:
-
-* **Tools** — ``config.capabilities.allowed_tools`` become ``--allowed-tools``
-  arguments, pre-approving them in headless mode.
-* **MCP servers** — command-bearing bindings become ``mcpServers`` entries in
-  ``<cwd>/.gemini/settings.json``.
-* **Skills** — ``config.capabilities.skills.paths`` are materialized under
-  ``<cwd>/.gemini/skills/<name>/SKILL.md``.
-* **Rules** — ``config.capabilities.rules.text`` is written to ``GEMINI.md``,
-  auto-loaded as the startup context.
+The trajectory is parsed from the ``--output-format stream-json`` stdout stream
+(:mod:`~.parsing`), never from session files. Capabilities use the CLI's
+workspace channels under the per-run cwd: ``--allowed-tools``, ``mcpServers`` in
+``.gemini/settings.json``, skills under ``.gemini/skills/``, rules in ``GEMINI.md``.
 """
 
 from __future__ import annotations
@@ -52,7 +41,7 @@ from devops_bench.agents.shared.vertex_env import (
     vertex_location,
     vertex_project,
 )
-from devops_bench.core import ConfigError, SandboxError, SubprocessError, get_logger
+from devops_bench.core import ConfigError, SubprocessError, get_logger
 from devops_bench.core.model_providers import resolve_provider, sandbox_credential_env
 from devops_bench.core.subprocess import run
 
@@ -61,17 +50,17 @@ if TYPE_CHECKING:  # pragma: no cover - typing-only import
 
 __all__ = ["GeminiCliAgent"]
 
-# Filename the Gemini CLI auto-loads from its working directory as the
-# operator brief / startup context (its native equivalent of a system prompt).
+# Auto-loaded from the cwd as the startup context (the CLI's system-prompt channel).
 _GEMINI_RULES_FILE = "GEMINI.md"
-# Workspace config dir/files the CLI reads from its cwd. ``settings.json`` here
-# overrides the user-level ``~/.gemini/settings.json``; ``skills/`` is the
-# workspace skill-discovery root.
+# Workspace config the CLI reads from its cwd; overrides the user-level settings.
 _GEMINI_CONFIG_DIR = ".gemini"
 _GEMINI_SETTINGS_FILE = "settings.json"
 _GEMINI_SKILLS_DIR = "skills"
 
 _log = get_logger("agents.cli.gemini_cli")
+
+# The image ships its own gemini on PATH; a host binary path cannot exec inside.
+_CONTAINER_GEMINI_BIN = "gemini"
 
 
 def _build_settings(mcp_servers: tuple[McpBinding, ...], *, skills_enabled: bool) -> dict:
@@ -80,9 +69,8 @@ def _build_settings(mcp_servers: tuple[McpBinding, ...], *, skills_enabled: bool
     Args:
         mcp_servers: Bindings to render into ``mcpServers`` (empty-command
             bindings are skipped by :func:`build_mcp_servers`).
-        skills_enabled: Whether any workspace skill was materialized; gates the
-            explicit ``skills.enabled`` flag so the benchmark does not depend on
-            the user-level default.
+        skills_enabled: Whether any workspace skill was materialized; sets
+            ``skills.enabled`` explicitly rather than relying on the user default.
 
     Returns:
         A settings mapping, possibly empty (caller skips the write when empty).
@@ -104,32 +92,18 @@ def _build_argv(
 ) -> list[str]:
     """Build the ``gemini`` invocation for ``prompt``.
 
-    ``--approval-mode yolo`` is always passed so the CLI auto-approves every tool
-    call (built-in *and* MCP) instead of blocking on interactive confirmation —
-    without it, MCP tool calls hang until the run hits its timeout.
-
-    When ``allowed_tools`` is empty, gemini *extensions* are disabled via
-    ``--extensions=`` — this is orthogonal to MCP (servers come from
-    ``settings.json`` and stay available). The short ``-e=`` / ``-e=""`` forms
-    print help and exit non-zero on gemini >= 0.47 (the literal value, quotes
-    included, reaches the parser since argv bypasses the shell), and ``-e none``
-    loads an extension literally named "none" rather than disabling.
-
-    Note: MCP servers only load when the workspace is *trusted*. The per-run temp
-    cwd is untrusted by default, so the bastion sets
-    ``security.folderTrust.enabled = false`` in the user-level
-    ``~/.gemini/settings.json`` (``--skip-trust`` alone does not lift the MCP
-    gate). See ``scripts/bastion/vm-setup.sh``.
+    ``--approval-mode yolo`` auto-approves every tool call, or MCP calls hang
+    until the timeout. With no ``allowed_tools``, extensions are disabled via
+    ``--extensions=`` (MCP servers come from ``settings.json`` and stay available).
+    MCP servers only load in a trusted workspace, so the host setup disables
+    ``security.folderTrust`` in the user-level settings; ``--skip-trust`` alone
+    does not lift that gate.
 
     Args:
         target: Path to the ``gemini`` binary (already user-expanded).
         prompt: Task prompt.
-        allowed_tools: Pre-approved tool names; each yields a separate
-            ``--allowed-tools <name>`` pair (redundant under yolo).
+        allowed_tools: Pre-approved tool names, one ``--allowed-tools`` each.
         extra_flags: Optional extra CLI flags to forward to the binary.
-
-    Returns:
-        The argv list ready to hand to ``core.subprocess.run``.
     """
     argv = [target, "--output-format", "stream-json", "--skip-trust"]
     argv.extend(["--approval-mode", "yolo"])
@@ -149,25 +123,14 @@ def _build_argv(
 def _build_env(config: AgentConfig) -> dict[str, str]:
     """Build the env overlay that makes the Gemini CLI run model-agnostic.
 
-    Routes ``config.api_key`` onto the provider's key env var(s) and
-    ``config.model`` onto ``GEMINI_MODEL``, and disables the OTLP exporters,
-    which hang on an unreachable collector. A Vertex backend also gets the
-    google-genai routing vars (switch, project, location; location defaults
-    to ``global``, the only endpoint the ``-preview`` ids are published on). A
-    *sandboxed* keyless Vertex run additionally gets the metadata-emulator
-    vars from :func:`~devops_bench.core.model_providers.sandbox_credential_env`,
-    since ADC does not exist inside the container.
-
-    Args:
-        config: Resolved :class:`AgentConfig` for this run.
-
-    Returns:
-        A mapping suitable for ``core.subprocess.run``'s ``extra_env``.
+    Routes ``config.api_key`` and ``config.model`` onto the CLI's env vars and
+    disables the OTLP exporters. A Vertex backend gets the google-genai routing
+    vars; sandboxed and keyless it also gets the metadata-emulator vars from
+    :func:`~devops_bench.core.model_providers.sandbox_credential_env`.
 
     Raises:
         ConfigError: Unknown provider, a Vertex run with neither project nor
-            ``GOOGLE_API_KEY``, or a sandboxed keyless run that cannot be given
-            a model credential.
+            ``GOOGLE_API_KEY``, or a sandboxed keyless run with no credential recipe.
     """
     # Resolve unconditionally so an unknown provider fails loud even keyless.
     spec = resolve_provider(config.provider)
@@ -212,22 +175,10 @@ def _build_env(config: AgentConfig) -> dict[str, str]:
 class GeminiCliAgent(AgentHarness):
     """Gemini CLI agent harness driving the ``gemini`` binary.
 
-    The binary path is resolved from ``config.target``, falling back to
-    ``"gemini"`` on ``$PATH``. Model / API key flow from
-    ``config.model`` / ``config.api_key`` via the env overlay — never
-    hardcoded. ``config.capabilities.allowed_tools`` (aggregated across every
-    bound MCP server) selects between the ``--allowed-tools`` overlay and the
-    ``--extensions=`` extensions-disabled path.
-
-    ``__init__`` assigns ``self.mcp_servers``, ``self.skills`` and ``self.rules``
-    from the granted config bindings, which is what makes
-    ``isinstance(agent, SupportsMcp / SupportsSkills / SupportsRules)`` return
-    ``True`` for orchestrator-side capability negotiation (the Protocols are
-    structural).
-
-    The full canonical trajectory is parsed from the official
-    ``--output-format stream-json`` event stream; no session files are read
-    from disk.
+    The binary comes from ``config.target``, else ``gemini`` on ``PATH``; model
+    and key flow through the env overlay. ``__init__`` assigns
+    ``mcp_servers``/``skills``/``rules`` so the agent satisfies the
+    ``Supports*`` protocols.
     """
 
     supports_sandbox = True
@@ -242,32 +193,14 @@ class GeminiCliAgent(AgentHarness):
     def _execute(self, prompt: str, workspace_path: Path | None = None) -> AgentResult:
         """Build argv, run the CLI, and parse the stream-json output.
 
-        The agent runs the binary inside ``workspace_path`` when the harness
-        supplies one, else its own per-run temp working directory, and lays
-        down the granted capabilities there before invocation, using the
-        CLI's native workspace channels (all auto-loaded from the cwd, so the
-        user's ``~/.gemini`` stays untouched and concurrent runs never race):
-
-        * ``GEMINI.md`` — the operator brief, when ``rules.text`` is set.
-        * ``.gemini/settings.json`` — ``mcpServers`` for each command-bearing
-          MCP binding, plus ``skills.enabled`` when skills were materialized.
-        * ``.gemini/skills/<name>/SKILL.md`` — one per discovered skill.
-
-        A temp working directory (used when ``workspace_path`` is ``None``) is
-        cleaned up when ``_execute`` returns; a harness-supplied
-        ``workspace_path`` is left for the harness to collect and clean up.
+        Capabilities are laid down in ``workspace_path`` (or a temp dir this
+        method owns and removes) as ``GEMINI.md``, ``.gemini/settings.json`` and
+        ``.gemini/skills/``, all auto-loaded from the cwd.
         """
         caps = self.config.capabilities
-        raw_target = self.config.target or "gemini"
-        if self.config.sandbox is not None and raw_target.startswith("~"):
-            # expanduser resolves against the HOST home; the resulting path
-            # cannot exist in the container image.
-            raise SandboxError(
-                f"AGENT_TARGET={raw_target!r} resolves against the host home; a "
-                "sandboxed run needs the binary's in-image path (or the bare "
-                "name on the image's PATH)"
-            )
-        target = os.path.expanduser(raw_target)
+        target = os.path.expanduser(self.config.target or "gemini")
+        if self.config.sandbox is not None:
+            target = _CONTAINER_GEMINI_BIN
         argv = _build_argv(target, prompt, caps.allowed_tools, self.config.extra_flags)
         env_overlay = _build_env(self.config)
         rules_text = caps.rules.text
@@ -285,12 +218,8 @@ class GeminiCliAgent(AgentHarness):
                     json.dumps(settings, indent=2), encoding="utf-8"
                 )
             if self.config.sandbox is not None:
-                # The container HOME (<workspace>/home) is fresh, so the
-                # user-level folder-trust disable the bastion relies on (see
-                # _build_argv) does not exist there. Untrusted, the CLI drops
-                # the workspace settings (MCP), GEMINI.md (rules), and
-                # downgrades --approval-mode — so every sandboxed arm needs
-                # the seed, not just the ones that wrote settings.
+                # The container HOME is fresh, so seed the folder-trust disable there;
+                # untrusted, the CLI drops settings, GEMINI.md and --approval-mode.
                 user_gemini_dir = workdir / "home" / _GEMINI_CONFIG_DIR
                 user_gemini_dir.mkdir(parents=True, exist_ok=True)
                 (user_gemini_dir / _GEMINI_SETTINGS_FILE).write_text(

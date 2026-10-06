@@ -26,7 +26,7 @@ import sys
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from devops_bench.core import ConfigError
+from devops_bench.core import ConfigError, configure_logging
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports
     from devops_bench.run import BenchmarkConfig
@@ -89,7 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--parallel",
         action="store_true",
         help=(
-            "Isolate this run (own kubeconfig / gcloud config / tofu data dir and "
+            "Isolate this run (own kubeconfig, cloud CLI config and tofu data dir, and "
             "a run-unique cluster name) so it can run concurrently with others."
         ),
     )
@@ -156,10 +156,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # args_to_config runs inside the try: BenchmarkConfig.from_env raises
-    # ConfigError on malformed env (e.g. a non-integer EVAL_LIMIT), which must
-    # exit 2 like every other configuration error, not escape as a traceback.
+    # Everything that reads the env sits inside the try so a malformed value exits 2.
     try:
+        # The package logger carries a NullHandler, so without this every library
+        # warning is silent. After parse_args so --help never depends on the env.
+        try:
+            configure_logging()
+        except ValueError as exc:
+            raise ConfigError(f"BENCH_LOG_LEVEL: {exc}") from exc
         config = args_to_config(args)
         result = run_benchmark(config)
     except ConfigError as exc:

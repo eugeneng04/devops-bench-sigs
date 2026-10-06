@@ -27,6 +27,7 @@ from devops_bench import core
 from devops_bench.agents import base
 from devops_bench.agents import config as agents_config
 from devops_bench.agents import result as agents_result
+from devops_bench.agents import sandbox as sandbox_mod
 from devops_bench.agents.cli.antigravity import parsing
 from devops_bench.agents.shared import cli_capabilities
 from devops_bench.agents.shared.vertex_env import vertex_location, vertex_project
@@ -41,12 +42,13 @@ _log = core.get_logger("agents.cli.antigravity")
 
 _GCLOUD_LOOKUP_TIMEOUT_SEC = 10
 
-# agy flushes usage to the conversation DB asynchronously after process exit;
-# poll briefly for the rows before giving up.
+# The image ships its own agy on PATH; a host binary path in argv[0] fails to exec.
+_CONTAINER_AGY_BIN = "agy"
+
+# agy flushes usage to the conversation DB asynchronously after exit; poll briefly.
 _DB_FLUSH_POLL_ATTEMPTS = 10
 _DB_FLUSH_POLL_INTERVAL_SEC = 0.25
-# Rows that decode to nothing mean schema drift, not an in-flight flush: allow
-# one recheck, then stop instead of burning the full poll budget.
+# Undecodable rows mean schema drift, not an in-flight flush: one recheck, then stop.
 _UNDECODABLE_MAX_ATTEMPTS = 2
 
 
@@ -104,7 +106,7 @@ def _build_settings(
     if model:
         settings["modelConfigs"] = {"defaultModel": _resolve_model_name(model)}
 
-    # Add GCP block if project/location are provided (needed for GCA/GKE tools)
+    # The gcp block is what the cloud tools read.
     if project or location:
         settings["gcp"] = {}
         if project:
@@ -116,10 +118,7 @@ def _build_settings(
 
 
 def _build_env(config: agents_config.AgentConfig) -> dict[str, str]:
-    """Build the env overlay for the Antigravity CLI subprocess.
-
-    HOME must NOT be overridden to leverage cached OAuth/ADC credentials.
-    """
+    """Build the env overlay for the Antigravity CLI subprocess; HOME is left alone so cached credentials work."""
     overlay: dict[str, str] = {
         # Trust workspace so it doesn't block on untrusted folder warnings
         "GEMINI_CLI_TRUST_WORKSPACE": "true",
@@ -162,11 +161,14 @@ def _get_gcloud_project() -> str | None:
 class AgyCliAgent(base.AgentHarness):
     """Antigravity CLI agent harness driving the ``agy`` binary.
 
-    Lays down capabilities (rules, MCP, skills) in the workspace
-    directory and spawns the ``agy`` binary. It preserves the user's real
-    HOME to leverage cached OAuth/ADC credentials. The trajectory is
-    extracted by parsing the generated transcript JSONL log file.
+    Lays down rules, MCP and skills in the workspace, spawns ``agy``, and parses
+    the transcript JSONL. Sandboxed, only the OAuth token crosses (copied into the
+    per-run config dir under the workspace); ambient cloud credentials never do.
     """
+
+    # All agent subprocesses go through run_agent_cmd. The gcloud project/location
+    # lookups stay on the host: they run before the agent and cross as values.
+    supports_sandbox = True
 
     def __init__(self, config: agents_config.AgentConfig | None = None) -> None:
         super().__init__(config)
@@ -195,11 +197,8 @@ class AgyCliAgent(base.AgentHarness):
 
         with cli_capabilities.agent_workdir(workspace_path, prefix="agy-run-") as workdir:
             gemini_dir = workdir / ".gemini"
-            # <gemini_dir>/antigravity-cli/ is the single directory agy reads
-            # its config from and writes its state to (see the OAuth token,
-            # conversations, and transcript paths below, and the global
-            # default documented in
-            # .agents/references/permission-configs/README.md).
+            # <gemini_dir>/antigravity-cli/ is the one dir agy reads config from and
+            # writes state (token, conversations, transcripts) to.
             agy_config_dir = gemini_dir / "antigravity-cli"
             agy_config_dir.mkdir(parents=True, exist_ok=True)
 
@@ -214,10 +213,17 @@ class AgyCliAgent(base.AgentHarness):
             env_overlay["GCP_LOCATION"] = location
 
             # Explicit gemini_dir keeps agy on the workspace settings, not real HOME.
+            # argv crosses verbatim, so pass the container spelling; keep the host
+            # spelling in gemini_dir for the post-run transcript read.
+            gemini_dir_arg = str(gemini_dir)
+            spec = self.config.sandbox
+            if spec is not None and spec.workspace is not None:
+                gemini_dir_arg = sandbox_mod.container_path(spec.workspace, gemini_dir)
+                binary = _CONTAINER_AGY_BIN
             argv = [
                 binary,
                 "--dangerously-skip-permissions",
-                f"--gemini_dir={gemini_dir}",
+                f"--gemini_dir={gemini_dir_arg}",
             ]
             if project:
                 argv.append(f"--project={project}")
@@ -252,9 +258,8 @@ class AgyCliAgent(base.AgentHarness):
                     json.dumps(settings, indent=2), encoding="utf-8"
                 )
 
-            # Copy (not symlink) the OAuth token into the workspace: agy may
-            # refresh it in place during a run, and a symlink shared across
-            # concurrent runs would race on the one real file.
+            # Copy, not symlink: agy refreshes the token in place, and a shared
+            # symlink would race across concurrent runs.
             real_home = pathlib.Path.home()
             real_token = real_home / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
             copied_token: pathlib.Path | None = None
@@ -272,27 +277,27 @@ class AgyCliAgent(base.AgentHarness):
             completed: devops_subprocess.CompletedProcess | None = None
             timeout_exc: core.SubprocessError | None = None
             try:
-                completed = devops_subprocess.run(
+                # Through the sandbox seam: containerised when config.sandbox is
+                # set, otherwise identical to the previous direct run(...).
+                completed = self.run_agent_cmd(
                     argv,
                     extra_env=env_overlay,
                     cwd=workdir,
                     check=False,
                     timeout=self.config.timeout_sec,
+                    host_run=devops_subprocess.run,
                 )
             except core.SubprocessError as exc:
-                # check=False means this can only be a timeout. agy may have
-                # already written a partial transcript before being killed,
-                # so fall through to recover it instead of returning early
-                # and losing the workspace to the `with` block's cleanup.
+                # Under check=False this is a timeout; fall through so a partial
+                # transcript is recovered before the workdir is cleaned up.
                 timeout_exc = exc
             except OSError as exc:
                 return agents_result.AgentResult.errored(
                     f"antigravity-cli binary unavailable: {exc}"
                 )
             finally:
-                # agy only needs the token while running. Remove the copy once it
-                # exits so the live credential never lingers in a workspace that
-                # is deliberately retained for artifact collection.
+                # Remove the token copy on exit so a live credential never lingers
+                # in a workspace retained for artifact collection.
                 if copied_token is not None:
                     copied_token.unlink(missing_ok=True)
 
@@ -344,8 +349,7 @@ class AgyCliAgent(base.AgentHarness):
             if not session_text:
                 _log.warning("Failed to retrieve session log, falling back to empty")
 
-        # Output + trajectory come from the transcript; tokens prefer the DB,
-        # falling back to transcript-aggregated counts (old agy formats), else
+        # Tokens prefer the DB, then transcript counts (old agy formats), else
         # all-None so the row reads "unavailable" rather than a fake 0.
         output, trajectory, transcript_tokens, parse_errors = parsing.parse_session_jsonl(
             session_text
