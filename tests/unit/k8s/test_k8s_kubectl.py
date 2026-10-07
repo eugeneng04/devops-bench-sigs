@@ -172,6 +172,85 @@ def test_apply_builds_argv(mocker: MockerFixture) -> None:
     assert argv == ["kubectl", "apply", "-f", "/manifests/app.yaml", "-n", "staging"]
 
 
+def test_delete_builds_argv_and_ignores_not_found_by_default(mocker: MockerFixture) -> None:
+    # Teardown callers treat "already gone" as success.
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.delete("clusterrolebinding", "a", "b", context="kind-bench")
+
+    argv = mock_run.call_args.args[0]
+    assert argv == [
+        "kubectl",
+        "delete",
+        "clusterrolebinding",
+        "a",
+        "b",
+        "--ignore-not-found",
+        "--context",
+        "kind-bench",
+    ]
+
+
+def test_delete_can_skip_waiting_and_surface_not_found(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.delete("pod", "web-0", namespace="prod", ignore_not_found=False, wait=False)
+
+    argv = mock_run.call_args.args[0]
+    assert argv == ["kubectl", "delete", "pod", "web-0", "--wait=false", "-n", "prod"]
+
+
+def test_delete_threads_the_subprocess_timeout(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.delete("namespace", "bench-system", timeout=300)
+
+    assert mock_run.call_args.kwargs["timeout"] == 300
+
+
+def test_apply_label_config_value_and_create_token_thread_the_timeout(
+    mocker: MockerFixture,
+) -> None:
+    """Provisioning and teardown calls must be bounded so a silent apiserver cannot hang the run."""
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed(stdout="v"))
+    kubectl.apply("m.yaml", timeout=60)
+    assert mock_run.call_args.kwargs["timeout"] == 60
+    kubectl.label("namespace", "ns", {"k": None}, timeout=61)
+    assert mock_run.call_args.kwargs["timeout"] == 61
+    kubectl.config_value("{.x}", timeout=62)
+    assert mock_run.call_args.kwargs["timeout"] == 62
+    kubectl.create_token("sa", namespace="ns", duration_sec=5, timeout=63)
+    assert mock_run.call_args.kwargs["timeout"] == 63
+
+
+def test_apply_and_label_omit_the_timeout_kwarg_when_unset(mocker: MockerFixture) -> None:
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+    kubectl.apply("m.yaml")
+    assert "timeout" not in mock_run.call_args.kwargs
+    kubectl.label("namespace", "ns", {"k": "v"})
+    assert "timeout" not in mock_run.call_args.kwargs
+
+
+def test_delete_refuses_an_empty_name_list(mocker: MockerFixture) -> None:
+    # No implicit --all.
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    with pytest.raises(ValueError):
+        kubectl.delete("pod")
+
+    mock_run.assert_not_called()
+
+
+def test_label_renders_a_none_value_as_removal(mocker: MockerFixture) -> None:
+    # ``key-`` is kubectl's "remove this label".
+    mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
+
+    kubectl.label("namespace", "default", {"keep": "1", "drop": None})
+
+    argv = mock_run.call_args.args[0]
+    assert argv == ["kubectl", "label", "namespace", "default", "keep=1", "drop-"]
+
+
 def test_rollout_status_with_timeout(mocker: MockerFixture) -> None:
     mock_run = mocker.patch("devops_bench.k8s.kubectl.run", return_value=_completed())
 

@@ -31,6 +31,7 @@ __all__ = [
     "apply",
     "config_value",
     "create_token",
+    "delete",
     "exec_pod",
     "get_resource",
     "is_not_found",
@@ -115,6 +116,11 @@ def _namespace_args(namespace: str | None) -> list[str]:
 
 def _selector_args(selector: str | None) -> list[str]:
     return ["-l", selector] if selector else []
+
+
+def _timeout_kwargs(timeout: float | None) -> dict[str, float]:
+    """``run`` kwargs for an optional timeout; omitted entirely when None."""
+    return {"timeout": timeout} if timeout is not None else {}
 
 
 def _context_args(context: str | None) -> list[str]:
@@ -316,6 +322,7 @@ def apply(
     namespace: str | None = None,
     kubeconfig: KubeconfigSource = None,
     context: str | None = None,
+    timeout: float | None = None,
 ) -> CompletedProcess:
     """Apply a manifest file or directory via ``kubectl apply -f``.
 
@@ -324,6 +331,7 @@ def apply(
         namespace: Optional namespace (``-n``).
         kubeconfig: Kubeconfig path or context-like object.
         context: Optional kubeconfig context to pin the call to (``--context``).
+        timeout: Optional subprocess timeout in seconds for the whole call.
 
     Returns:
         The completed process.
@@ -332,23 +340,68 @@ def apply(
         SubprocessError: If kubectl exits non-zero or times out.
     """
     argv = ["kubectl", "apply", "-f", path, *_namespace_args(namespace)]
-    return _run_kubectl(argv, kubeconfig, context=context)
+    return _run_kubectl(argv, kubeconfig, context=context, **_timeout_kwargs(timeout))
+
+
+def delete(
+    resource: str,
+    *names: str,
+    namespace: str | None = None,
+    ignore_not_found: bool = True,
+    wait: bool = True,
+    timeout: float | None = None,
+    kubeconfig: KubeconfigSource = None,
+    context: str | None = None,
+) -> CompletedProcess:
+    """Delete named resources via ``kubectl delete``.
+
+    Args:
+        resource: Resource kind, e.g. ``"namespace"``.
+        *names: Names to delete; at least one is required (no implicit ``--all``).
+        namespace: Optional namespace (``-n``).
+        ignore_not_found: Pass ``--ignore-not-found`` (on by default: teardown treats
+            "already gone" as success).
+        wait: When False, pass ``--wait=false`` and return once the deletion is accepted.
+        timeout: Optional subprocess timeout in seconds for the whole call.
+        kubeconfig: Kubeconfig path or context-like object.
+        context: Optional kubectl context to pin the call to (``--context``).
+
+    Returns:
+        The completed process.
+
+    Raises:
+        ValueError: If no names are given.
+        SubprocessError: If kubectl exits non-zero or times out.
+    """
+    if not names:
+        raise ValueError("kubectl.delete requires at least one resource name")
+    argv = [
+        "kubectl",
+        "delete",
+        resource,
+        *names,
+        *(["--ignore-not-found"] if ignore_not_found else []),
+        *([] if wait else ["--wait=false"]),
+        *_namespace_args(namespace),
+    ]
+    return _run_kubectl(argv, kubeconfig, context=context, **_timeout_kwargs(timeout))
 
 
 def label(
     resource: str,
     name: str,
-    labels: Mapping[str, str],
+    labels: Mapping[str, str | None],
     *,
     overwrite: bool = False,
     namespace: str | None = None,
     kubeconfig: KubeconfigSource = None,
     context: str | None = None,
+    timeout: float | None = None,
 ) -> CompletedProcess:
-    """Set labels on one resource via ``kubectl label``.
+    """Set or remove labels on one resource via ``kubectl label``.
 
-    Without ``overwrite`` kubectl refuses to change a label that already has
-    a different value.
+    A ``None`` value renders as ``key-`` (kubectl's "remove this label"). Without
+    ``overwrite`` kubectl refuses to change a label that already has a different value.
 
     Raises:
         SubprocessError: If kubectl exits non-zero or times out.
@@ -358,11 +411,11 @@ def label(
         "label",
         resource,
         name,
-        *(f"{key}={value}" for key, value in labels.items()),
+        *(f"{key}-" if value is None else f"{key}={value}" for key, value in labels.items()),
         *(["--overwrite"] if overwrite else []),
         *_namespace_args(namespace),
     ]
-    return _run_kubectl(argv, kubeconfig, context=context)
+    return _run_kubectl(argv, kubeconfig, context=context, **_timeout_kwargs(timeout))
 
 
 def config_value(
@@ -370,6 +423,7 @@ def config_value(
     *,
     kubeconfig: KubeconfigSource = None,
     context: str | None = None,
+    timeout: float | None = None,
 ) -> str:
     """Read one value out of the effective kubeconfig via jsonpath.
 
@@ -381,7 +435,9 @@ def config_value(
         fails; callers decide whether that is fatal.
     """
     argv = ["kubectl", "config", "view", "--raw", "--minify", "-o", f"jsonpath={jsonpath}"]
-    completed = _run_kubectl(argv, kubeconfig, context=context, check=False)
+    completed = _run_kubectl(
+        argv, kubeconfig, context=context, check=False, **_timeout_kwargs(timeout)
+    )
     return (completed.stdout or "").strip()
 
 
@@ -392,6 +448,7 @@ def create_token(
     duration_sec: float,
     kubeconfig: KubeconfigSource = None,
     context: str | None = None,
+    timeout: float | None = None,
 ) -> str:
     """Mint a short-lived ServiceAccount token via ``kubectl create token``.
 
@@ -412,7 +469,9 @@ def create_token(
         f"--duration={int(duration_sec)}s",
         *_namespace_args(namespace),
     ]
-    return (_run_kubectl(argv, kubeconfig, context=context).stdout or "").strip()
+    return (
+        _run_kubectl(argv, kubeconfig, context=context, **_timeout_kwargs(timeout)).stdout or ""
+    ).strip()
 
 
 def rollout_status(

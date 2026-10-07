@@ -290,6 +290,18 @@ matrix_dispatch() {
     echo "export AGENT_PROVIDER='${AGENT_PROVIDER}' JUDGE_PROVIDER='${JUDGE_PROVIDER}' JUDGE_MODEL='${JUDGE_MODEL}'"
     echo "export AGENT_TIMEOUT_SEC='${AGENT_TIMEOUT_SEC}'"
     echo "export BENCH_PARALLEL=true"
+    if [ -n "${BENCH_AGENT_SANDBOX:-}" ]; then
+      # The runner's env is only what this script bakes in; a workstation-only export
+      # would silently produce an unsandboxed matrix. The escape hatches are never forwarded.
+      echo "export BENCH_AGENT_SANDBOX='${BENCH_AGENT_SANDBOX}'"
+      if [ -n "${BENCH_SANDBOX_IMAGE:-}" ]; then
+        echo "export BENCH_SANDBOX_IMAGE='${BENCH_SANDBOX_IMAGE}'"
+      fi
+      # Same for the fixture path: without it, fixture tasks run and score fixtureless.
+      if [ -n "${BENCH_AGENT_FIXTURES:-}" ]; then
+        echo "export BENCH_AGENT_FIXTURES='${BENCH_AGENT_FIXTURES}'"
+      fi
+    fi
     echo 'run_one() {'
     echo '  local rid="$1" task="$2" kvs="$3" arm="$4" kv rc rdir'
     echo '  local d="$OUT/$rid"; mkdir -p "$d"'

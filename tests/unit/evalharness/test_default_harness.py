@@ -1155,7 +1155,12 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     from devops_bench.core import ClusterInfo, NetworkPlan
 
     harness = _sandboxed_harness(monkeypatch, tmp_path)
-    plan = NetworkPlan(docker_network="kind", rewrite_server="https://c1-control-plane:6443")
+    # A provider-pinned plan passes pin_plan_context untouched (identity kept).
+    plan = NetworkPlan(
+        docker_network="kind",
+        rewrite_server="https://c1-control-plane:6443",
+        kubectl_context="kind-c1",
+    )
     kubeconfig = tmp_path / "creds" / "kubeconfig"
     provider = object()
 
@@ -1205,6 +1210,159 @@ def test_prepare_sandbox_spec_completes_the_skeletal_spec(
     # The run's own provider and cluster build the plan (and through it the
     # kubeconfig), never the ambient current-context.
     assert plan_requests == [(provider, "c1")]
+
+
+def test_prepare_sandbox_spec_tears_down_when_completion_fails(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No completed spec will carry the context to the run-end teardown, so this path cleans up."""
+    from devops_bench.core import ClusterInfo, NetworkPlan
+
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    plan = NetworkPlan(kubectl_context="kind-c1")
+    monkeypatch.setattr(
+        harness_default.agent_sandbox, "build_network_plan", lambda provider, cluster: plan
+    )
+    monkeypatch.setattr(
+        harness_default.agent_credentials,
+        "provision_agent_credentials",
+        lambda *args, **kwargs: tmp_path / "creds" / "kubeconfig",
+    )
+
+    def explode(cluster: str) -> dict[str, str]:
+        raise ValueError("BENCH_AGENT_FIXTURES names a path that does not exist")
+
+    monkeypatch.setattr(harness_default.agent_sandbox, "discover_fixture_mounts", explode)
+    torn_down: list[str | None] = []
+    monkeypatch.setattr(
+        harness_default.agent_credentials,
+        "teardown_agent_credentials",
+        lambda context=None: torn_down.append(context) or True,
+    )
+
+    workspace = tmp_path / "workspace-x"
+    workspace.mkdir()
+    (tmp_path / "creds").mkdir()
+    with pytest.raises(ValueError):
+        harness._prepare_sandbox_spec(  # noqa: SLF001
+            workspace, tmp_path / "creds", ClusterInfo(name="c1"), None, "baseline"
+        )
+
+    assert torn_down == ["kind-c1"]
+
+
+def test_prepare_sandbox_spec_keeps_its_error_when_teardown_raises(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A teardown failure on the spec-completion path must not replace the original error."""
+    from devops_bench.core import ClusterInfo, NetworkPlan
+
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        harness_default.agent_sandbox,
+        "build_network_plan",
+        lambda provider, cluster: NetworkPlan(kubectl_context="kind-c1"),
+    )
+    monkeypatch.setattr(
+        harness_default.agent_credentials,
+        "provision_agent_credentials",
+        lambda *args, **kwargs: tmp_path / "creds" / "kubeconfig",
+    )
+
+    def explode(cluster: str) -> dict[str, str]:
+        raise ValueError("fixture path does not exist")
+
+    def teardown_bug(context: str | None = None) -> bool:
+        raise RuntimeError("teardown bug")
+
+    monkeypatch.setattr(harness_default.agent_sandbox, "discover_fixture_mounts", explode)
+    monkeypatch.setattr(
+        harness_default.agent_credentials, "teardown_agent_credentials", teardown_bug
+    )
+    workspace = tmp_path / "workspace-y"
+    workspace.mkdir()
+    (tmp_path / "creds").mkdir()
+
+    with pytest.raises(ValueError, match="fixture path"):
+        harness._prepare_sandbox_spec(  # noqa: SLF001
+            workspace, tmp_path / "creds", ClusterInfo(name="c1"), None, "baseline"
+        )
+
+
+@pytest.mark.parametrize("clean", [True, False], ids=["clean", "residue"])
+def test_run_one_tears_down_sandbox_credentials_in_its_finally(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clean: bool
+) -> None:
+    """The run-end teardown fires from the finally, pinned to the run's own context."""
+    from dataclasses import replace
+
+    from devops_bench.core import NetworkPlan
+
+    class _SandboxReadyAgent(_WorkspaceWritingAgent):
+        # base.run() refuses a sandboxed config on an unmigrated harness.
+        supports_sandbox = True
+
+    AGENTS.register("fake-sandbox-teardown")(_SandboxReadyAgent)
+    try:
+        harness = _sandboxed_harness(
+            monkeypatch, tmp_path, agent_type="fake-sandbox-teardown", no_infra=True
+        )
+
+        def fake_prepare(
+            workspace_path: Path,
+            creds_dir: Path,
+            cluster_info: Any,
+            provider: Any,
+            pod_security: str,
+            *,
+            with_cluster: bool = True,
+        ) -> Any:
+            (workspace_path / "home").mkdir(parents=True, exist_ok=True)
+            return replace(
+                harness.build_agent_config().sandbox,
+                network=NetworkPlan(kubectl_context="kind-c1"),
+                workspace=workspace_path,
+                kubeconfig=creds_dir / "kubeconfig",
+            )
+
+        monkeypatch.setattr(harness, "_prepare_sandbox_spec", fake_prepare)
+        torn_down: list[str | None] = []
+        monkeypatch.setattr(
+            harness_default.agent_credentials,
+            "teardown_agent_credentials",
+            lambda context=None: torn_down.append(context) is None and clean,
+        )
+        task = Task.from_dict({"task_id": "t", "name": "demo", "prompt": "p"})
+        run_dir = tmp_path / "run_1"
+        run_dir.mkdir()
+
+        record, _ = harness._run_one(task, run_dir)  # noqa: SLF001
+
+        assert record["status"] == "success"
+        assert torn_down == ["kind-c1"]
+        # Residue is a next-run problem on a reused cluster; it rides on the record.
+        if clean:
+            assert "sandbox_teardown_clean" not in record
+        else:
+            assert record["sandbox_teardown_clean"] is False
+    finally:
+        AGENTS._items.pop("fake-sandbox-teardown", None)  # noqa: SLF001
+
+
+def test_sandbox_credential_teardown_only_runs_when_the_cluster_survives(
+    isolated_env: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A destroyed cluster takes the objects with it; reused clusters are where teardown matters."""
+    harness = _sandboxed_harness(monkeypatch, tmp_path)
+    survives = harness._cluster_survives  # noqa: SLF001
+
+    assert survives({"deployer": "kind"}) is False
+    assert survives({"deployer": "kind", "teardown": True}) is False
+    assert survives({"deployer": "kind", "teardown": False}) is True
+    assert survives({"deployer": "noop"}) is True
+
+    harness.no_teardown = True
+    assert survives({"deployer": "kind"}) is True
 
 
 def test_prepare_sandbox_spec_without_a_cluster_skips_the_plan_and_credential(

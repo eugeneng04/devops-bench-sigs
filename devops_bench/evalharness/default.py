@@ -1140,6 +1140,19 @@ class DefaultEvalHarness(Harness):
             if safeguard_monitor is not None:
                 # Idempotent; covers any path that skipped the calls above.
                 safeguard_monitor.stop()
+            if completed_spec is not None and self._cluster_survives(infra_config):
+                # Only on a cluster that outlives the run: residue there denies the operator's
+                # next privileged workload. A destroyed cluster takes the objects with it.
+                try:
+                    clean = agent_credentials.teardown_agent_credentials(
+                        completed_spec.network.kubectl_context
+                    )
+                except Exception:
+                    _log.exception("sandbox credential teardown failed; continuing")
+                    clean = False
+                if not clean and result is not None:
+                    # Residue is a next-run problem; surface it where results are read.
+                    result["sandbox_teardown_clean"] = False
             if deployer is not None:
                 self._teardown(deployer, infra_config, task.name)
             if workspace_path is not None:
@@ -1173,7 +1186,10 @@ class DefaultEvalHarness(Harness):
             )
         (workspace_path / "home").mkdir(parents=True, exist_ok=True)
         if with_cluster:
-            plan = agent_sandbox.build_network_plan(provider, cluster_info)
+            # Pinned here too, so the spec and the run-end teardown target the same cluster.
+            plan = agent_credentials.pin_plan_context(
+                agent_sandbox.build_network_plan(provider, cluster_info)
+            )
             kubeconfig = agent_credentials.provision_agent_credentials(
                 plan,
                 creds_dir,
@@ -1185,13 +1201,22 @@ class DefaultEvalHarness(Harness):
             kubeconfig = creds_dir / "kubeconfig"
             kubeconfig.write_text("apiVersion: v1\nkind: Config\n")
             kubeconfig.chmod(0o600)
-        return replace(
-            self._agent_config.sandbox,
-            network=plan,
-            workspace=workspace_path,
-            kubeconfig=kubeconfig,
-            fixture_mounts=agent_sandbox.discover_fixture_mounts(cluster_info.name),
-        )
+        try:
+            return replace(
+                self._agent_config.sandbox,
+                network=plan,
+                workspace=workspace_path,
+                kubeconfig=kubeconfig,
+                fixture_mounts=agent_sandbox.discover_fixture_mounts(cluster_info.name),
+            )
+        except Exception:
+            # Provisioned, but no completed spec will carry the objects to the run-end teardown.
+            if with_cluster:
+                try:
+                    agent_credentials.teardown_agent_credentials(plan.kubectl_context)
+                except Exception:  # noqa: BLE001 - the original error must win
+                    _log.exception("sandbox credential teardown failed; continuing")
+            raise
 
     def _inventory_sandbox_home(
         self,
@@ -1408,6 +1433,12 @@ class DefaultEvalHarness(Harness):
             # get_reports() returned a private deep copy, so stamping it is safe.
             chaos_report["status"] = "timed_out"
         return chaos_report, perf_report
+
+    def _cluster_survives(self, infra_config: dict[str, Any]) -> bool:
+        """Whether the run's cluster outlives the run, so sandbox objects need removing by hand."""
+        if infra_config.get("deployer") == "noop":
+            return True
+        return self.no_teardown or not infra_config.get("teardown", True)
 
     def _teardown(self, deployer: Any, infra_config: dict[str, Any], name: str) -> None:
         """Tear down infrastructure unless disabled by config or env.
