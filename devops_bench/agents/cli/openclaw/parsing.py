@@ -104,6 +104,14 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
     agent's ``_fold_with_extraction_errors`` and the Gemini ``parse_stream_json``
     policy.
 
+    oc 2026.9.x logs each tool event twice (``source: transcript`` and
+    ``source: runtime``) under one ``toolCallId``. A repeat from the other
+    source is folded into the kept copy, with transcript args preferred (the
+    runtime copy is redacted to ``***``); a repeat from the same source is a
+    new call, so a reused id is never dropped. Runtime-only events are
+    code-mode nested calls (``args`` and ``result.content`` rather than
+    ``arguments`` and ``message.content``).
+
     Args:
         jsonl_text: Raw contents of ``events.jsonl`` inside the export bundle.
 
@@ -118,6 +126,9 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
     output = ""
     fallback_output: list[str] = []
     pending: dict[str, ToolCall] = {}
+    # Per id: the source of the kept call / result, so only the other source's copy is a dup.
+    kept_calls: dict[str, tuple[str | None, ToolCall]] = {}
+    resolved: dict[str, str | None] = {}
     trajectory: list[ToolCall] = []
 
     for lineno, raw in enumerate(jsonl_text.splitlines(), start=1):
@@ -138,25 +149,38 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
             data = {}
 
         if etype == "tool.call":
-            call_id = data.get("toolCallId") or data.get("id") or ""
-            args = data.get("arguments")
-            call = ToolCall(
-                name=data.get("name", ""),
-                args=args if isinstance(args, dict) else {},
-                status="called",
-            )
+            call_id = str(data.get("toolCallId") or data.get("id") or "")
+            source = entry.get("source")
+            args = data.get("arguments") or data.get("args")
+            args = args if isinstance(args, dict) else {}
+            kept = kept_calls.get(call_id) if call_id else None
+            if kept is not None and kept[0] != source:
+                if source == "transcript" and args:
+                    kept[1].args = args
+                continue
+            call = ToolCall(name=data.get("name", ""), args=args, status="called")
             trajectory.append(call)
             if call_id:
-                pending[str(call_id)] = call
+                kept_calls[call_id] = (source, call)
+                pending[call_id] = call
+                resolved.pop(call_id, None)
         elif etype == "tool.result":
             msg = data.get("message") if isinstance(data.get("message"), dict) else data
-            call_id = msg.get("toolCallId") or msg.get("id") or ""
-            text = _join_text(msg.get("content"))
-            details = msg.get("details") if isinstance(msg.get("details"), dict) else {}
-            is_error = bool(msg.get("isError")) or (
-                str(details.get("status", "")).lower() in ("error", "failed", "failure")
+            call_id = str(msg.get("toolCallId") or msg.get("id") or "")
+            source = entry.get("source")
+            if call_id and call_id in resolved and resolved[call_id] != source:
+                continue
+            body = msg.get("result") if isinstance(msg.get("result"), dict) else msg
+            text = _join_text(body.get("content"))
+            details = body.get("details")
+            if not isinstance(details, dict):
+                details = msg.get("details") if isinstance(msg.get("details"), dict) else {}
+            is_error = (
+                bool(msg.get("isError"))
+                or msg.get("success") is False
+                or str(details.get("status", "")).lower() in ("error", "failed", "failure")
             )
-            target = pending.pop(str(call_id), None) if call_id else None
+            target = pending.pop(call_id, None) if call_id else None
             if target is None:
                 # Drop the orphan from the trajectory but surface it on errors.
                 # Synthesizing a free-floating result entry would break the
@@ -171,6 +195,7 @@ def parse_trajectory_export(jsonl_text: str) -> tuple[list[dict], dict, str, lis
                     f"(id={call_id!r}, content={preview!r})"
                 )
                 continue
+            resolved[call_id] = source
             target.result = text
             target.status = "error" if is_error else "completed"
         elif etype == "model.completed":

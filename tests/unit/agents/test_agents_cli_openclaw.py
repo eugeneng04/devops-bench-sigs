@@ -900,6 +900,96 @@ def test_execute_cleans_up_temp_working_dir_after_run(
     assert not os.path.exists(captured["cwd"])
 
 
+def _runtime_call(call_id: str, args: dict) -> dict:
+    """A ``source: runtime`` tool.call in the oc 2026.9.x shape."""
+    return {
+        "type": "tool.call",
+        "source": "runtime",
+        "data": {"toolCallId": call_id, "name": "exec", "args": args},
+    }
+
+
+def _runtime_result(call_id: str, text: str, *, success: bool = True) -> dict:
+    """A ``source: runtime`` tool.result in the oc 2026.9.x shape."""
+    return {
+        "type": "tool.result",
+        "source": "runtime",
+        "data": {
+            "toolCallId": call_id,
+            "name": "exec",
+            "success": success,
+            "result": {"content": [{"type": "text", "text": text}]},
+        },
+    }
+
+
+def test_parse_trajectory_export_dedupes_dual_source_events() -> None:
+    """oc 2026.9.x logs each tool event twice; nested runtime-only calls are kept."""
+    nested = "tool_search_code:call_1:exec:1"
+    blob = _events(
+        {**_tool_call("call_1", "exec", {"code": "run()"}), "source": "transcript"},
+        _runtime_call("call_1", {"code": "***"}),
+        _runtime_call(nested, {"command": "kubectl get pods"}),
+        _runtime_result(nested, "pod-a Running"),
+        _runtime_result("call_1", "done"),
+        {**_tool_result("call_1", "stale duplicate"), "source": "transcript"},
+        _runtime_call("call_2", {"code": "fail()"}),
+        _runtime_result("call_2", "boom", success=False),
+    )
+    trajectory, _tokens, _output, errors = parse_trajectory_export(blob)
+    assert errors == []
+    assert trajectory == [
+        {"name": "exec", "args": {"code": "run()"}, "result": "done", "status": "completed"},
+        {
+            "name": "exec",
+            "args": {"command": "kubectl get pods"},
+            "result": "pod-a Running",
+            "status": "completed",
+        },
+        {"name": "exec", "args": {"code": "fail()"}, "result": "boom", "status": "error"},
+    ]
+
+
+def test_parse_trajectory_export_prefers_transcript_args_whichever_copy_comes_first() -> None:
+    """The runtime copy is always redacted to ***; transcript args win regardless of order."""
+    blob = _events(
+        _runtime_call("call_1", {"code": "***"}),
+        {**_tool_call("call_1", "exec", {"code": "run()"}), "source": "transcript"},
+        _runtime_result("call_1", "done"),
+        {**_tool_result("call_1", "done"), "source": "transcript"},
+    )
+    trajectory, _tokens, _output, errors = parse_trajectory_export(blob)
+    assert errors == []
+    assert trajectory == [
+        {"name": "exec", "args": {"code": "run()"}, "result": "done", "status": "completed"},
+    ]
+
+
+def test_parse_trajectory_export_keeps_a_reused_call_id_from_the_same_source() -> None:
+    """A repeat from the same source is a new call, not a duplicate, so nothing is dropped."""
+    blob = _events(
+        {**_tool_call("call_0", "exec", {"command": "ls"}), "source": "transcript"},
+        _runtime_call("call_0", {"command": "***"}),
+        _runtime_result("call_0", "a.txt"),
+        {**_tool_result("call_0", "a.txt"), "source": "transcript"},
+        {**_tool_call("call_0", "exec", {"command": "pwd"}), "source": "transcript"},
+        _runtime_call("call_0", {"command": "***"}),
+        _runtime_result("call_0", "/workspace"),
+        {**_tool_result("call_0", "/workspace"), "source": "transcript"},
+    )
+    trajectory, _tokens, _output, errors = parse_trajectory_export(blob)
+    assert errors == []
+    assert trajectory == [
+        {"name": "exec", "args": {"command": "ls"}, "result": "a.txt", "status": "completed"},
+        {
+            "name": "exec",
+            "args": {"command": "pwd"},
+            "result": "/workspace",
+            "status": "completed",
+        },
+    ]
+
+
 def test_native_openai_key_crosses_explicit_overlay(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     assert _build_env(AgentConfig(provider="openai"))["OPENAI_API_KEY"] == "test-key"
