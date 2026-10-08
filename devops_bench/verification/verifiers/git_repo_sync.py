@@ -46,6 +46,7 @@ thing the check exists to inspect. The one exception is documented on
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Literal
@@ -70,6 +71,7 @@ from devops_bench.verification.base import (
 from devops_bench.verification.verifiers.resource_property import (
     _apply_op,
     _compile,
+    _compile_regex,
     _render_path,
     _split_at_last_wildcard,
 )
@@ -182,6 +184,12 @@ class GitRepoSyncVerifier(BaseVerifier):
             raise ValueError(msg)
         if self.op in _VALUE_OPS and self.value is None:
             raise ValueError(f"op {self.op!r} requires 'value'")
+        if self.op == "matches":
+            try:
+                _compile_regex(str(self.value))
+            except re.error as exc:
+                msg = f"op 'matches' has an invalid pattern {self.value!r}: {exc}"
+                raise ValueError(msg) from exc
         return self
 
     def verify(self, timeout_sec: float) -> VerificationResult:

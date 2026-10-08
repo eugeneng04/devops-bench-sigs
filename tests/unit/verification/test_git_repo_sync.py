@@ -128,6 +128,21 @@ def test_a_value_op_requires_a_value(repo: Path) -> None:
         _verifier(repo, op="eq", path=_KIND_INGRESS, file="app.yaml")
 
 
+def test_matches_op_with_a_malformed_pattern_is_rejected_at_parse_time(repo: Path) -> None:
+    # Without this the pattern first compiles inside _apply_op, which fails the
+    # check closed with a reason naming the bad pattern. That reads as the agent
+    # having left the repo wrong, when the task spec is what is wrong.
+    with pytest.raises(ValidationError, match=r"invalid pattern.*\[unclosed"):
+        _verifier(repo, op="matches", value="[unclosed", path=_KIND_INGRESS, file="app.yaml")
+
+
+def test_matches_op_with_a_valid_pattern_parses(repo: Path) -> None:
+    verifier = _verifier(
+        repo, op="matches", value=r"^networking\.k8s\.io/v1$", path=_KIND_INGRESS, file="app.yaml"
+    )
+    assert verifier.op == "matches"
+
+
 # -- reading the committed document -------------------------------------
 
 
