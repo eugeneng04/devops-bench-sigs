@@ -58,7 +58,9 @@ In the record's `scores` map, read the entries in the order that matters:
   trajectory (present only when MCP is on).
 - **`Check: <item>.reason`** for each `expected_output` requirement, and
   **`ChecklistScore.reason`** for the passed/total ratio in words
-  (`"Passed 3 out of 5 checks."`).
+  (`"Passed 3 out of 4 checks."`); a `Check:` entry with a `null` score is one
+  the judge could not evaluate, and a `null` `ChecklistScore` was withheld
+  because at least one item could not be judged (its reason says how many).
 - **`GroundingAccuracy.reason`** — reads "Applied X out of Y documented
   constraints (Critical: a/b)"; note it is on a **0–5 scale**, and a short
   *critical* count caps the band even when the raw count looks fine.

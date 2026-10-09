@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -31,8 +32,12 @@ __all__ = [
     "MetricContext",
     "MetricEvaluator",
     "MetricScore",
+    "not_judged",
     "run_geval",
+    "withheld_aggregate",
 ]
+
+_log = logging.getLogger(__name__)
 
 # Default pass cutoff for a single GEval judgment. DeepEval's own default is
 # 0.5; the builtin metrics deliberately score at 0.8, so every GEval-backed
@@ -159,3 +164,31 @@ def run_geval(case: LLMTestCase, metrics: list[Any]) -> list[MetricScore]:
                 )
             )
     return out
+
+
+def not_judged(exc: BaseException) -> str:
+    """Reason for an item the judge could not score; keeps the type when the message is empty."""
+    msg = str(exc)
+    return f"Not judged: {type(exc).__name__}" + (f": {msg}" if msg else "")
+
+
+def withheld_aggregate(
+    name: str, *, passed: int, judged: int, total: int, noun: str
+) -> MetricScore | None:
+    """Return the withheld ``name`` record when any of ``total`` items went unjudged, else ``None``.
+
+    A ratio over the items that happened to be judged is never published: it is
+    not comparable to one over the whole list.
+    """
+    unjudged = total - judged
+    if not unjudged:
+        return None
+    _log.error(
+        "the judge could not evaluate %d of %d %s; withholding %s", unjudged, total, noun, name
+    )
+    partial = f" ({passed} of {judged} judged passed)" if judged else ""
+    return MetricScore(
+        name=name,
+        score=None,
+        reason=f"Withheld: {unjudged} of {total} {noun} could not be judged{partial}.",
+    )
